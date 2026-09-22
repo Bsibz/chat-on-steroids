@@ -28,6 +28,10 @@ import {
 
 const roots: string[] = [];
 const handles: NightBuildBridgeV2Handle[] = [];
+const ACTIVE_RUN_ID = '11111111-1111-4111-8111-111111111111';
+const DORMANT_RUN_ID = '22222222-2222-4222-8222-222222222222';
+const ACTIVE_PRIME_CONVERSATION = 'conversation-0001';
+const DORMANT_PRIME_CONVERSATION = 'conversation-old-prime';
 
 afterEach(async () => {
   await Promise.allSettled(handles.splice(0).map((handle) => handle.stop()));
@@ -198,24 +202,27 @@ async function writeFixtureUserData(root: string): Promise<void> {
   await fs.writeFile(path.join(root, 'state', 'swarm.json'), JSON.stringify({
     version: 7,
     savedAt: 100,
-    runId: 'SECRET-RUN-ID',
-    primeConversationId: 'SECRET-PRIME-CONVERSATION',
+    runId: ACTIVE_RUN_ID,
+    primeConversationId: ACTIVE_PRIME_CONVERSATION,
     startedAt: 90,
     agents: [],
     activeRuns: [{
-      runId: 'SECRET-RUN-ID',
-      primeConversationId: 'SECRET-PRIME-CONVERSATION',
+      runId: ACTIVE_RUN_ID,
+      primeConversationId: ACTIVE_PRIME_CONVERSATION,
       startedAt: 90,
       agents: [
-        { info: { role: 'prime', state: 'active', contextTokens: 120_000, id: 'SECRET_PRIME_ID', task: 'SECRET_TASK' }, queue: [] },
-        { info: { role: 'worker', state: 'sleeping', contextTokens: 220_000, id: 'SECRET_WORKER_ID', task: 'SECRET_WORKER_TASK' }, queue: [] }
+        { info: { id: 'prime', role: 'prime', state: 'active', contextTokens: 120_000, runId: ACTIVE_RUN_ID, primeConversationId: ACTIVE_PRIME_CONVERSATION, conversationId: ACTIVE_PRIME_CONVERSATION, task: 'SECRET_TASK' }, queue: [] },
+        { info: { id: 'worker-1', role: 'worker', state: 'sleeping', contextTokens: 220_000, runId: ACTIVE_RUN_ID, primeConversationId: ACTIVE_PRIME_CONVERSATION, conversationId: 'conversation-worker-0001', task: 'SECRET_WORKER_TASK' }, queue: [] }
       ]
     }],
     dormantRuns: [{
-      primeConversationId: 'SECRET-OLD-PRIME',
+      primeConversationId: DORMANT_PRIME_CONVERSATION,
       startedAt: 1,
       parkedAt: 2,
-      agents: [{ info: { role: 'worker', state: 'finished', contextTokens: 300_000, id: 'SECRET_OLD_WORKER' }, queue: [] }]
+      agents: [
+        { info: { id: 'prime', role: 'prime', state: 'active', contextTokens: 100_000, runId: DORMANT_RUN_ID, primeConversationId: DORMANT_PRIME_CONVERSATION, conversationId: DORMANT_PRIME_CONVERSATION }, queue: [] },
+        { info: { id: 'worker-1', role: 'worker', state: 'finished', contextTokens: 300_000, runId: DORMANT_RUN_ID, primeConversationId: DORMANT_PRIME_CONVERSATION, conversationId: 'conversation-old-worker' }, queue: [] }
+      ]
     }]
   }));
 }
@@ -293,7 +300,7 @@ describe('Night Build protocol v2', () => {
     for (const marker of ['SECRET_', 'conversation-0001']) expect(encoded).not.toContain(marker);
   });
 
-  it('fails closed on corrupt config, session metadata and unsupported swarm versions', async () => {
+  it('fails closed on corrupt config, session metadata and any swarm schema other than installed v7', async () => {
     const root = await tempRoot();
     await writeFixtureUserData(root);
     await fs.writeFile(path.join(root, 'config.json'), '{bad');
@@ -306,7 +313,14 @@ describe('Night Build protocol v2', () => {
     await expect(readDurableSidecarSnapshot(root)).rejects.toThrow('session_events_invalid');
 
     await writeFixtureUserData(root);
-    await fs.writeFile(path.join(root, 'state', 'swarm.json'), JSON.stringify({ version: 5, activeRuns: [], dormantRuns: [] }));
+    const swarmFile = path.join(root, 'state', 'swarm.json');
+    const swarm = JSON.parse(await fs.readFile(swarmFile, 'utf8')) as Record<string, unknown>;
+    swarm['version'] = 6;
+    await fs.writeFile(swarmFile, JSON.stringify(swarm));
+    await expect(readDurableSidecarSnapshot(root)).rejects.toThrow('swarm_version_invalid');
+
+    swarm['version'] = 5;
+    await fs.writeFile(swarmFile, JSON.stringify(swarm));
     await expect(readDurableSidecarSnapshot(root)).rejects.toThrow('swarm_version_invalid');
   });
 
@@ -316,16 +330,29 @@ describe('Night Build protocol v2', () => {
     const swarmFile = path.join(root, 'state', 'swarm.json');
     const valid = JSON.parse(await fs.readFile(swarmFile, 'utf8')) as Record<string, unknown>;
 
+    const activeRun = (swarm: Record<string, unknown>) => (swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    const dormantRun = (swarm: Record<string, unknown>) => (swarm['dormantRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    const agentInfo = (run: Record<string, unknown>, index: number) => (((run['agents'] as Array<Record<string, unknown>>)[index] as Record<string, unknown>)['info'] as Record<string, unknown>);
+
     for (const mutate of [
       (swarm: Record<string, unknown>) => { (swarm['activeRuns'] as Array<Record<string, unknown>>)[0] = { agents: [] }; },
-      (swarm: Record<string, unknown>) => { delete ((swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>)['primeConversationId']; },
-      (swarm: Record<string, unknown>) => { ((swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>)['startedAt'] = 'SECRET_BAD_TIME'; },
-      (swarm: Record<string, unknown>) => { (swarm['dormantRuns'] as Array<Record<string, unknown>>)[0] = { agents: [] }; }
+      (swarm: Record<string, unknown>) => { delete activeRun(swarm)['primeConversationId']; },
+      (swarm: Record<string, unknown>) => { activeRun(swarm)['startedAt'] = 'SECRET_BAD_TIME'; },
+      (swarm: Record<string, unknown>) => { agentInfo(activeRun(swarm), 1)['runId'] = DORMANT_RUN_ID; },
+      (swarm: Record<string, unknown>) => { delete agentInfo(activeRun(swarm), 1)['primeConversationId']; },
+      (swarm: Record<string, unknown>) => { agentInfo(activeRun(swarm), 0)['conversationId'] = 'conversation-wrong-prime'; },
+      (swarm: Record<string, unknown>) => { agentInfo(activeRun(swarm), 1)['id'] = 'prime'; agentInfo(activeRun(swarm), 1)['role'] = 'prime'; },
+      (swarm: Record<string, unknown>) => { (dormantRun(swarm)['agents'] as unknown[]).shift(); },
+      (swarm: Record<string, unknown>) => { agentInfo(dormantRun(swarm), 1)['runId'] = ACTIVE_RUN_ID; },
+      (swarm: Record<string, unknown>) => { agentInfo(dormantRun(swarm), 1)['state'] = 'active'; },
+      (swarm: Record<string, unknown>) => { for (const row of dormantRun(swarm)['agents'] as Array<Record<string, unknown>>) (row['info'] as Record<string, unknown>)['runId'] = ACTIVE_RUN_ID; },
+      (swarm: Record<string, unknown>) => { agentInfo(dormantRun(swarm), 1)['conversationId'] = ACTIVE_PRIME_CONVERSATION; },
+      (swarm: Record<string, unknown>) => { activeRun(swarm)['primeRequestId'] = 'request_owner_duplicate'; dormantRun(swarm)['primeRequestId'] = 'request_owner_duplicate'; }
     ]) {
       const malformed = structuredClone(valid);
       mutate(malformed);
       await fs.writeFile(swarmFile, JSON.stringify(malformed));
-      await expect(readDurableSidecarSnapshot(root)).rejects.toThrow(/swarm_(?:active|dormant)_/);
+      await expect(readDurableSidecarSnapshot(root)).rejects.toThrow(/swarm_/);
     }
 
     await fs.writeFile(swarmFile, JSON.stringify(valid));
@@ -337,6 +364,38 @@ describe('Night Build protocol v2', () => {
     const encoded = JSON.stringify(snapshot.workers);
     expect(encoded).not.toContain('SECRET_');
     expect(encoded).not.toContain('SECRET-');
+  });
+
+  it('accepts structurally valid v7 request-owned primes without exposing request or family identity', async () => {
+    const root = await tempRoot();
+    await writeFixtureUserData(root);
+    const swarmFile = path.join(root, 'state', 'swarm.json');
+    const swarm = JSON.parse(await fs.readFile(swarmFile, 'utf8')) as Record<string, unknown>;
+    const run = (swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    run['primeConversationId'] = null;
+    run['primeRequestId'] = 'request_owner_123';
+    for (const [index, row] of (run['agents'] as Array<Record<string, unknown>>).entries()) {
+      const info = row['info'] as Record<string, unknown>;
+      delete info['primeConversationId'];
+      if (index === 0) info['conversationId'] = null;
+    }
+    await fs.writeFile(swarmFile, JSON.stringify(swarm));
+    const snapshot = await readDurableSidecarSnapshot(root);
+    expect(snapshot.workers.rows).toHaveLength(2);
+    const encoded = JSON.stringify(snapshot.workers);
+    expect(encoded).not.toContain('request_owner_123');
+    expect(encoded).not.toContain(ACTIVE_RUN_ID);
+  });
+
+  it('rejects aggregate swarm agent counts before mapping malformed rows', async () => {
+    const root = await tempRoot();
+    await writeFixtureUserData(root);
+    const swarmFile = path.join(root, 'state', 'swarm.json');
+    const swarm = JSON.parse(await fs.readFile(swarmFile, 'utf8')) as Record<string, unknown>;
+    const run = (swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    run['agents'] = Array.from({ length: 4_097 }, () => null);
+    await fs.writeFile(swarmFile, JSON.stringify(swarm));
+    await expect(readDurableSidecarSnapshot(root)).rejects.toThrow('swarm_agent_limit');
   });
 
   it('publishes 0600 exclusively and refuses a foreign discovery file', async () => {
@@ -486,9 +545,10 @@ describe('installed CoS owner proof', () => {
     expect(await ownerStillCurrent('/tmp/user-data', owner, deps())()).toBe(true);
   });
 
-  it('fails closed on a foreign process or changed process generation', async () => {
+  it('fails closed on a foreign process, changed process generation, or installed app version change', async () => {
     await expect(proveInstalledCoSOwner('/tmp/user-data', deps({ processInfo: async () => ({ command: '/tmp/Chat On Steroids', startedAt: 123_000 }) }))).rejects.toThrow('owner_process_mismatch');
     const owner = await proveInstalledCoSOwner('/tmp/user-data', deps());
     expect(await ownerStillCurrent('/tmp/user-data', owner, deps({ processInfo: async () => ({ command: INSTALLED_COS_EXECUTABLE, startedAt: 124_000 }) }))()).toBe(false);
+    expect(await ownerStillCurrent('/tmp/user-data', owner, deps({ readFile: async () => '<key>CFBundleShortVersionString</key>\n<string>2.1.15</string>' }))()).toBe(false);
   });
 });

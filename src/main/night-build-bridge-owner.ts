@@ -74,7 +74,8 @@ export function ownerStillCurrent(userData: string, owner: InstalledCoSOwner, de
       const pid = pidFromSingletonLock(target);
       if (pid !== owner.pid) return false;
       const processInfo = await deps.processInfo(pid);
-      return processInfo?.command === INSTALLED_COS_EXECUTABLE && processInfo.startedAt === owner.startedAt;
+      if (processInfo?.command !== INSTALLED_COS_EXECUTABLE || processInfo.startedAt !== owner.startedAt) return false;
+      return installedVersion(await deps.readFile(INSTALLED_COS_INFO_PLIST)) === owner.appVersion;
     } catch {
       return false;
     }

@@ -21,6 +21,9 @@ const MAX_GOAL_ROWS = 10_000;
 const MAX_SWARM_RUNS = 128;
 const MAX_SWARM_AGENTS = 4_096;
 const ID = /^[0-9a-z-]{8,256}$/i;
+const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const REQUEST_ID = /^[a-z0-9_-]{1,100}$/i;
+const WORKER_ID = /^worker-[1-9][0-9]{0,9}$/;
 const SESSION_ID = /^[0-9a-z-]{8,64}$/i;
 const AGENT_STATES: readonly AgentState[] = ['invited', 'active', 'detached', 'waking', 'sleeping', 'finished', 'failed'];
 const OUTCOMES: readonly TurnOutcome[] = ['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown'];
@@ -59,6 +62,17 @@ function nullableString(value: unknown, label: string, max = 256): string | null
 
 function requiredId(value: unknown, label: string): string {
   if (typeof value !== 'string' || !ID.test(value)) throw new Error(`${label}_invalid`);
+  return value;
+}
+
+function requiredRunId(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !RUN_ID.test(value)) throw new Error(`${label}_invalid`);
+  return value;
+}
+
+function optionalRequestId(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !REQUEST_ID.test(value)) throw new Error(`${label}_invalid`);
   return value;
 }
 
@@ -230,52 +244,141 @@ function durableGoalRows(
   return rows;
 }
 
-function parseWorkerInfo(raw: unknown): NightBuildBridgeV2WorkerInput {
+interface SwarmOwnerBinding {
+  runId: string;
+  primeConversationId: string | null;
+  primeRequestId: string | undefined;
+  dormant: boolean;
+}
+
+function parseWorkerInfo(raw: unknown, owner: SwarmOwnerBinding): { id: string; conversationId: string | null; row: NightBuildBridgeV2WorkerInput } {
   const info = object(raw, 'swarm_agent_info');
+  const id = info['id'];
   const role = info['role'];
   const state = info['state'];
   if (role !== 'prime' && role !== 'worker') throw new Error('swarm_agent_role_invalid');
+  if (typeof id !== 'string' || (role === 'prime' ? id !== 'prime' : !WORKER_ID.test(id))) throw new Error('swarm_agent_id_invalid');
   if (typeof state !== 'string' || !AGENT_STATES.includes(state as AgentState)) throw new Error('swarm_agent_state_invalid');
+  if (requiredRunId(info['runId'], 'swarm_agent_run_id') !== owner.runId) throw new Error('swarm_agent_run_owner_mismatch');
+  if (owner.primeConversationId === null) {
+    if (!owner.primeRequestId || info['primeConversationId'] !== undefined) throw new Error('swarm_agent_prime_binding_invalid');
+  } else if (info['primeConversationId'] !== owner.primeConversationId) {
+    throw new Error('swarm_agent_prime_binding_invalid');
+  }
+  const conversationId = nullableString(info['conversationId'], 'swarm_agent_conversation_id');
+  if (conversationId !== null && !ID.test(conversationId)) throw new Error('swarm_agent_conversation_id_invalid');
+  if (role === 'prime' && conversationId !== owner.primeConversationId) throw new Error('swarm_prime_conversation_mismatch');
+  if (role === 'worker' && conversationId !== null && conversationId === owner.primeConversationId) throw new Error('swarm_worker_conversation_conflict');
+  if (owner.dormant && role === 'worker' && (state === 'invited' || state === 'active' || state === 'detached' || state === 'waking')) {
+    throw new Error('swarm_dormant_worker_active');
+  }
   const context = info['contextTokens'];
   const contextTokens = context === null ? 0 : safeInt(context, 'swarm_agent_context');
-  return { role, state: state as AgentState, contextTokens };
+  return { id, conversationId, row: { role, state: state as AgentState, contextTokens } };
 }
 
-function parseAgentRows(raw: unknown): NightBuildBridgeV2WorkerInput[] {
-  if (!Array.isArray(raw)) throw new Error('swarm_agents_invalid');
-  return raw.map((entry) => {
+function parseAgentRows(raw: unknown[], owner: SwarmOwnerBinding): { rows: NightBuildBridgeV2WorkerInput[]; workerConversations: string[] } {
+  const ids = new Set<string>();
+  const conversations = new Set<string>();
+  const workerConversations: string[] = [];
+  let primes = 0;
+  const rows = raw.map((entry) => {
     const row = object(entry, 'swarm_agent');
     if (!Array.isArray(row['queue'])) throw new Error('swarm_agent_queue_invalid');
-    return parseWorkerInfo(row['info']);
+    const parsed = parseWorkerInfo(row['info'], owner);
+    if (ids.has(parsed.id)) throw new Error('swarm_agent_id_duplicate');
+    ids.add(parsed.id);
+    if (parsed.row.role === 'prime') primes += 1;
+    if (parsed.conversationId !== null) {
+      if (conversations.has(parsed.conversationId)) throw new Error('swarm_agent_conversation_duplicate');
+      conversations.add(parsed.conversationId);
+      if (parsed.row.role === 'worker') workerConversations.push(parsed.conversationId);
+    }
+    return parsed.row;
   });
+  if (primes !== 1) throw new Error('swarm_prime_count_invalid');
+  return { rows, workerConversations };
+}
+
+function dormantFamilyRunId(agents: unknown[]): string {
+  let runId: string | null = null;
+  for (const entry of agents) {
+    const row = object(entry, 'swarm_agent');
+    const info = object(row['info'], 'swarm_agent_info');
+    if (info['id'] !== 'prime') continue;
+    if (runId !== null) throw new Error('swarm_prime_count_invalid');
+    runId = requiredRunId(info['runId'], 'swarm_dormant_run_id');
+  }
+  if (runId === null) throw new Error('swarm_prime_count_invalid');
+  return runId;
+}
+
+function parseRunOwner(raw: unknown, dormant: boolean): { owner: SwarmOwnerBinding; agents: unknown[] } {
+  const run = object(raw, dormant ? 'swarm_dormant_run' : 'swarm_active_run');
+  const prime = run['primeConversationId'];
+  const primeConversationId = prime === null ? null : requiredId(prime, dormant ? 'swarm_dormant_prime_conversation_id' : 'swarm_active_prime_conversation_id');
+  const primeRequestId = optionalRequestId(run['primeRequestId'], dormant ? 'swarm_dormant_prime_request_id' : 'swarm_active_prime_request_id');
+  if (primeConversationId === null && !primeRequestId) throw new Error(dormant ? 'swarm_dormant_prime_binding_invalid' : 'swarm_active_prime_binding_invalid');
+  const agents = run['agents'];
+  if (!Array.isArray(agents)) throw new Error('swarm_agents_invalid');
+  safeInt(run['startedAt'], dormant ? 'swarm_dormant_started_at' : 'swarm_active_started_at', false);
+  if (dormant) safeInt(run['parkedAt'], 'swarm_dormant_parked_at', false);
+  const runId = dormant ? '' : requiredRunId(run['runId'], 'swarm_active_run_id');
+  return { owner: { runId, primeConversationId, primeRequestId, dormant }, agents };
+}
+
+interface SwarmOwnership {
+  workers: Set<string>;
+  primes: Set<string>;
+  ordinaryPrimes: Set<string>;
+  requests: Set<string>;
+}
+
+function claimSwarmOwner(owner: SwarmOwnerBinding, workerConversations: string[], seen: SwarmOwnership): void {
+  if (owner.primeRequestId && seen.requests.has(owner.primeRequestId)) throw new Error('swarm_prime_request_duplicate');
+  if (owner.primeConversationId !== null) {
+    if (seen.workers.has(owner.primeConversationId)) throw new Error('swarm_prime_worker_conflict');
+    if (!owner.primeRequestId && seen.ordinaryPrimes.has(owner.primeConversationId)) throw new Error('swarm_prime_conversation_duplicate');
+  }
+  for (const conversationId of workerConversations) {
+    if (seen.workers.has(conversationId) || seen.primes.has(conversationId)) throw new Error('swarm_worker_conversation_duplicate');
+  }
+  for (const conversationId of workerConversations) seen.workers.add(conversationId);
+  if (owner.primeConversationId !== null) {
+    seen.primes.add(owner.primeConversationId);
+    if (!owner.primeRequestId) seen.ordinaryPrimes.add(owner.primeConversationId);
+  }
+  if (owner.primeRequestId) seen.requests.add(owner.primeRequestId);
 }
 
 function parseSwarm(raw: unknown | null, enabled: boolean): NightBuildBridgeV2Snapshot['workers'] {
   if (raw === null) return { enabled, running: false, retainedHistory: false, rows: [] };
   const root = object(raw, 'swarm');
-  if (root['version'] !== 6 && root['version'] !== 7) throw new Error('swarm_version_invalid');
+  if (root['version'] !== 7) throw new Error('swarm_version_invalid');
   if (!Array.isArray(root['activeRuns']) || !Array.isArray(root['dormantRuns'])) throw new Error('swarm_runs_invalid');
   if (root['activeRuns'].length > MAX_SWARM_RUNS || root['dormantRuns'].length > MAX_SWARM_RUNS) throw new Error('swarm_run_limit');
   safeInt(root['savedAt'], 'swarm_saved_at', false);
+  const active = root['activeRuns'].map((run) => parseRunOwner(run, false));
+  const dormant = root['dormantRuns'].map((run) => parseRunOwner(run, true));
+  const agentCount = [...active, ...dormant].reduce((sum, run) => sum + run.agents.length, 0);
+  if (agentCount > MAX_SWARM_AGENTS) throw new Error('swarm_agent_limit');
   const rows: NightBuildBridgeV2WorkerInput[] = [];
-  let parsedAgents = 0;
-  for (const rawRun of root['activeRuns']) {
-    const run = object(rawRun, 'swarm_active_run');
-    requiredId(run['runId'], 'swarm_active_run_id');
-    requiredId(run['primeConversationId'], 'swarm_active_prime_conversation_id');
-    safeInt(run['startedAt'], 'swarm_active_started_at', false);
-    const active = parseAgentRows(run['agents']);
-    parsedAgents += active.length;
-    rows.push(...active);
-    if (parsedAgents > MAX_SWARM_AGENTS) throw new Error('swarm_agent_limit');
+  const familyIds = new Set<string>();
+  const ownership: SwarmOwnership = { workers: new Set(), primes: new Set(), ordinaryPrimes: new Set(), requests: new Set() };
+  for (const run of active) {
+    if (familyIds.has(run.owner.runId)) throw new Error('swarm_run_id_duplicate');
+    familyIds.add(run.owner.runId);
+    const parsed = parseAgentRows(run.agents, run.owner);
+    claimSwarmOwner(run.owner, parsed.workerConversations, ownership);
+    rows.push(...parsed.rows);
   }
-  for (const rawRun of root['dormantRuns']) {
-    const run = object(rawRun, 'swarm_dormant_run');
-    requiredId(run['primeConversationId'], 'swarm_dormant_prime_conversation_id');
-    safeInt(run['startedAt'], 'swarm_dormant_started_at', false);
-    safeInt(run['parkedAt'], 'swarm_dormant_parked_at', false);
-    parsedAgents += parseAgentRows(run['agents']).length;
-    if (parsedAgents > MAX_SWARM_AGENTS) throw new Error('swarm_agent_limit');
+  for (const run of dormant) {
+    const runId = dormantFamilyRunId(run.agents);
+    if (familyIds.has(runId)) throw new Error('swarm_run_id_duplicate');
+    familyIds.add(runId);
+    const owner = { ...run.owner, runId };
+    const parsed = parseAgentRows(run.agents, owner);
+    claimSwarmOwner(owner, parsed.workerConversations, ownership);
   }
   return { enabled, running: root['activeRuns'].length > 0, retainedHistory: root['dormantRuns'].length > 0, rows };
 }

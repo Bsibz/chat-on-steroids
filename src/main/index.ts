@@ -16,7 +16,8 @@ import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
 import { pluginManager } from './plugins/manager.js';
 import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
-import { shutdownNightBuildBridge, startNightBuildBridge } from './night-build-bridge.js';
+import { startNightBuildBridgeV2, type NightBuildBridgeV2Handle } from './night-build-bridge-v2.js';
+import { createInProcessNightBuildBridgeV2Source } from './night-build-bridge-v2-in-process.js';
 import { flushSessions, initSessionStore } from './session/store.js';
 import { initSkillsPath } from './skills.js';
 import { usageOverview } from './session/usage.js';
@@ -88,6 +89,7 @@ const RETIRED_WORKERS_STATE = 'retired-workers';
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
+let nightBuildBridge: NightBuildBridgeV2Handle | null = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
 const usageWarmup = new AbortController();
@@ -438,7 +440,7 @@ void app.whenReady().then(async () => {
   onStatusChange(refreshTray);
 
   try {
-    await startNightBuildBridge(userData);
+    nightBuildBridge = await startNightBuildBridgeV2(userData, createInProcessNightBuildBridgeV2Source());
   } catch {
     // The bridge is optional and its underlying failures may contain local
     // paths. Keep startup logs bounded instead of copying raw exception prose.
@@ -509,7 +511,7 @@ app.on('will-quit', (event) => {
       {
         name: 'admission/drain',
         budgetMs: 40_000,
-        run: () => [shutdownConnection(), shutdownBridge(), shutdownNightBuildBridge()]
+        run: () => [shutdownConnection(), shutdownBridge(), nightBuildBridge?.stop() ?? Promise.resolve()]
       },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {

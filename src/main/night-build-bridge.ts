@@ -12,14 +12,7 @@ import {
   type NightBuildBridgeStatus,
   type NightBuildCapability
 } from '../shared/night-build-bridge.js';
-import { bridgeObserverStatus } from './bridge.js';
-import { getConfig } from './config.js';
-import { getStatus } from './connection.js';
-import { goalObserverFor } from './goal.js';
-import { swarmState } from './agents.js';
 import { APP_VERSION } from './version.js';
-import { peekSessionPage } from './session/store.js';
-import { logInfo, logWarn } from './logger.js';
 
 const HOST = '127.0.0.1' as const;
 const OBSERVED_SESSION_LIMIT = 50;
@@ -51,9 +44,28 @@ const CAPABILITIES: NightBuildCapability[] = [
   'context'
 ];
 
-type BrowserStatus = Awaited<ReturnType<typeof bridgeObserverStatus>>;
-type GoalStatus = ReturnType<typeof goalObserverFor>;
-type SessionPage = Awaited<ReturnType<typeof peekSessionPage>>;
+interface BrowserStatus {
+  running: boolean;
+  paired: boolean;
+  present: boolean;
+  lastSeenAt: number | null;
+}
+
+interface GoalStatus {
+  enabled: boolean;
+  mode: 'goal' | 'loop';
+  own: boolean;
+  afterTurn: boolean;
+  armed: boolean;
+  objectivePresent: boolean;
+  draft: null | { stage: 'sending' | 'answering' | 'ready' | 'no-reply' | 'failed'; retryable: boolean };
+}
+
+interface SessionPage {
+  sessions: SessionSummary[];
+  total: number;
+  nextCursor: unknown;
+}
 
 export interface NightBuildBridgeDataSource {
   config(): Config;
@@ -64,14 +76,24 @@ export interface NightBuildBridgeDataSource {
   workers(): SwarmState;
 }
 
-const productionSource: NightBuildBridgeDataSource = {
-  config: getConfig,
-  connectionStatus: getStatus,
-  browserStatus: bridgeObserverStatus,
-  listSessions: (limit) => peekSessionPage({ limit }),
-  goalStatus: goalObserverFor,
-  workers: () => swarmState()
-};
+async function productionSource(): Promise<NightBuildBridgeDataSource> {
+  const [{ bridgeObserverStatus }, { getConfig }, { getStatus }, { goalObserverFor }, { swarmState }, { peekSessionPage }] = await Promise.all([
+    import('./bridge.js'),
+    import('./config.js'),
+    import('./connection.js'),
+    import('./goal.js'),
+    import('./agents.js'),
+    import('./session/store.js')
+  ]);
+  return {
+    config: getConfig,
+    connectionStatus: getStatus,
+    browserStatus: bridgeObserverStatus,
+    listSessions: (limit) => peekSessionPage({ limit }),
+    goalStatus: goalObserverFor,
+    workers: () => swarmState()
+  };
+}
 
 interface ActiveBridge {
   server: http.Server;
@@ -412,7 +434,6 @@ function requestHandler(
       // This listener is a privacy boundary. Underlying filesystem/store
       // exceptions can contain session IDs or absolute local paths, so bridge
       // logs deliberately expose only a stable bounded failure class.
-      logWarn('night build bridge status request failed');
       if (!res.headersSent) writeJson(res, 500, { error: 'internal_error' });
       else res.end();
     });
@@ -442,7 +463,7 @@ async function publishDiscovery(
 
 export async function startNightBuildBridge(
   userData: string,
-  source: NightBuildBridgeDataSource = productionSource
+  source?: NightBuildBridgeDataSource
 ): Promise<NightBuildBridgeDiscovery | null> {
   if (shutdownRequested) return null;
   if (active) return active.discovery;
@@ -461,7 +482,8 @@ export async function startNightBuildBridge(
     token: randomBytes(32).toString('base64url'),
     startedAt: Date.now()
   };
-  const server = http.createServer({ maxHeaderSize: 8192 }, requestHandler(source, seed));
+  const effectiveSource = source ?? await productionSource();
+  const server = http.createServer({ maxHeaderSize: 8192 }, requestHandler(effectiveSource, seed));
   server.requestTimeout = 10_000;
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
@@ -492,7 +514,6 @@ export async function startNightBuildBridge(
     return null;
   }
   active = { server, discovery, discoveryPath: published };
-  logInfo('night build bridge started');
   return discovery;
 }
 
@@ -519,7 +540,6 @@ async function stopActiveBridge(): Promise<void> {
     });
     current.server.closeIdleConnections?.();
   });
-  logInfo('night build bridge stopped');
 }
 
 export function shutdownNightBuildBridge(): Promise<void> {

@@ -7,7 +7,12 @@ export default defineConfig({
     // rather than being inlined by the bundler.
     plugins: [externalizeDepsPlugin()],
     build: {
-      rollupOptions: { input: resolve(__dirname, 'src/main/index.ts') }
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/main/index.ts'),
+          'night-build-bridge-sidecar': resolve(__dirname, 'src/main/night-build-bridge-sidecar.ts')
+        }
+      }
     }
   },
   preload: {

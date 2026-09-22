@@ -2158,7 +2158,10 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
   }
 }
 
-async function readMetaCheckpoint(id: string): Promise<MetaCheckpoint | null> {
+async function readMetaCheckpoint(
+  id: string,
+  options: { logWarnings?: boolean } = {}
+): Promise<MetaCheckpoint | null> {
   const dir = sessionDir(id);
   try {
     const primary = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.json'), 'utf8'));
@@ -2169,13 +2172,17 @@ async function readMetaCheckpoint(id: string): Promise<MetaCheckpoint | null> {
   try {
     const backup = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.backup.json'), 'utf8'));
     if (backup) {
-      logWarn(`session ${id}: primary meta.json unreadable; using the last validated checkpoint`);
+      if (options.logWarnings !== false) {
+        logWarn(`session ${id}: primary meta.json unreadable; using the last validated checkpoint`);
+      }
       return backup;
     }
   } catch {
     // No recovery checkpoint.
   }
-  logWarn(`session ${id}: no valid metadata projection; refusing to treat it as an empty session`);
+  if (options.logWarnings !== false) {
+    logWarn(`session ${id}: no valid metadata projection; refusing to treat it as an empty session`);
+  }
   return null;
 }
 
@@ -2405,6 +2412,44 @@ export interface SessionPage {
   nextCursor: SessionListCursor | null;
 }
 
+/**
+ * Metadata-only observer page. This never repairs or reconciles a checkpoint, so merely opening
+ * a monitoring client cannot become a session-store write.
+ */
+export async function peekSessionPage(options: { limit?: number } = {}): Promise<SessionPage> {
+  assertReady();
+  const limit = Math.max(1, Math.min(MAX_LISTED_SESSIONS, Math.floor(options.limit ?? MAX_LISTED_SESSIONS)));
+  let names: string[];
+  try {
+    names = await fs.readdir(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { sessions: [], total: 0, nextCursor: null };
+    throw error;
+  }
+
+  const summaries: SessionSummary[] = [];
+  const candidates = names.filter((name) => /^[0-9a-z-]{8,64}$/i.test(name));
+  for (let offset = 0; offset < candidates.length; offset += ATTACHMENT_CATALOG_READ_CONCURRENCY) {
+    const rows = await Promise.all(candidates.slice(offset, offset + ATTACHMENT_CATALOG_READ_CONCURRENCY).map(async (id) => {
+      return open.get(id)?.summary ?? (await readMetaCheckpoint(id, { logWarnings: false }))?.summary ?? null;
+    }));
+    for (const summary of rows) {
+      if (!summary || summary.origin?.kind === 'helper') continue;
+      summaries.push({ ...summary, chatIds: [...summary.chatIds], agents: [...summary.agents] });
+    }
+  }
+  summaries.sort(compareSummariesNewestFirst);
+  const sessions = summaries.slice(0, limit);
+  const last = sessions.at(-1);
+  return {
+    sessions,
+    total: summaries.length,
+    nextCursor: summaries.length > sessions.length && last
+      ? { updatedAt: last.updatedAt, id: last.id }
+      : null
+  };
+}
+
 function compareSummariesNewestFirst(left: SessionSummary, right: SessionSummary): number {
   if (right.updatedAt !== left.updatedAt) return right.updatedAt - left.updatedAt;
   if (left.id === right.id) return 0;
@@ -2632,6 +2677,7 @@ export async function getSession(id: string): Promise<SessionSummary | null> {
   return summary ? { ...summary } : null;
 }
 
+/** Exact metadata-only observer lookup with no crash-repair write. */
 /** Positive absence for retiring an exact delivered receipt, never corrupt metadata. */
 export async function sessionDirectoryMissing(id: string): Promise<boolean> {
   assertSessionId(id);

@@ -255,6 +255,19 @@ export async function getSecret(key: SecretKey): Promise<string | null> {
   return value && value.length > 0 ? value : null;
 }
 
+/**
+ * Observation-only secret read.
+ *
+ * Loads/decrypts the existing store if needed but deliberately does not run
+ * maintenance rotation. Status/reporting surfaces can therefore observe
+ * whether a value exists without turning a read into a credential-store write.
+ */
+export async function peekSecret(key: SecretKey): Promise<string | null> {
+  const all = await readAll();
+  const value = all[key];
+  return value && value.length > 0 ? value : null;
+}
+
 export async function hasSecret(key: SecretKey): Promise<boolean> {
   return (await getSecret(key)) !== null;
 }

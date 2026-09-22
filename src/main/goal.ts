@@ -1115,6 +1115,37 @@ export function goalViewFor(conversationId: string, clientId?: string): GoalDraf
   return view(draft);
 }
 
+/**
+ * Side-effect-free Goal/Loop projection for local read-only integrations.
+ *
+ * Unlike goalViewFor(), this must never expire, acknowledge or otherwise mutate a draft just
+ * because an observer asked what exists. It deliberately omits prompt/reply/error prose.
+ */
+export function goalObserverFor(conversationId: string): {
+  enabled: boolean;
+  mode: GoalMode;
+  own: boolean;
+  afterTurn: boolean;
+  armed: boolean;
+  objectivePresent: boolean;
+  draft: null | { stage: GoalStage; retryable: boolean };
+} {
+  const control = goalSwitchFor(conversationId);
+  const objectivePresent = goalObjectiveFor(conversationId) !== '';
+  const draft = drafts.get(conversationId);
+  return {
+    ...control,
+    armed: control.own ? control.enabled : control.enabled || objectivePresent,
+    objectivePresent,
+    draft: draft && !draft.acknowledged
+      ? {
+          stage: draft.stage,
+          retryable: draft.stage === 'failed' && retryableGoalFailure(draft.error ?? '')
+        }
+      : null
+  };
+}
+
 export async function retryGoalBrowserHelper(sourceSessionId: string, inputId: string): Promise<boolean> {
   const session = await getSession(sourceSessionId);
   if (!session?.conversationId) return false;

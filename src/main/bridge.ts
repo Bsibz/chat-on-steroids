@@ -51,7 +51,7 @@ import { CHAT_ACTIVE_MS, CHAT_SILENCE_MS, continuationMarkerOf, isReasoningEffor
 import { isChatBlocked, chatBlockedAt } from './session/blocked-chats.js';
 export { CHAT_ACTIVE_MS, CHAT_SILENCE_MS } from '../shared/session.js';
 import { effectiveCapabilities, getConfig, updateConfig } from './config.js';
-import { getSecret, secureStorageStatus, setSecret } from './secrets.js';
+import { getSecret, peekSecret, secureStorageStatus, setSecret } from './secrets.js';
 import {
   acceptGoalReplyNow,
   astraFinishOnly,
@@ -744,6 +744,24 @@ function changed(): void {
 
 export async function bridgeStatus(): Promise<BridgeStatus> {
   const stored = await getSecret('bridgeToken');
+  return {
+    running: server !== null,
+    port,
+    paired: stored !== null && stored !== BROWSER_DISCONNECTED,
+    present: browserPresent(),
+    lastSeenAt,
+    extensionVersion
+  };
+}
+
+/**
+ * Privacy/read-only observer used by Night Build.
+ *
+ * Unlike bridgeStatus(), this must not trigger secret-store maintenance such
+ * as key rotation merely because another local app asked for status.
+ */
+export async function bridgeObserverStatus(): Promise<BridgeStatus> {
+  const stored = await peekSecret('bridgeToken');
   return {
     running: server !== null,
     port,

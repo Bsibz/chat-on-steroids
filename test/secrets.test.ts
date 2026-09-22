@@ -19,6 +19,7 @@ const {
   deleteAllSecrets,
   getSecret,
   initSecretsPath,
+  peekSecret,
   resetSecretsCacheForTests,
   secureStorageCiphertextIsProtected,
   secureStorageStatus,
@@ -301,6 +302,32 @@ describe('secret store', () => {
 
     resetSecretsCacheForTests();
     expect(await getSecret('openaiApiKey')).toBe('sk-rotated');
+  });
+
+  it('lets observation-only reads see a rotating secret without resealing it', async () => {
+    await setSecret('bridgeToken', 'bridge-token-observed-without-write');
+    const file = path.join(dir, 'secrets.bin');
+    const before = await fs.readFile(file);
+    resetSecretsCacheForTests();
+    vi.mocked(safeStorage.encryptStringAsync).mockClear();
+    vi.mocked(safeStorage.decryptStringAsync).mockImplementationOnce(async (buffer) => ({
+      result: buffer.toString('utf8'),
+      shouldReEncrypt: true
+    }));
+
+    expect(await peekSecret('bridgeToken')).toBe('bridge-token-observed-without-write');
+    expect(await fs.readFile(file)).toEqual(before);
+    const writes = vi.mocked(safeStorage.encryptStringAsync).mock.calls
+      .map(([value]) => value)
+      .filter((value) => value !== 'chat-on-steroids-safe-storage-probe');
+    expect(writes).toHaveLength(0);
+
+    // A later ordinary credential read may perform the deferred maintenance.
+    expect(await getSecret('bridgeToken')).toBe('bridge-token-observed-without-write');
+    const laterWrites = vi.mocked(safeStorage.encryptStringAsync).mock.calls
+      .map(([value]) => value)
+      .filter((value) => value !== 'chat-on-steroids-safe-storage-probe');
+    expect(laterWrites).toHaveLength(1);
   });
 
   it('keeps the old ciphertext and readable cache when key-rotation reseal is temporarily unavailable', async () => {

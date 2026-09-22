@@ -11,7 +11,8 @@ export const NIGHT_BUILD_BRIDGE_V2_CAPABILITIES = [
   'activity',
   'goal',
   'agents',
-  'context'
+  'context',
+  'compaction'
 ] as const;
 export type NightBuildBridgeV2Capability = (typeof NIGHT_BUILD_BRIDGE_V2_CAPABILITIES)[number];
 export type NightBuildBridgeObservationMode = 'in-process' | 'durable-sidecar';
@@ -93,6 +94,7 @@ export interface NightBuildBridgeV2Status {
   goal: {
     enabled: boolean;
     mode: GoalMode;
+    observedSessionCount: number;
     objectivePresent: number;
     armed: number;
     draftsObserved: boolean;

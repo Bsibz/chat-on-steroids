@@ -252,7 +252,7 @@ describe('Night Build protocol v2', () => {
     expect(status.capabilities).toEqual([...NIGHT_BUILD_BRIDGE_V2_CAPABILITIES]);
     expect(status.bridge).toEqual({ observationMode: 'in-process', startedAt: discovery.startedAt });
     expect(status.controller).toEqual({ running: true, startedAt: 123_000 });
-    expect(status.goal).toMatchObject({ enabled: true, mode: 'loop', objectivePresent: 1, armed: 1, draftsObserved: true, drafts: { failed: 1, retryableFailed: 1 } });
+    expect(status.goal).toMatchObject({ enabled: true, mode: 'loop', observedSessionCount: 1, objectivePresent: 1, armed: 1, draftsObserved: true, drafts: { failed: 1, retryableFailed: 1 } });
     expect(status.workers).toMatchObject({ totalAgents: 2, workerCount: 1, sleepingWorkers: 1, retainedHistory: true });
     const encoded = JSON.stringify(status);
     for (const marker of ['SECRET_INSTANCE', 'SECRET_BEARER', 'SECRET_CONVERSATION', 'SECRET_HANDOFF', 'SECRET_TURN']) expect(encoded).not.toContain(marker);
@@ -284,6 +284,7 @@ describe('Night Build protocol v2', () => {
     expect(status.controller.startedAt).toBe(123_000);
     expect(status.goal.draftsObserved).toBe(false);
     expect(status.goal.drafts).toBeNull();
+    expect(status.goal.observedSessionCount).toBe(1);
     expect(status.goal.objectivePresent).toBe(1);
     expect(status.goal.armed).toBe(1);
     expect(status.sessions.context.sessionsAtOrAboveAdvisory).toBe(2);

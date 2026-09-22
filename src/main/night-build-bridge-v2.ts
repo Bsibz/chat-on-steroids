@@ -190,7 +190,15 @@ export function aggregateNightBuildBridgeV2Goal(input: NightBuildBridgeV2Snapsho
     else drafts[row.draft.stage] += 1;
     if (row.draft.stage === 'failed' && row.draft.retryable) drafts.retryableFailed += 1;
   }
-  return { enabled: input.enabled, mode: input.mode, objectivePresent, armed, draftsObserved: input.draftsObserved, drafts: input.draftsObserved ? drafts : null };
+  return {
+    enabled: input.enabled,
+    mode: input.mode,
+    observedSessionCount: input.rows.length,
+    objectivePresent,
+    armed,
+    draftsObserved: input.draftsObserved,
+    drafts: input.draftsObserved ? drafts : null
+  };
 }
 
 export function aggregateNightBuildBridgeV2Workers(input: NightBuildBridgeV2Snapshot['workers']): NightBuildBridgeV2Status['workers'] {

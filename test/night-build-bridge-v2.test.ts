@@ -198,13 +198,13 @@ async function writeFixtureUserData(root: string): Promise<void> {
   await fs.writeFile(path.join(root, 'state', 'swarm.json'), JSON.stringify({
     version: 7,
     savedAt: 100,
-    runId: 'SECRET_RUN_ID',
-    primeConversationId: 'SECRET_PRIME_CONVERSATION',
+    runId: 'SECRET-RUN-ID',
+    primeConversationId: 'SECRET-PRIME-CONVERSATION',
     startedAt: 90,
     agents: [],
     activeRuns: [{
-      runId: 'SECRET_RUN_ID',
-      primeConversationId: 'SECRET_PRIME_CONVERSATION',
+      runId: 'SECRET-RUN-ID',
+      primeConversationId: 'SECRET-PRIME-CONVERSATION',
       startedAt: 90,
       agents: [
         { info: { role: 'prime', state: 'active', contextTokens: 120_000, id: 'SECRET_PRIME_ID', task: 'SECRET_TASK' }, queue: [] },
@@ -212,7 +212,7 @@ async function writeFixtureUserData(root: string): Promise<void> {
       ]
     }],
     dormantRuns: [{
-      primeConversationId: 'SECRET_OLD_PRIME',
+      primeConversationId: 'SECRET-OLD-PRIME',
       startedAt: 1,
       parkedAt: 2,
       agents: [{ info: { role: 'worker', state: 'finished', contextTokens: 300_000, id: 'SECRET_OLD_WORKER' }, queue: [] }]
@@ -310,6 +310,35 @@ describe('Night Build protocol v2', () => {
     await expect(readDurableSidecarSnapshot(root)).rejects.toThrow('swarm_version_invalid');
   });
 
+  it('fails closed on malformed installed swarm v7 run ownership while keeping valid projection bounded', async () => {
+    const root = await tempRoot();
+    await writeFixtureUserData(root);
+    const swarmFile = path.join(root, 'state', 'swarm.json');
+    const valid = JSON.parse(await fs.readFile(swarmFile, 'utf8')) as Record<string, unknown>;
+
+    for (const mutate of [
+      (swarm: Record<string, unknown>) => { (swarm['activeRuns'] as Array<Record<string, unknown>>)[0] = { agents: [] }; },
+      (swarm: Record<string, unknown>) => { delete ((swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>)['primeConversationId']; },
+      (swarm: Record<string, unknown>) => { ((swarm['activeRuns'] as Array<Record<string, unknown>>)[0] as Record<string, unknown>)['startedAt'] = 'SECRET_BAD_TIME'; },
+      (swarm: Record<string, unknown>) => { (swarm['dormantRuns'] as Array<Record<string, unknown>>)[0] = { agents: [] }; }
+    ]) {
+      const malformed = structuredClone(valid);
+      mutate(malformed);
+      await fs.writeFile(swarmFile, JSON.stringify(malformed));
+      await expect(readDurableSidecarSnapshot(root)).rejects.toThrow(/swarm_(?:active|dormant)_/);
+    }
+
+    await fs.writeFile(swarmFile, JSON.stringify(valid));
+    const snapshot = await readDurableSidecarSnapshot(root);
+    expect(snapshot.workers.rows).toEqual([
+      { role: 'prime', state: 'active', contextTokens: 120_000 },
+      { role: 'worker', state: 'sleeping', contextTokens: 220_000 }
+    ]);
+    const encoded = JSON.stringify(snapshot.workers);
+    expect(encoded).not.toContain('SECRET_');
+    expect(encoded).not.toContain('SECRET-');
+  });
+
   it('publishes 0600 exclusively and refuses a foreign discovery file', async () => {
     const root = await tempRoot();
     const discoveryFile = path.join(root, NIGHT_BUILD_BRIDGE_V2_DISCOVERY_FILE);
@@ -336,6 +365,23 @@ describe('Night Build protocol v2', () => {
     await expect(request(handle.discovery, { token: handle.discovery.token, protocol: '2' })).rejects.toBeTruthy();
   });
 
+  it('does not unlink a foreign discovery replacement that wins after cleanup ownership proof', async () => {
+    const root = await tempRoot();
+    const file = path.join(root, NIGHT_BUILD_BRIDGE_V2_DISCOVERY_FILE);
+    let raced = false;
+    const handle = await startNightBuildBridgeV2(root, fixtureSource(), {
+      ownershipPollMs: 60_000,
+      beforeDiscoveryCleanupClaim: async () => {
+        raced = true;
+        await fs.writeFile(file, 'FOREIGN_AFTER_PROOF\n');
+      }
+    });
+    handles.push(handle);
+    await handle.stop();
+    expect(raced).toBe(true);
+    expect(await fs.readFile(file, 'utf8')).toBe('FOREIGN_AFTER_PROOF\n');
+  });
+
   it('self-stops and conditionally removes its own discovery when the owner dies', async () => {
     const root = await tempRoot();
     let alive = true;
@@ -348,6 +394,53 @@ describe('Night Build protocol v2', () => {
     expect(await handle.checkOwnershipNow()).toBe(false);
     await expect(fs.readFile(path.join(root, NIGHT_BUILD_BRIDGE_V2_DISCOVERY_FILE), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(request(handle.discovery, { token: handle.discovery.token, protocol: '2' })).rejects.toBeTruthy();
+  });
+
+  it('re-proves owner identity after the awaited status snapshot before returning 200', async () => {
+    const root = await tempRoot();
+    let snapshotStarted!: () => void;
+    let releaseSnapshot!: () => void;
+    const started = new Promise<void>((resolve) => { snapshotStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+    let alive = true;
+    const source: NightBuildBridgeV2DataSource = {
+      ...fixtureSource('durable-sidecar'),
+      snapshot: async () => {
+        snapshotStarted();
+        await release;
+        return fixtureSnapshot();
+      }
+    };
+    const handle = await startNightBuildBridgeV2(root, source, { ownerIsCurrent: async () => alive, ownershipPollMs: 60_000 });
+    handles.push(handle);
+    const pending = request(handle.discovery, { token: handle.discovery.token, protocol: '2' });
+    await started;
+    alive = false;
+    releaseSnapshot();
+    expect((await pending).status).toBe(503);
+  });
+
+  it('re-proves exact discovery generation after the awaited status snapshot before returning 200', async () => {
+    const root = await tempRoot();
+    let snapshotStarted!: () => void;
+    let releaseSnapshot!: () => void;
+    const started = new Promise<void>((resolve) => { snapshotStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+    const source: NightBuildBridgeV2DataSource = {
+      ...fixtureSource('durable-sidecar'),
+      snapshot: async () => {
+        snapshotStarted();
+        await release;
+        return fixtureSnapshot();
+      }
+    };
+    const handle = await startNightBuildBridgeV2(root, source, { ownershipPollMs: 60_000 });
+    handles.push(handle);
+    const pending = request(handle.discovery, { token: handle.discovery.token, protocol: '2' });
+    await started;
+    await fs.writeFile(path.join(root, NIGHT_BUILD_BRIDGE_V2_DISCOVERY_FILE), 'FOREIGN_DURING_SNAPSHOT\n');
+    releaseSnapshot();
+    expect((await pending).status).toBe(503);
   });
 
   it('enforces protocol, bearer, method, body and browser-origin fences over HTTP', async () => {

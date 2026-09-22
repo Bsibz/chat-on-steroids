@@ -57,6 +57,11 @@ function nullableString(value: unknown, label: string, max = 256): string | null
   return value;
 }
 
+function requiredId(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !ID.test(value)) throw new Error(`${label}_invalid`);
+  return value;
+}
+
 function goalMode(value: unknown, label: string): GoalMode {
   if (value !== 'goal' && value !== 'loop') throw new Error(`${label}_invalid`);
   return value;
@@ -251,10 +256,14 @@ function parseSwarm(raw: unknown | null, enabled: boolean): NightBuildBridgeV2Sn
   if (root['version'] !== 6 && root['version'] !== 7) throw new Error('swarm_version_invalid');
   if (!Array.isArray(root['activeRuns']) || !Array.isArray(root['dormantRuns'])) throw new Error('swarm_runs_invalid');
   if (root['activeRuns'].length > MAX_SWARM_RUNS || root['dormantRuns'].length > MAX_SWARM_RUNS) throw new Error('swarm_run_limit');
+  safeInt(root['savedAt'], 'swarm_saved_at', false);
   const rows: NightBuildBridgeV2WorkerInput[] = [];
   let parsedAgents = 0;
   for (const rawRun of root['activeRuns']) {
     const run = object(rawRun, 'swarm_active_run');
+    requiredId(run['runId'], 'swarm_active_run_id');
+    requiredId(run['primeConversationId'], 'swarm_active_prime_conversation_id');
+    safeInt(run['startedAt'], 'swarm_active_started_at', false);
     const active = parseAgentRows(run['agents']);
     parsedAgents += active.length;
     rows.push(...active);
@@ -262,6 +271,9 @@ function parseSwarm(raw: unknown | null, enabled: boolean): NightBuildBridgeV2Sn
   }
   for (const rawRun of root['dormantRuns']) {
     const run = object(rawRun, 'swarm_dormant_run');
+    requiredId(run['primeConversationId'], 'swarm_dormant_prime_conversation_id');
+    safeInt(run['startedAt'], 'swarm_dormant_started_at', false);
+    safeInt(run['parkedAt'], 'swarm_dormant_parked_at', false);
     parsedAgents += parseAgentRows(run['agents']).length;
     if (parsedAgents > MAX_SWARM_AGENTS) throw new Error('swarm_agent_limit');
   }

@@ -102,6 +102,8 @@ export interface NightBuildBridgeV2StartOptions {
   bridgeStartedAt?: number;
   ownerIsCurrent?: () => Promise<boolean>;
   ownershipPollMs?: number;
+  /** Test seam for proving cleanup stays conditional across the ownership-check/claim boundary. */
+  beforeDiscoveryCleanupClaim?: () => Promise<void>;
 }
 
 function latestTimestamp(values: Array<number | null | undefined>): number | null {
@@ -294,7 +296,9 @@ function requestHandler(
       }
       if (req.url !== '/v2/status') return writeJson(res, 404, { error: 'not_found' });
       if (!(await statusAllowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-      writeJson(res, 200, await projectNightBuildBridgeV2Status(source, discovery));
+      const status = await projectNightBuildBridgeV2Status(source, discovery);
+      if (!(await statusAllowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
+      writeJson(res, 200, status);
     })().catch(() => {
       if (!res.headersSent) writeJson(res, 500, { error: 'internal_error' });
       else res.end();
@@ -323,8 +327,34 @@ async function publishDiscoveryExclusive(userData: string, discovery: NightBuild
   return { file, bytes };
 }
 
-async function conditionalUnlink(file: string, ownedBytes: Buffer): Promise<void> {
-  if (await sameBytes(file, ownedBytes)) await fs.rm(file, { force: true });
+async function conditionalUnlink(file: string, ownedBytes: Buffer, beforeClaim?: () => Promise<void>): Promise<void> {
+  if (!(await sameBytes(file, ownedBytes))) return;
+  await beforeClaim?.();
+
+  // Renaming first makes the destructive step operate on a private name. A replacement that
+  // wins after the byte proof is moved aside and rechecked instead of being unlinked by path.
+  const claimed = `${file}.cleanup-${randomUUID()}`;
+  try {
+    await fs.rename(file, claimed);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (await sameBytes(claimed, ownedBytes)) {
+    await fs.rm(claimed, { force: true });
+    return;
+  }
+
+  // The path changed between proof and claim. Restore the foreign bytes without overwriting a
+  // newer generation. If another writer already filled the public path, retain the claimed file
+  // as recovery evidence rather than deleting bytes we do not own.
+  try {
+    await fs.link(claimed, file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return;
+    throw error;
+  }
+  await fs.rm(claimed, { force: true });
 }
 
 async function closeServer(server: http.Server): Promise<void> {
@@ -397,8 +427,11 @@ export async function startNightBuildBridgeV2(
       if (stopped) return;
       stopped = true;
       if (timer) { clearInterval(timer); timer = null; }
-      await conditionalUnlink(publication.file, publication.bytes);
-      await closeServer(server);
+      try {
+        await conditionalUnlink(publication.file, publication.bytes, options.beforeDiscoveryCleanupClaim);
+      } finally {
+        await closeServer(server);
+      }
     })();
     return stopping;
   };

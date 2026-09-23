@@ -282,6 +282,39 @@ describe('Night Build Chat Transport v2 local server', () => {
     })).status).toBe(200);
   });
 
+  it('stamps observedAt after a newly admitted Send exists', async () => {
+    const root = await tempRoot();
+    let createdAt = 0;
+    const source = dataSource({
+      createSend: async (input) => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        createdAt = Date.now();
+        return {
+          id: input.id,
+          conversation: input.conversation,
+          state: 'queued',
+          createdAt,
+          claimedAt: null,
+          receipt: null,
+          error: null
+        };
+      }
+    });
+    const handle = await startNightBuildChatTransportV2(root, source);
+    handles.push(handle);
+
+    const created = await request(handle.discovery, {
+      ...auth(handle.discovery),
+      method: 'POST',
+      path: '/v2/send-intents',
+      body: JSON.stringify({ id: SEND_ID, conversation: CONVERSATION, text: 'timestamp order' })
+    });
+    expect(created.status).toBe(202);
+    const body = JSON.parse(created.text) as { createdAt: number; observedAt: number };
+    expect(body.createdAt).toBe(createdAt);
+    expect(body.observedAt).toBeGreaterThanOrEqual(createdAt);
+  });
+
   it('revokes the stale generation when discovery bytes are replaced and preserves the foreign owner', async () => {
     const root = await tempRoot();
     const handle = await startNightBuildChatTransportV2(root, dataSource());

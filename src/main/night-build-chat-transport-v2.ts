@@ -158,26 +158,26 @@ function requestHandler(
       }
       if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
       const url = new URL(req.url, 'http://127.0.0.1');
-      const common = {
+      const common = () => ({
         protocolVersion: NIGHT_BUILD_CHAT_TRANSPORT_V2_PROTOCOL,
         appVersion: discovery.appVersion,
         transportStartedAt: discovery.startedAt,
         observedAt: Date.now()
-      } as const;
+      } as const);
       try {
         if (url.pathname === '/v2/conversations') {
           if (req.method !== 'GET') return writeJson(res, 405, { error: 'method_not_allowed' });
           if (url.search !== '' || !noRequestBody(req)) return writeJson(res, 400, { error: 'bad_request' });
           const conversations = await source.list();
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-          return writeJson(res, 200, { ...common, conversations });
+          return writeJson(res, 200, { ...common(), conversations });
         }
         if (url.pathname === '/v2/transcript') {
           if (req.method !== 'GET') return writeJson(res, 405, { error: 'method_not_allowed' });
           if (!noRequestBody(req)) return writeJson(res, 400, { error: 'bad_request' });
           const transcript = await source.transcript(transcriptQuery(url));
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-          return writeJson(res, 200, { ...common, ...transcript });
+          return writeJson(res, 200, { ...common(), ...transcript });
         }
         if (url.pathname === '/v2/send-intents') {
           if (req.method !== 'POST') return writeJson(res, 405, { error: 'method_not_allowed' });
@@ -186,7 +186,7 @@ function requestHandler(
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
           const intent = await source.createSend(body);
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-          return writeJson(res, 202, { ...common, ...intent });
+          return writeJson(res, 202, { ...common(), ...intent });
         }
         const send = url.pathname.match(/^\/v2\/send-intents\/([0-9a-f-]{36})(\/inspect)?$/i);
         if (send && UUID.test(send[1]!)) {
@@ -197,7 +197,7 @@ function requestHandler(
           if (intent === undefined) return writeJson(res, 405, { error: 'method_not_allowed' });
           if (!intent) return writeJson(res, 404, { error: 'intent_not_found' });
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-          return writeJson(res, 200, { ...common, ...intent });
+          return writeJson(res, 200, { ...common(), ...intent });
         }
         if (url.pathname === '/v2/stop-intents') {
           if (req.method !== 'POST') return writeJson(res, 405, { error: 'method_not_allowed' });
@@ -206,7 +206,7 @@ function requestHandler(
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
           const intent = await source.createStop(body);
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-          return writeJson(res, 202, { ...common, ...intent });
+          return writeJson(res, 202, { ...common(), ...intent });
         }
         const stop = url.pathname.match(/^\/v2\/stop-intents\/([0-9a-f-]{36})$/i);
         if (stop && UUID.test(stop[1]!)) {
@@ -215,7 +215,7 @@ function requestHandler(
           const intent = await source.stop(stop[1]!);
           if (!intent) return writeJson(res, 404, { error: 'intent_not_found' });
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
-          return writeJson(res, 200, { ...common, ...intent });
+          return writeJson(res, 200, { ...common(), ...intent });
         }
         return writeJson(res, 404, { error: 'not_found' });
       } catch (error) {

@@ -4,9 +4,28 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createNightBuildChatTransportSource, resolveNightBuildChatNativeSendProof } from '../src/main/night-build-chat-transport-source.js';
+import { createInProcessNightBuildChatTransportV2Source } from '../src/main/night-build-chat-transport-v2-source.js';
+import { initDurableStore, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
+import { recordDeliveredInput } from '../src/main/session/input-history.js';
+import { listInputs, pendingBrowserInputs, resetInputForTests, type InputEntry } from '../src/main/session/input.js';
+import {
+  appendEvent,
+  createSession,
+  flushSessions,
+  initSessionStore,
+  readEvents,
+  resetSessionStoreForTests,
+  unsetSessionRootForTests,
+  upsertMessageEvent
+} from '../src/main/session/store.js';
+import {
+  createNightBuildChatTransportSource,
+  nightBuildChatHandleForIdentity,
+  resolveNightBuildChatNativeSendProof,
+  resolveNightBuildChatNativeSendProofByIdentity
+} from '../src/main/night-build-chat-transport-source.js';
 import {
   startNightBuildChatTransportV1,
   type NightBuildChatTransportV1Handle
@@ -618,7 +637,7 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     )).resolves.toBeNull();
   });
 
-  it('does not treat the app-authored ACK projection as native ChatGPT acceptance proof', async () => {
+  it('proves acceptance from the confirmed app input row and keeps the extension echo on the same receipt', async () => {
     const root = await tempRoot();
     const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
     const fixture = await writeFixture(root, { inputId });
@@ -635,13 +654,20 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     });
     const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
     const [conversation] = await source.list();
+    const receipt = {
+      messageId: 'message-user-0001',
+      turnId: 'turn-0000001',
+      turnOrigin: 2,
+      revisionSeq: 1
+    };
     await expect(resolveNightBuildChatNativeSendProof(
       root, 'test-generation-secret', conversation!.handle, inputId
-    )).resolves.toBeNull();
+    )).resolves.toEqual(receipt);
+    await expect(resolveNightBuildChatNativeSendProof(
+      root, 'test-generation-secret', conversation!.handle, inputId, 'message-user-0001'
+    )).resolves.toEqual(receipt);
 
-    // The later recorder echo of ChatGPT's own stable row carries the same
-    // canonical key and retained inputId; only this extension observation may
-    // establish Native Chat acceptance.
+    // A later page echo of the same canonical key keeps this receipt.
     await writeCanonical(fixture.dir, {
       seq: 9,
       origin: 1,
@@ -658,7 +684,395 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
     await expect(resolveNightBuildChatNativeSendProof(
       root, 'test-generation-secret', conversation!.handle, inputId
-    )).resolves.toMatchObject({ messageId: 'message-user-0001', turnId: 'turn-0000001' });
+    )).resolves.toMatchObject({ messageId: 'message-user-0001', turnId: 'turn-0000001', turnOrigin: 2 });
+    await expect(resolveNightBuildChatNativeSendProof(
+      root, 'test-generation-secret', conversation!.handle, inputId, 'message-user-0001'
+    )).resolves.toMatchObject({ messageId: 'message-user-0001', turnId: 'turn-0000001', turnOrigin: 2 });
+  });
+
+  it('rejects a confirmed app row that sits before the current resume lower bound', async () => {
+    const root = await tempRoot();
+    const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const fixture = await writeFixture(root, {
+      chatIds: ['conversation-old1', 'conversation-0001'],
+      resume: true,
+      historySeq: 12,
+      inputId
+    });
+    await writeCanonical(fixture.dir, {
+      seq: 1,
+      time: 100,
+      source: 'app',
+      kind: 'user_message',
+      messageId: 'message-user-0001',
+      inputId,
+      inputDelivery: 'confirmed',
+      authoredText: 'Hello from ordinary ChatGPT',
+      message: stored('Hello from ordinary ChatGPT')
+    });
+    await writeCanonical(fixture.dir, {
+      seq: 10, time: 1_000, source: 'extension', kind: 'user_message',
+      messageId: 'message-resume-0001',
+      message: stored('[[CLF-RESUME:abcdefghijklmnop]]\n\nContinue here')
+    });
+    await writeContinuationWal(root, {
+      token: 'abcdefghijklmnop',
+      sessionId: 'session-0001',
+      conversationId: 'conversation-0001',
+      handoffId: 'handoff-0001',
+      messageId: 'message-resume-0001'
+    });
+    fixture.meta['updatedAt'] = 1_200;
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    await expect(resolveNightBuildChatNativeSendProof(
+      root, 'test-generation-secret', conversation!.handle, inputId, 'message-user-0001'
+    )).resolves.toBeNull();
+    await expect(resolveNightBuildChatNativeSendProof(
+      root, 'test-generation-secret', conversation!.handle, inputId
+    )).resolves.toBeNull();
+  });
+});
+
+describe('recordDeliveredInput confirmed app row proves Native Chat acceptance', () => {
+  const salt = 'test-generation-secret';
+  const turnId = 'turn-native-0001';
+  let userData = '';
+
+  beforeEach(async () => {
+    userData = await fs.mkdtemp(path.join(os.tmpdir(), 'cos-native-app-proof-'));
+    initSessionStore(userData);
+  });
+
+  afterEach(async () => {
+    resetInputForTests();
+    resetDurableForTests();
+    resetSessionStoreForTests();
+    unsetSessionRootForTests();
+    if (userData) await fs.rm(userData, { recursive: true, force: true });
+  });
+
+  async function deliverConfirmed(options: {
+    conversationId?: string;
+    messageId?: string;
+    inputId?: string;
+    text?: string;
+    withTurn?: boolean;
+    turn?: string;
+  } = {}) {
+    const conversationId = options.conversationId ?? 'conv-native-0001';
+    const messageId = options.messageId ?? 'msg-user-native-0001';
+    const inputId = options.inputId ?? '11111111-1111-4111-8111-111111111111';
+    const text = options.text ?? 'Hello from the confirmed native send';
+    const session = await createSession({ conversationId, title: 'Native send proof' });
+    const entry = {
+      id: inputId,
+      sessionId: session.id,
+      conversationId,
+      state: 'sent',
+      messageId,
+      deliveredAt: 300,
+      text
+    } as InputEntry;
+    expect(await recordDeliveredInput(entry)).toBe(true);
+    if (options.withTurn !== false) {
+      await appendEvent(session.id, {
+        source: 'extension',
+        time: 400,
+        kind: 'turn_start',
+        turnId: options.turn ?? turnId
+      });
+    }
+    await flushSessions();
+    const recorded = (await readEvents(session.id)).find((event) => event.kind === 'user_message');
+    expect(recorded).toMatchObject({
+      source: 'app',
+      kind: 'user_message',
+      messageId,
+      inputId,
+      inputDelivery: 'confirmed'
+    });
+    return { session, conversationId, messageId, inputId, text };
+  }
+
+  async function prove(
+    sessionId: string,
+    conversationId: string,
+    inputId: string,
+    expectedMessageId?: string
+  ) {
+    const handle = await nightBuildChatHandleForIdentity(userData, salt, sessionId, conversationId);
+    expect(handle).toBeTruthy();
+    return resolveNightBuildChatNativeSendProof(userData, salt, handle!, inputId, expectedMessageId);
+  }
+
+  it('resolves native acceptance from the exact confirmed app row', async () => {
+    const delivered = await deliverConfirmed();
+    const receipt = {
+      messageId: delivered.messageId,
+      turnId,
+      turnOrigin: 2,
+      revisionSeq: 1
+    };
+    await expect(prove(
+      delivered.session.id, delivered.conversationId, delivered.inputId, delivered.messageId
+    )).resolves.toEqual(receipt);
+    await expect(prove(
+      delivered.session.id, delivered.conversationId, delivered.inputId
+    )).resolves.toEqual(receipt);
+  });
+
+  it('still proves the extension user row with the same turn receipt', async () => {
+    const conversationId = 'conv-native-0001';
+    const messageId = 'msg-user-native-0001';
+    const inputId = '11111111-1111-4111-8111-111111111111';
+    const text = 'Hello from the extension echo';
+    const session = await createSession({ conversationId, title: 'Extension echo' });
+    await upsertMessageEvent(session.id, {
+      source: 'extension',
+      kind: 'user_message',
+      time: 100,
+      messageId,
+      inputId,
+      inputDelivery: 'confirmed',
+      message: { text, chars: text.length, truncated: false }
+    });
+    await appendEvent(session.id, { source: 'extension', time: 400, kind: 'turn_start', turnId });
+    await flushSessions();
+    await expect(prove(session.id, conversationId, inputId, messageId)).resolves.toMatchObject({
+      messageId,
+      turnId,
+      turnOrigin: 2
+    });
+    await expect(prove(session.id, conversationId, inputId)).resolves.toMatchObject({
+      messageId,
+      turnId
+    });
+  });
+
+  it('rejects an app row whose input id is missing or different', async () => {
+    const delivered = await deliverConfirmed();
+    await expect(prove(
+      delivered.session.id,
+      delivered.conversationId,
+      '22222222-2222-4222-8222-222222222222',
+      delivered.messageId
+    )).resolves.toBeNull();
+
+    const bare = await createSession({ conversationId: 'conv-native-0002', title: 'Missing input id' });
+    const text = 'App prose without an outbox id';
+    await upsertMessageEvent(bare.id, {
+      source: 'app',
+      kind: 'user_message',
+      time: 100,
+      messageId: 'msg-user-native-0002',
+      inputDelivery: 'confirmed',
+      message: { text, chars: text.length, truncated: false }
+    });
+    await appendEvent(bare.id, { source: 'extension', time: 400, kind: 'turn_start', turnId: 'turn-native-0002' });
+    await flushSessions();
+    await expect(prove(
+      bare.id, 'conv-native-0002', delivered.inputId, 'msg-user-native-0002'
+    )).resolves.toBeNull();
+  });
+
+  it('rejects offered and tool-keyed app rows', async () => {
+    const session = await createSession({ conversationId: 'conv-native-0003', title: 'Offered input' });
+    const inputId = '33333333-3333-4333-8333-333333333333';
+    const text = 'Waiting for a tool receipt';
+    await upsertMessageEvent(session.id, {
+      source: 'app',
+      kind: 'user_message',
+      time: 100,
+      messageId: 'msg-user-native-0003',
+      inputId,
+      inputDelivery: 'offered',
+      message: { text, chars: text.length, truncated: false }
+    });
+    await appendEvent(session.id, { source: 'extension', time: 400, kind: 'turn_start', turnId: 'turn-native-0003' });
+    await flushSessions();
+    await expect(prove(session.id, 'conv-native-0003', inputId, 'msg-user-native-0003')).resolves.toBeNull();
+
+    const tool = await createSession({ conversationId: 'conv-native-0004', title: 'Tool input' });
+    const toolId = '44444444-4444-4444-8444-444444444444';
+    expect(await recordDeliveredInput({
+      id: toolId,
+      sessionId: tool.id,
+      state: 'sent',
+      messageId: `input:${toolId}`,
+      deliveredAt: 300,
+      text: 'Tool handout confirmed'
+    } as InputEntry)).toBe(true);
+    await appendEvent(tool.id, { source: 'extension', time: 400, kind: 'turn_start', turnId: 'turn-native-0004' });
+    await flushSessions();
+    const toolRow = (await readEvents(tool.id)).find((event) => event.kind === 'user_message');
+    expect(toolRow).toMatchObject({ source: 'app', inputDelivery: 'confirmed', messageId: `input:${toolId}` });
+    await expect(prove(tool.id, 'conv-native-0004', toolId, `input:${toolId}`)).resolves.toBeNull();
+    await expect(prove(tool.id, 'conv-native-0004', toolId)).resolves.toBeNull();
+  });
+
+  it('rejects the wrong ChatGPT message id, another session, and a decision row', async () => {
+    const delivered = await deliverConfirmed();
+    await expect(prove(
+      delivered.session.id, delivered.conversationId, delivered.inputId, 'msg-user-other-9999'
+    )).resolves.toBeNull();
+    const other = await createSession({ conversationId: 'conv-native-0099', title: 'Other chat' });
+    await flushSessions();
+    await expect(prove(other.id, 'conv-native-0099', delivered.inputId, delivered.messageId)).resolves.toBeNull();
+
+    const helper = await createSession({
+      conversationId: 'conv-helper-0001',
+      title: 'Helper chat',
+      origin: { kind: 'helper', fromSessionId: null, agentId: null, task: 'decide' }
+    });
+    expect(await recordDeliveredInput({
+      id: '99999999-9999-4999-8999-999999999991',
+      sessionId: helper.id,
+      conversationId: 'conv-helper-0001',
+      state: 'sent',
+      messageId: 'msg-helper-decision-1',
+      deliveredAt: 280,
+      purpose: 'decision',
+      text: 'Helper decision'
+    } as InputEntry)).toBe(false);
+    expect(await recordDeliveredInput({
+      id: '99999999-9999-4999-8999-999999999999',
+      sessionId: helper.id,
+      conversationId: 'conv-helper-0001',
+      state: 'sent',
+      messageId: 'msg-helper-user-0001',
+      deliveredAt: 300,
+      text: 'Helper user row'
+    } as InputEntry)).toBe(true);
+    await appendEvent(helper.id, { source: 'extension', time: 400, kind: 'turn_start', turnId: 'turn-helper-0001' });
+    await flushSessions();
+    expect(await nightBuildChatHandleForIdentity(userData, salt, helper.id, 'conv-helper-0001')).toBeNull();
+    expect((await readEvents(helper.id)).some((event) => event.kind === 'user_message' && event.messageId === 'msg-helper-decision-1')).toBe(false);
+  });
+
+  it('fails closed when two confirmed rows share the input id or two turns share the question', async () => {
+    const conversationId = 'conv-native-0005';
+    const inputId = '55555555-5555-4555-8555-555555555555';
+    const session = await createSession({ conversationId, title: 'Ambiguous rows' });
+    expect(await recordDeliveredInput({
+      id: inputId, sessionId: session.id, conversationId, state: 'sent',
+      messageId: 'msg-user-native-0005a', deliveredAt: 300, text: 'First confirmed row'
+    } as InputEntry)).toBe(true);
+    expect(await recordDeliveredInput({
+      id: inputId, sessionId: session.id, conversationId, state: 'sent',
+      messageId: 'msg-user-native-0005b', deliveredAt: 320, text: 'Second confirmed row'
+    } as InputEntry)).toBe(true);
+    await appendEvent(session.id, { source: 'extension', time: 400, kind: 'turn_start', turnId });
+    await flushSessions();
+    await expect(prove(session.id, conversationId, inputId)).resolves.toBeNull();
+    await expect(prove(session.id, conversationId, inputId, 'msg-user-native-0005a')).resolves.toBeNull();
+
+    const split = await createSession({ conversationId: 'conv-native-0006', title: 'Two turns' });
+    expect(await recordDeliveredInput({
+      id: '66666666-6666-4666-8666-666666666666',
+      sessionId: split.id,
+      conversationId: 'conv-native-0006',
+      state: 'sent',
+      messageId: 'msg-user-native-0006',
+      deliveredAt: 300,
+      text: 'One question, two turns'
+    } as InputEntry)).toBe(true);
+    await appendEvent(split.id, { source: 'extension', time: 400, kind: 'turn_start', turnId: 'turn-native-0006' });
+    await appendEvent(split.id, { source: 'extension', time: 500, kind: 'turn_start', turnId: 'turn-native-0007' });
+    await flushSessions();
+    await expect(prove(
+      split.id, 'conv-native-0006', '66666666-6666-4666-8666-666666666666', 'msg-user-native-0006'
+    )).resolves.toBeNull();
+  });
+
+  it('requires the timeline turn questionId to be that exact message', async () => {
+    const delivered = await deliverConfirmed({ withTurn: false });
+    await expect(prove(
+      delivered.session.id, delivered.conversationId, delivered.inputId, delivered.messageId
+    )).resolves.toBeNull();
+
+    const early = await createSession({ conversationId: 'conv-native-0008', title: 'Turn before question' });
+    await appendEvent(early.id, { source: 'extension', time: 100, kind: 'turn_start', turnId: 'turn-native-0008' });
+    expect(await recordDeliveredInput({
+      id: '88888888-8888-4888-8888-888888888888',
+      sessionId: early.id,
+      conversationId: 'conv-native-0008',
+      state: 'sent',
+      messageId: 'msg-user-native-0008',
+      deliveredAt: 300,
+      text: 'Question arrived after the turn'
+    } as InputEntry)).toBe(true);
+    await flushSessions();
+    await expect(prove(
+      early.id, 'conv-native-0008', '88888888-8888-4888-8888-888888888888', 'msg-user-native-0008'
+    )).resolves.toBeNull();
+  });
+
+  it('stamps nativeChat.acceptance on the same id and does not create another browser send', async () => {
+    initDurableStore(userData);
+    resetInputForTests();
+    const delivered = await deliverConfirmed();
+    const outbox: InputEntry = {
+      id: delivered.inputId,
+      sessionId: delivered.session.id,
+      text: delivered.text,
+      mode: 'auto',
+      dueAt: 100,
+      model: null,
+      reasoningEffort: null,
+      state: 'sent',
+      owner: 'native-document-1',
+      createdAt: 100,
+      conversationId: delivered.conversationId,
+      messageId: delivered.messageId,
+      deliveredAt: 300,
+      offeredAt: 200,
+      sendAuthorizedAt: 250,
+      transportIntent: 'browser',
+      historyRecorded: true,
+      nativeChat: { sessionId: delivered.session.id, conversationId: delivered.conversationId }
+    };
+    await writeDurableNow('session-input', [outbox]);
+    resetInputForTests();
+    const transport = createInProcessNightBuildChatTransportV2Source(userData, salt);
+    const first = await transport.send(delivered.inputId);
+    const stopProof = await resolveNightBuildChatNativeSendProofByIdentity(
+      userData, salt, delivered.session.id, delivered.conversationId, delivered.inputId
+    );
+    expect(stopProof).toMatchObject({ messageId: delivered.messageId, turnId, turnOrigin: 2 });
+    expect(first).toMatchObject({
+      id: delivered.inputId,
+      state: 'nativeAcceptanceProved',
+      error: null,
+      receipt: {
+        userMessage: createHash('sha256').update('user-message').update('\0').update(salt).update('\0')
+          .update(delivered.session.id + '\0' + stopProof!.messageId).digest('base64url'),
+        turn: createHash('sha256').update('turn').update('\0').update(salt).update('\0')
+          .update(delivered.session.id + '\0' + stopProof!.turnId).digest('base64url'),
+        turnOrigin: stopProof!.turnOrigin
+      }
+    });
+    const stamped = (await listInputs()).find((entry) => entry.id === delivered.inputId);
+    expect(stamped?.nativeChat?.acceptance).toEqual(stopProof);
+    expect(stamped).toMatchObject({ state: 'sent', messageId: delivered.messageId, historyRecorded: true });
+
+    const second = await transport.send(delivered.inputId);
+    expect(second).toEqual(first);
+    const replay = await transport.createSend({
+      id: delivered.inputId,
+      conversation: first!.conversation,
+      text: delivered.text
+    });
+    expect(replay).toMatchObject({
+      id: delivered.inputId,
+      state: 'nativeAcceptanceProved',
+      receipt: first!.receipt,
+      error: null
+    });
+    expect(await listInputs()).toHaveLength(1);
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect(await transport.inspectSend(delivered.inputId)).toEqual(first);
   });
 });
 

@@ -71,6 +71,7 @@ interface CanonicalMessage {
   messageId: string;
   providerMessageId?: string;
   inputId?: string;
+  inputDelivery?: 'offered' | 'confirmed';
   seq: number;
   origin: number;
   time: number;
@@ -352,6 +353,10 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
   if (turnId && !CHAT_ID.test(turnId)) throw new Error('chat_transport_message_turn_invalid');
   const providerMessageId = optionalString(event['providerMessageId'], 'chat_transport_provider_message_invalid');
   const inputId = optionalString(event['inputId'], 'chat_transport_input_id_invalid');
+  const inputDelivery = event['inputDelivery'];
+  if (inputDelivery !== undefined && inputDelivery !== 'offered' && inputDelivery !== 'confirmed') {
+    throw new Error('chat_transport_input_delivery_invalid');
+  }
   const source = event['source'];
   if (source !== 'extension' && source !== 'mcp' && source !== 'app') throw new Error('chat_transport_message_source_invalid');
   const agent = optionalString(event['agent'], 'chat_transport_agent_invalid', 128);
@@ -370,6 +375,9 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
     ...(turnId ? { turnId } : {}),
     ...(providerMessageId ? { providerMessageId } : {}),
     ...(inputId ? { inputId } : {}),
+    ...(kind === 'user_message' && (inputDelivery === 'offered' || inputDelivery === 'confirmed')
+      ? { inputDelivery }
+      : {}),
     ...parseStoredText(event['message'])
   };
   if (kind === 'user_message') return base;
@@ -594,12 +602,45 @@ function positionOf(event: { seq: number; origin?: number }): number {
   return typeof event.origin === 'number' && Number.isFinite(event.origin) ? event.origin : event.seq;
 }
 
+/**
+ * Browser delivery recorded by recordDeliveredInput().
+ * Tool handouts keep messageId `input:<id>` and must not become a native question.
+ */
+function confirmedNativeAppInput(message: CanonicalMessage): boolean {
+  return message.kind === 'user_message'
+    && message.source === 'app'
+    && message.inputDelivery === 'confirmed'
+    && !!message.inputId
+    && !message.messageId.startsWith('input:');
+}
+
 function injectedUserMessage(event: CanonicalMessage, turns: Record<string, TimelineTurn>): boolean {
-  return event.kind === 'user_message' && (
-    event.source !== 'extension' ||
-    (!!event.inputId && (event.messageId.startsWith('input:') ||
-      (!!event.turnId && Object.hasOwn(turns, event.turnId))))
+  if (event.kind !== 'user_message') return false;
+  // Extension page rows and the confirmed app delivery of ChatGPT's own user
+  // message are native questions. Offered rows, tool handouts, decision rows,
+  // and every other app or mcp user message stay injected.
+  if (event.source !== 'extension' && !confirmedNativeAppInput(event)) return true;
+  return !!event.inputId && (
+    event.messageId.startsWith('input:') ||
+    (!!event.turnId && Object.hasOwn(turns, event.turnId))
   );
+}
+
+function eligibleNativeSendMessage(
+  message: CanonicalMessage,
+  inputId: string,
+  lowerBoundOrigin: number,
+  expectedMessageId?: string
+): boolean {
+  if (message.kind !== 'user_message' || message.origin < lowerBoundOrigin) return false;
+  if (expectedMessageId) {
+    if (message.messageId !== expectedMessageId) return false;
+    if (message.source === 'extension') return !message.inputId || message.inputId === inputId;
+    return confirmedNativeAppInput(message) && message.inputId === inputId;
+  }
+  if (message.inputId !== inputId) return false;
+  if (message.source === 'extension') return true;
+  return confirmedNativeAppInput(message);
 }
 
 function responseTurnId(turns: Record<string, TimelineTurn>, id: string): string {
@@ -923,12 +964,15 @@ export async function resolveNightBuildChatConversation(
 }
 
 /**
- * Resolve a confirmed outbox input to the recorder's exact native question and
- * exact local turn. A same-text row is deliberately insufficient. Ordinarily the
- * canonical row must carry the durable input id written by recordDeliveredInput().
- * When the browser ACK has already durably bound this input to one exact native
- * ChatGPT user-message id, that exact id may bridge the short attribution lag —
- * but a conflicting canonical input id still fails closed.
+ * Resolve one Native Chat send to the recorder's exact native question and turn.
+ * A same-text row is deliberately insufficient.
+ *
+ * An extension user row with the expected message id and no conflicting input id
+ * remains proof. recordDeliveredInput() writes the same delivery as source app,
+ * inputDelivery confirmed, the exact outbox id, and ChatGPT's own user-message id.
+ * That row is the other eligible proof. Offered, tool-keyed, missing-input, and
+ * any other app user row is not. One matching message and one turn whose
+ * questionId equals that message id are still required.
  */
 export async function resolveNightBuildChatNativeSendProof(
   userData: string,
@@ -953,9 +997,7 @@ export async function resolveNightBuildChatNativeSendProof(
     const lowerBoundOrigin = await currentLowerBound(userData, row, canonical.messages, journal, dir);
     const identity = rebuildIdentity(canonical.messages, canonical.identityTools, journal);
     const messages = canonical.messages.filter((message) =>
-      message.kind === 'user_message' && message.source === 'extension' &&
-      message.origin >= lowerBoundOrigin && message.messageId === expectedMessageId &&
-      (!message.inputId || message.inputId === inputId)
+      eligibleNativeSendMessage(message, inputId, lowerBoundOrigin, expectedMessageId)
     );
     if (messages.length !== 1) return null;
     const message = messages[0]!;
@@ -978,8 +1020,7 @@ export async function resolveNightBuildChatNativeSendProof(
 
   const projection = await selectedProjection(userData, row);
   const messages = projection.messages.filter((message) =>
-    message.kind === 'user_message' && message.source === 'extension' &&
-    message.inputId === inputId && message.origin >= projection.lowerBoundOrigin
+    eligibleNativeSendMessage(message, inputId, projection.lowerBoundOrigin)
   );
   if (messages.length !== 1) return null;
   const message = messages[0]!;

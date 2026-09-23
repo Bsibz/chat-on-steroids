@@ -924,21 +924,28 @@ export async function resolveNightBuildChatConversation(
 
 /**
  * Resolve a confirmed outbox input to the recorder's exact native question and
- * exact local turn. A same-text row is deliberately insufficient: the canonical
- * message must carry the durable input id written by recordDeliveredInput().
+ * exact local turn. A same-text row is deliberately insufficient. Ordinarily the
+ * canonical row must carry the durable input id written by recordDeliveredInput().
+ * When the browser ACK has already durably bound this input to one exact native
+ * ChatGPT user-message id, that exact id may bridge the short attribution lag —
+ * but a conflicting canonical input id still fails closed.
  */
 export async function resolveNightBuildChatNativeSendProof(
   userData: string,
   salt: string,
   handle: string,
-  inputId: string
+  inputId: string,
+  expectedMessageId?: string
 ): Promise<NightBuildChatNativeSendProof | null> {
   const row = await catalogRowForHandle(userData, salt, handle);
   if (!row) return null;
   const projection = await selectedProjection(userData, row);
   const messages = projection.messages.filter((message) =>
     message.kind === 'user_message' && message.source === 'extension' &&
-    message.inputId === inputId && message.origin >= projection.lowerBoundOrigin
+    message.origin >= projection.lowerBoundOrigin &&
+    (expectedMessageId
+      ? message.messageId === expectedMessageId && (!message.inputId || message.inputId === inputId)
+      : message.inputId === inputId)
   );
   if (messages.length !== 1) return null;
   const message = messages[0]!;
@@ -959,11 +966,12 @@ export async function resolveNightBuildChatNativeSendProofByIdentity(
   salt: string,
   sessionId: string,
   conversationId: string,
-  inputId: string
+  inputId: string,
+  expectedMessageId?: string
 ): Promise<NightBuildChatNativeSendProof | null> {
   const handle = await nightBuildChatHandleForIdentity(userData, salt, sessionId, conversationId);
   if (!handle) return null;
-  return resolveNightBuildChatNativeSendProof(userData, salt, handle, inputId);
+  return resolveNightBuildChatNativeSendProof(userData, salt, handle, inputId, expectedMessageId);
 }
 
 function projectedTurnOrigin(identity: IdentityState, turnId: string | undefined): number | null {

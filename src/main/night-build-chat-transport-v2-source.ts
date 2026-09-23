@@ -132,7 +132,8 @@ export function createInProcessNightBuildChatTransportV2Source(
           salt,
           row.nativeChat.sessionId,
           row.nativeChat.conversationId,
-          row.id
+          row.id,
+          row.messageId
         );
       } catch (error) {
         // A live ChatGPT turn can revise canonical shards/metadata between the

@@ -573,6 +573,51 @@ describe('Night Build Chat Transport v1 durable projection', () => {
       });
   });
 
+  it('uses an exact browser-acknowledged native message id while canonical input attribution lags', async () => {
+    const root = await tempRoot();
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    await writeFixture(root, { historySeq: 1 });
+    const [conversation] = await source.list();
+    expect(conversation).toBeDefined();
+
+    await expect(resolveNightBuildChatNativeSendProof(
+      root,
+      'test-generation-secret',
+      conversation!.handle,
+      'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      'message-user-0001'
+    )).resolves.toMatchObject({
+      messageId: 'message-user-0001',
+      turnId: 'turn-0000001',
+      turnOrigin: 2,
+      revisionSeq: 1
+    });
+  });
+
+  it('rejects a wrong or conflicting browser-acknowledged native message identity', async () => {
+    const root = await tempRoot();
+    const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await writeFixture(root, { historySeq: 1, inputId: 'ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb' });
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    expect(conversation).toBeDefined();
+
+    await expect(resolveNightBuildChatNativeSendProof(
+      root,
+      'test-generation-secret',
+      conversation!.handle,
+      inputId,
+      'wrong-message-id'
+    )).resolves.toBeNull();
+    await expect(resolveNightBuildChatNativeSendProof(
+      root,
+      'test-generation-secret',
+      conversation!.handle,
+      inputId,
+      'message-user-0001'
+    )).resolves.toBeNull();
+  });
+
   it('does not treat the app-authored ACK projection as native ChatGPT acceptance proof', async () => {
     const root = await tempRoot();
     const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';

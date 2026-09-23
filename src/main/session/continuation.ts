@@ -69,6 +69,7 @@ import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, recordNote, rebindConversation } from './recorder.js';
 import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
+import { nativeChatMutationPendingForSession } from './input.js';
 import {
   ensureCommittedResumeHandoff,
   findSessionByConversation,
@@ -76,7 +77,8 @@ import {
   readEvents,
   readHandoff,
   refuseAutomaticCompactionNow,
-  rebindSession
+  rebindSession,
+  withSessionMutationAdmission
 } from './store.js';
 
 /**
@@ -773,9 +775,15 @@ export async function openContinuationNow(
   const opening = openingBySession.get(sessionId);
   if (opening) return opening;
 
-  const work = (async (): Promise<ContinuationView> => {
+  const work = withSessionMutationAdmission(sessionId, 'continuation admission', async (): Promise<ContinuationView> => {
     const again = [...byToken.values()].find((entry) => entry.sessionId === sessionId && isOpen(entry));
     if (again) return view(again);
+    // Native Chat Send/Stop owns this exact conversation until its durable
+    // outcome is settled. Compact & Resume must wait rather than capture or
+    // rebind a conversation while that owner is ambiguous.
+    if (await nativeChatMutationPendingForSession(sessionId)) {
+      throw new Error('native_chat_mutation_pending');
+    }
     const entry = makeContinuation(sessionId, fromConversationId, automatic, normalizeProjectId(project));
     const source = await getSession(sessionId);
     entry.sourceTurnId = source?.activeTurnId ?? null;
@@ -794,7 +802,7 @@ export async function openContinuationNow(
     beginPrimeTransfer(fromConversationId);
     logInfo(`continuation ${entry.token.slice(0, 8)} durably opened for session ${sessionId} in chat ${fromConversationId}`);
     return view(entry);
-  })();
+  });
   openingBySession.set(sessionId, work);
   try {
     return await work;

@@ -1877,6 +1877,29 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     let tab = candidates.sort((a, b) => a.id - b.id)[0];
     let elected = elections[input.id];
     let recoveredReuse = null;
+    // Night Build native Chat never grants browser-opening or retarget authority.
+    // It may use exactly one already-open document already showing the pinned
+    // conversation. Missing, duplicate, hydrating or replacement documents wait
+    // safely; the durable input expiry decides failed vs unknown from whether
+    // Send had been authorized, and no other tab receives the prompt.
+    if (input.nativePinned === true) {
+      if (!target || candidates.length !== 1 || !tab || !Number.isInteger(tab.id) || tab.pendingUrl) continue;
+      const documentId = tabDocuments[String(tab.id)];
+      const source = { tab: tab.id, documentId, navigationEpoch: tabEpochs[String(tab.id)] };
+      if (!documentId || !ownsDocument(source) || conversationForTab(tab) !== target) continue;
+      if (elected) {
+        if (elected.tab !== tab.id || (elected.conversationId && elected.conversationId !== target)) continue;
+      } else {
+        await elect(input.id, { tab: tab.id, stage: 'ready', conversationId: target });
+        elected = elections[input.id];
+      }
+      // Re-read after the durable election. Navigation cannot turn that election
+      // into authority over whatever replaced this document.
+      const current = await chrome.tabs.get(tab.id).catch(() => null);
+      if (!current || current.pendingUrl || !ownsDocument(source) || conversationForTab(current) !== target) continue;
+      offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target });
+      continue;
+    }
     // A fresh app offer can follow a session rebind or the user's actual return.
     // Transfer to an existing exact-chat document only. Opening authority stays
     // spent, and main still owns the exclusive claim and final Send permission.
@@ -2020,6 +2043,32 @@ async function offerStopTurns(requests, background = false) {
       if (!current()) return;
       const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
       if (!current()) return;
+      if (request.nativePinned === true) {
+        // Native Chat Stop has no browser-opening or replacement-document
+        // authority. It may wake only the exact document owner that claimed
+        // and accepted the corresponding Native Send.
+        const expectedOwner = typeof request.browserOwner === 'string' && request.browserOwner.length <= 512
+          ? request.browserOwner : null;
+        if (!expectedOwner) return;
+        const tab = tabs.find(candidate => {
+          if (!Number.isInteger(candidate.id) || candidate.pendingUrl ||
+              conversationFromUrl(candidate.url) !== request.conversationId) return false;
+          const key = String(candidate.id), documentId = tabDocuments[key], navigationEpoch = tabEpochs[key];
+          if (!documentId || !Number.isInteger(navigationEpoch)) return false;
+          const source = { tab: candidate.id, documentId, navigationEpoch };
+          return ownsDocument(source) && String(candidate.id) + ':' + documentId + ':' + navigationEpoch === expectedOwner;
+        });
+        if (!tab) return;
+        const key = String(tab.id), documentId = tabDocuments[key], navigationEpoch = tabEpochs[key];
+        const source = { tab: tab.id, documentId, navigationEpoch };
+        const latest = await chrome.tabs.get(tab.id);
+        if (!current() || !documentId || !Number.isInteger(navigationEpoch) || !ownsDocument(source) ||
+            String(tab.id) + ':' + documentId + ':' + navigationEpoch !== expectedOwner || latest.pendingUrl ||
+            conversationFromUrl(latest.url) !== request.conversationId) return;
+        await chrome.tabs.sendMessage(tab.id, { type: 'clf-stop-turn', id: request.id,
+          conversationId: request.conversationId, turnId: request.turnId }, { documentId });
+        return;
+      }
       let election = stopOpenings[request.id];
       if (election && (election.conversationId !== request.conversationId || election.turnId !== request.turnId)) return;
       const matches = tab => conversationFromUrl(tab.pendingUrl || tab.url) === request.conversationId;

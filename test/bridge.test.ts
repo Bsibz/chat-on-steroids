@@ -12060,6 +12060,78 @@ describe('app requests to stop one exact active turn', () => {
     const activity = await request('GET', `/activity?conversationId=${conversationId}`);
     expect(activity.body.stopTurn).toEqual({ turnId: 'unanchored-turn', userMessageId: null });
   });
+  it('native Chat Stop requires the exact question, preserves Goal/Loop state and never wakes a missing browser', async () => {
+    const { requestNativeChatStop, nativeChatStopPending, sessionControlsFor, setSessionAutomation } = await import('../src/main/bridge.js');
+    const conversationId = 'e7878787-aaaa-4bbb-8ccc-111111111111';
+    await pair();
+    const result = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'native-question', text: 'Native owner work' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'native-turn' }
+    ] } });
+    const sessionId = result.body.sessionId as string;
+    await setSessionAutomation(sessionId, 'loop');
+    const wakes = recoveryBrowserWake.mock.calls.length;
+    const intentId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const persistMutationDeadline = vi.fn(async () => true);
+    await requestNativeChatStop({ intentId, sessionId, conversationId, turnId: 'native-turn', userMessageId: 'native-question', browserOwner: '7:native-stop-page:1', persistMutationDeadline });
+    expect(nativeChatStopPending(intentId)).toBe(true);
+    expect(recoveryBrowserWake.mock.calls.length).toBe(wakes);
+    expect(await sessionControlsFor(sessionId)).toMatchObject({ activeTurnId: 'native-turn', stopPending: true, automation: 'loop' });
+    await requestNativeChatStop({ intentId, sessionId, conversationId, turnId: 'native-turn', userMessageId: 'native-question', browserOwner: '7:native-stop-page:1', persistMutationDeadline });
+    expect(persistMutationDeadline).toHaveBeenCalledTimes(2);
+    expect((await request('GET', '/status')).body.stopTurns).toHaveLength(1);
+    const command = (await request('GET', '/status')).body.stopTurns[0];
+    const redeemed = await request('POST', '/commands/redeem', { body: { id: command.id, client: 'native-stop-page', conversationId } });
+    expect(redeemed.status).toBe(200);
+    expect(redeemed.body.command).toMatchObject({ kind: 'stop-turn', turnId: 'native-turn', userMessageId: 'native-question' });
+    await expect(requestNativeChatStop({
+      intentId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', sessionId, conversationId, turnId: 'native-turn', userMessageId: 'native-question',
+      browserOwner: '7:native-stop-page:1',
+      persistMutationDeadline: async () => true
+    })).rejects.toThrow('native_stop_already_pending');
+  });
+  it('native Chat Stop refuses a missing or wrong accepted-message anchor before queuing anything', async () => {
+    const { requestNativeChatStop } = await import('../src/main/bridge.js');
+    const conversationId = 'e7979797-aaaa-4bbb-8ccc-111111111111';
+    await pair();
+    const result = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'exact-question', text: 'Native owner work' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'exact-turn' }
+    ] } });
+    await expect(requestNativeChatStop({
+      intentId: 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa',
+      sessionId: result.body.sessionId,
+      conversationId,
+      turnId: 'exact-turn',
+      userMessageId: 'wrong-question',
+      browserOwner: '7:native-stop-page:1',
+      persistMutationDeadline: async () => true
+    })).rejects.toThrow('active_turn_changed');
+    expect((await request('GET', '/status')).body.stopTurns).toEqual([]);
+    expect(recoveryBrowserWake).not.toHaveBeenCalled();
+  });
+  it('retires native Chat Stop before browser wake when its mutation deadline cannot be persisted', async () => {
+    const { requestNativeChatStop, nativeChatStopPending } = await import('../src/main/bridge.js');
+    const conversationId = 'e7a7a7a7-aaaa-4bbb-8ccc-111111111111';
+    await pair();
+    const result = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'deadline-question', text: 'Native owner work' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'deadline-turn' }
+    ] } });
+    const intentId = 'dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb';
+    await expect(requestNativeChatStop({
+      intentId,
+      sessionId: result.body.sessionId,
+      conversationId,
+      turnId: 'deadline-turn',
+      userMessageId: 'deadline-question',
+      browserOwner: '7:native-stop-page:1',
+      persistMutationDeadline: async () => false
+    })).rejects.toThrow('stop_request_not_durable');
+    expect(nativeChatStopPending(intentId)).toBe(false);
+    expect((await request('GET', '/status')).body.stopTurns).toEqual([]);
+    expect(recoveryBrowserWake).not.toHaveBeenCalled();
+  });
   it('hands a new Stop to the shared absent-browser startup owner once and revokes it for a newer turn', async () => {
     const { stopSessionTurn } = await import('../src/main/bridge.js');
     const conversationId = 'e8888888-aaaa-4bbb-8ccc-111111111111';

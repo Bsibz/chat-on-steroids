@@ -142,7 +142,7 @@ it('carries the direct-turn offer only to the elected existing conversation', as
 });
 
 type Tab = { id: number; url?: string; pendingUrl?: string; windowId?: number; active?: boolean; pinned?: boolean };
-async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}) {
+async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; nativePinned?: true }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}) {
   const tabs: Tab[] = [];
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
@@ -295,6 +295,44 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect(restarted.fetch.mock.calls.some(([input]) => new URL(input).pathname === '/models')).toBe(change === 'same');
     expect(restarted.create).not.toHaveBeenCalled();
   });
+  it('offers native Chat only to one already-open exact owned document and never opens a fallback', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const };
+    const missing = await worker([input]);
+    await missing.maintain();
+    expect(missing.create).not.toHaveBeenCalled();
+    expect(missing.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+
+    const exact = await worker([input]);
+    exact.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    await exact.authorizeDocument({ tab: { id: 7 }, documentId: 'native-doc', frameId: 0, url: exact.tabs[0]!.url }, { navigationEpoch: 1 });
+    await exact.maintain();
+    expect(exact.create).not.toHaveBeenCalled();
+    expect(exact.sendMessage).toHaveBeenCalledWith(7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId });
+    expect((exact.localSaved.inputOpenings as any)[firstId]).toEqual({ tab: 7, stage: 'ready', conversationId: secondId });
+  });
+
+  it('refuses duplicate or replacement documents for one native Chat intent', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const };
+    const duplicate = await worker([input]);
+    duplicate.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` }, { id: 8, url: `https://chatgpt.com/c/${secondId}` });
+    await duplicate.authorizeDocument({ tab: { id: 7 }, documentId: 'native-a', frameId: 0, url: duplicate.tabs[0]!.url }, { navigationEpoch: 1 });
+    await duplicate.authorizeDocument({ tab: { id: 8 }, documentId: 'native-b', frameId: 0, url: duplicate.tabs[1]!.url }, { navigationEpoch: 1 });
+    await duplicate.maintain();
+    expect(duplicate.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+    expect(duplicate.create).not.toHaveBeenCalled();
+
+    const replaced = await worker([input]);
+    replaced.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    await replaced.authorizeDocument({ tab: { id: 7 }, documentId: 'native-original', frameId: 0, url: replaced.tabs[0]!.url }, { navigationEpoch: 1 });
+    await replaced.maintain();
+    replaced.sendMessage.mockClear();
+    replaced.tabs.splice(0, 1, { id: 9, url: `https://chatgpt.com/c/${secondId}` });
+    await replaced.authorizeDocument({ tab: { id: 9 }, documentId: 'native-replacement', frameId: 0, url: replaced.tabs[0]!.url }, { navigationEpoch: 1 });
+    await replaced.maintain();
+    expect(replaced.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+    expect(replaced.create).not.toHaveBeenCalled();
+  });
+
   it('moves a queued checkpoint to its existing compacted successor once, including legacy elections', async () => {
     const input = { id: firstId, conversationId: secondId, supersededConversationId: firstId };
     const h = await worker([input], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready' } } });
@@ -1147,6 +1185,41 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
 
 describe('Stop owns one exact existing or newly opened browser document', () => {
   const command = () => ({ id: '1122334455667700', conversationId: firstId, turnId: 'exact-turn', expiresAt: Date.now() + 120000 });
+  it('native Chat Stop never opens or transfers and targets only the accepting document owner', async () => {
+    const h = await worker([]) as any;
+    const request = {
+      ...command(),
+      nativePinned: true,
+      browserOwner: '7:native-send-document:1'
+    };
+    await h.offerStopTurns([request]);
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+
+    h.tabs.push({ id: 7, url: 'https://chatgpt.com/c/' + firstId });
+    const accepted = await h.authorizeDocument(
+      { tab: { id: 7 }, documentId: 'native-send-document', frameId: 0, url: h.tabs[0].url },
+      { navigationEpoch: 1 }
+    );
+    await h.noteTabConversation(accepted, firstId);
+    await h.offerStopTurns([{ ...request, id: '1122334455667701' }]);
+    expect(h.sendMessage).toHaveBeenCalledWith(
+      7,
+      { type: 'clf-stop-turn', id: '1122334455667701', conversationId: firstId, turnId: 'exact-turn' },
+      { documentId: 'native-send-document' }
+    );
+    expect(h.create).not.toHaveBeenCalled();
+
+    h.sendMessage.mockClear();
+    const replacement = await h.authorizeDocument(
+      { tab: { id: 7 }, documentId: 'replacement-document', frameId: 0, url: h.tabs[0].url },
+      { navigationEpoch: 2 }
+    );
+    await h.noteTabConversation(replacement, firstId);
+    await h.offerStopTurns([{ ...request, id: '1122334455667702' }]);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.create).not.toHaveBeenCalled();
+  });
   it('opens once and delivers after the elected new page registers', async () => {
     const h = await worker([]) as any;
     const request = command();

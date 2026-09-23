@@ -6,9 +6,11 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
 import {
-  fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput,
+  fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput, enqueueNativeChatInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
-  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy
+  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy,
+  beginNativeChatStopMutation, nativeChatMutationPendingForSession, recordNativeChatAcceptance,
+  setNativeChatStopExpiry
 } from '../src/main/session/input.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
@@ -84,6 +86,108 @@ afterEach(async () => {
 });
 
 describe('durable user input ownership', () => {
+  it('pins Night Build native Chat to one idle ordinary conversation and exact authored text', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const id = randomUUID();
+    const text = '  Native Chat keeps these outer spaces.  ';
+    const row = await enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId, text });
+    expect(row).toMatchObject({
+      id,
+      text,
+      conversationId: binding.conversationId,
+      transportIntent: 'browser',
+      nativeChat: { sessionId, conversationId: binding.conversationId },
+      state: 'queued'
+    });
+    expect(await pendingBrowserInputs()).toEqual([{
+      id,
+      conversationId: binding.conversationId,
+      nativePinned: true
+    }]);
+    const claim = await claimBrowserInput(id, 'native-document-one', binding.conversationId, true);
+    expect(claim).toMatchObject({ text, deliveryText: text, owner: 'native-document-one' });
+    expect(await claimBrowserInput(id, 'native-document-two', binding.conversationId, true)).toBeNull();
+    expect(await authorizeBrowserInput(id, 'native-document-one', binding.conversationId)).toBe(true);
+    expect(await acknowledgeBrowserInput(id, 'native-document-one', binding.conversationId, 'native-message-id')).toBe(true);
+    expect((await listInputs()).find((entry) => entry.id === id)).toMatchObject({
+      state: 'sent', messageId: 'native-message-id', text
+    });
+  });
+
+  it('never retargets or replays a native Chat intent after its pinned conversation changes', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const id = randomUUID();
+    await enqueueNativeChatInput({ id, sessionId, conversationId: 'conversation-a', text: 'Pinned once' });
+    expect(await claimBrowserInput(id, 'native-document', 'conversation-a', true)).not.toBeNull();
+    binding.conversationId = 'conversation-b';
+    expect(await authorizeBrowserInput(id, 'native-document', 'conversation-a')).toBe(false);
+    expect(await claimBrowserInput(id, 'replacement-document', 'conversation-b', true)).toBeNull();
+    const persisted = (await listInputs()).find((entry) => entry.id === id);
+    expect(persisted).toMatchObject({ conversationId: 'conversation-a', owner: 'native-document', state: 'browser' });
+  });
+
+  it('rejects busy native Chat admission and conflicting reuse of an intent id', async () => {
+    binding.activeTurnId = 'live-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'live-turn', time: 900 };
+    const id = randomUUID();
+    await expect(enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId, text: 'Do not interrupt' }))
+      .rejects.toThrow('not idle');
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'live-turn', time: 901 };
+    await enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId, text: 'One intent' });
+    await expect(enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId, text: 'Different intent' }))
+      .rejects.toThrow('already belongs to different input');
+  });
+
+  it('requires native authorization and ChatGPT message identity before accepting a browser ACK', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const id = randomUUID();
+    await enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId, text: 'Exact send' });
+    expect(await claimBrowserInput(id, 'native-document', binding.conversationId, true)).not.toBeNull();
+    expect(await acknowledgeBrowserInput(id, 'native-document', binding.conversationId, 'native-message-id')).toBe(false);
+    expect(await authorizeBrowserInput(id, 'native-document', binding.conversationId)).toBe(true);
+    expect(await acknowledgeBrowserInput(id, 'native-document', binding.conversationId)).toBe(false);
+    expect(await acknowledgeBrowserInput(id, 'native-document', binding.conversationId, 'native-message-id')).toBe(true);
+  });
+
+  it('durably blocks conversation mutation until exact Send proof and through an unsettled Native Stop', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const id = randomUUID();
+    await enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId, text: 'Lease me' });
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(true);
+    expect(await claimBrowserInput(id, 'native-document', binding.conversationId, true)).not.toBeNull();
+    expect(await authorizeBrowserInput(id, 'native-document', binding.conversationId)).toBe(true);
+    expect(await acknowledgeBrowserInput(id, 'native-document', binding.conversationId, 'native-message-id')).toBe(true);
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(true);
+
+    expect(await recordNativeChatAcceptance(id, sessionId, binding.conversationId, {
+      messageId: 'native-message-id',
+      turnId: 'native-turn',
+      turnOrigin: 42,
+      revisionSeq: 43
+    })).toBe(true);
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(false);
+
+    const stopId = randomUUID();
+    expect(await beginNativeChatStopMutation(id, sessionId, binding.conversationId, {
+      intentId: stopId,
+      turnId: 'native-turn',
+      userMessageId: 'native-message-id',
+      expiresAt: 2_000
+    })).toBe(true);
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(true);
+    expect(await setNativeChatStopExpiry(id, stopId, 2_500)).toBe(true);
+    resetInputForTests();
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(true);
+    now = 2_501;
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(false);
+    expect((await listInputs()).find((entry) => entry.id === id)?.nativeChat?.stop).toBeUndefined();
+  });
+
   it('preserves messages beyond the former composer limit through admission, restart and browser claim', async () => {
     binding.finishEnabled = false;
     const text = 'Long user request. '.repeat(2000);

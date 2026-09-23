@@ -67,6 +67,7 @@ interface SessionMeta extends IdentityState {
 interface CanonicalMessage {
   key: string;
   kind: 'user_message' | 'assistant_message';
+  source: 'extension' | 'mcp' | 'app';
   messageId: string;
   providerMessageId?: string;
   inputId?: string;
@@ -131,6 +132,42 @@ export interface NightBuildChatTranscriptQuery {
 export interface NightBuildChatTransportDataSource {
   list(): Promise<NightBuildChatConversationListV1['conversations']>;
   transcript(query: NightBuildChatTranscriptQuery): Promise<Omit<NightBuildChatTranscriptV1, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>>;
+}
+
+/**
+ * Internal-only identity behind one opaque Night Build conversation handle.
+ *
+ * Raw recorder/session/ChatGPT ids never cross the loopback Chat transport.
+ * The primary-process write service uses this solely to bind an owner request
+ * to the same ordinary conversation that the read projection admitted.
+ */
+export interface NightBuildChatResolvedConversation {
+  handle: string;
+  sessionId: string;
+  conversationId: string;
+  title: string;
+  updatedAt: number;
+}
+
+/** Exact native-send receipt once recorder identity has caught up with input history. */
+export interface NightBuildChatNativeSendProof {
+  messageId: string;
+  turnId: string;
+  turnOrigin: number;
+  revisionSeq: number;
+}
+
+export async function nightBuildChatHandleForIdentity(
+  userData: string,
+  salt: string,
+  sessionId: string,
+  conversationId: string
+): Promise<string | null> {
+  if (!salt) throw new Error('chat_transport_salt_missing');
+  const rows = (await catalogRows(userData)).filter((row) =>
+    row.directoryId === sessionId && row.meta.conversationId === conversationId
+  );
+  return rows.length === 1 ? conversationHandle(rows[0]!, salt) : null;
 }
 
 function object(value: unknown, code: string): JsonObject {
@@ -315,6 +352,8 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
   if (turnId && !CHAT_ID.test(turnId)) throw new Error('chat_transport_message_turn_invalid');
   const providerMessageId = optionalString(event['providerMessageId'], 'chat_transport_provider_message_invalid');
   const inputId = optionalString(event['inputId'], 'chat_transport_input_id_invalid');
+  const source = event['source'];
+  if (source !== 'extension' && source !== 'mcp' && source !== 'app') throw new Error('chat_transport_message_source_invalid');
   const agent = optionalString(event['agent'], 'chat_transport_agent_invalid', 128);
   const authoredText = event['authoredText'] === undefined
     ? undefined
@@ -323,7 +362,7 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
     ? undefined
     : safeInt(event['authoredAt'], 'chat_transport_authored_at_invalid');
   const base: CanonicalMessage = {
-    key, kind, messageId, seq, origin,
+    key, kind, source, messageId, seq, origin,
     time: safeInt(event['time'], 'chat_transport_message_time_invalid'),
     ...(authoredAt === undefined ? {} : { authoredAt }),
     ...(authoredText === undefined ? {} : { authoredText }),
@@ -556,8 +595,11 @@ function positionOf(event: { seq: number; origin?: number }): number {
 }
 
 function injectedUserMessage(event: CanonicalMessage, turns: Record<string, TimelineTurn>): boolean {
-  return event.kind === 'user_message' && !!event.inputId &&
-    (event.messageId.startsWith('input:') || (!!event.turnId && Object.hasOwn(turns, event.turnId)));
+  return event.kind === 'user_message' && (
+    event.source !== 'extension' ||
+    (!!event.inputId && (event.messageId.startsWith('input:') ||
+      (!!event.turnId && Object.hasOwn(turns, event.turnId))))
+  );
 }
 
 function responseTurnId(turns: Record<string, TimelineTurn>, id: string): string {
@@ -856,6 +898,72 @@ function conversationHandle(row: CatalogRow, salt: string): string {
 
 function publicConversation(row: CatalogRow, salt: string): NightBuildChatConversationV1 {
   return { handle: conversationHandle(row, salt), title: row.meta.title, updatedAt: row.meta.updatedAt };
+}
+
+async function catalogRowForHandle(userData: string, salt: string, handle: string): Promise<CatalogRow | null> {
+  const matches = (await catalogRows(userData)).filter((row) => conversationHandle(row, salt) === handle);
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+export async function resolveNightBuildChatConversation(
+  userData: string,
+  salt: string,
+  handle: string
+): Promise<NightBuildChatResolvedConversation | null> {
+  if (!salt) throw new Error('chat_transport_salt_missing');
+  const row = await catalogRowForHandle(userData, salt, handle);
+  if (!row) return null;
+  return {
+    handle,
+    sessionId: row.directoryId,
+    conversationId: row.meta.conversationId,
+    title: row.meta.title,
+    updatedAt: row.meta.updatedAt
+  };
+}
+
+/**
+ * Resolve a confirmed outbox input to the recorder's exact native question and
+ * exact local turn. A same-text row is deliberately insufficient: the canonical
+ * message must carry the durable input id written by recordDeliveredInput().
+ */
+export async function resolveNightBuildChatNativeSendProof(
+  userData: string,
+  salt: string,
+  handle: string,
+  inputId: string
+): Promise<NightBuildChatNativeSendProof | null> {
+  const row = await catalogRowForHandle(userData, salt, handle);
+  if (!row) return null;
+  const projection = await selectedProjection(userData, row);
+  const messages = projection.messages.filter((message) =>
+    message.kind === 'user_message' && message.source === 'extension' &&
+    message.inputId === inputId && message.origin >= projection.lowerBoundOrigin
+  );
+  if (messages.length !== 1) return null;
+  const message = messages[0]!;
+  const turns = Object.entries(projection.identity.timelineTurns).filter(([, turn]) => turn.questionId === message.messageId);
+  if (turns.length !== 1) return null;
+  const [turnId, turn] = turns[0]!;
+  if (!turnId || turn.origin < projection.lowerBoundOrigin) return null;
+  return {
+    messageId: message.messageId,
+    turnId,
+    turnOrigin: turn.origin,
+    revisionSeq: message.seq
+  };
+}
+
+export async function resolveNightBuildChatNativeSendProofByIdentity(
+  userData: string,
+  salt: string,
+  sessionId: string,
+  conversationId: string,
+  inputId: string
+): Promise<NightBuildChatNativeSendProof | null> {
+  const handle = await nightBuildChatHandleForIdentity(userData, salt, sessionId, conversationId);
+  if (!handle) return null;
+  return resolveNightBuildChatNativeSendProof(userData, salt, handle, inputId);
 }
 
 function projectedTurnOrigin(identity: IdentityState, turnId: string | undefined): number | null {

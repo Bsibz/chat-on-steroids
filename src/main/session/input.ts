@@ -48,6 +48,13 @@ export const inputArgs = z.object({
   reasoningEffort: z.enum(REASONING_EFFORTS).nullable()
 });
 export type InputArgs = z.infer<typeof inputArgs>;
+const nativeChatInputArgs = z.object({
+  id: z.string().uuid(),
+  sessionId: z.string().min(8).max(64),
+  conversationId: z.string().min(8).max(256),
+  text: z.string().min(1).max(MAX_CHATGPT_MESSAGE_CHARS).refine((value) => value.trim().length > 0)
+}).strict();
+export type NativeChatInputArgs = z.infer<typeof nativeChatInputArgs>;
 const entrySchema = inputArgs.extend({
   /** This exact outbox row owns the first native send of its reserved local session. */
   opening: z.literal(true).optional(),
@@ -93,7 +100,27 @@ const entrySchema = inputArgs.extend({
   /** Store origin proving the canonical row was committed; never a wall-clock guess. */
   historySeq: z.number().int().positive().optional(),
   completedTurnId: z.string().max(256).optional(),
-  queueOrder: z.number().int().nonnegative().optional()
+  queueOrder: z.number().int().nonnegative().optional(),
+  /** Internal Night Build native Chat write custody; never part of inputArgs. */
+  nativeChat: z.object({
+    sessionId: z.string().min(8).max(64),
+    conversationId: z.string().min(8).max(256),
+    /** Exact recorder proof. Raw ids stay internal and never cross v2. */
+    acceptance: z.object({
+      messageId: z.string().min(1).max(256),
+      turnId: z.string().min(1).max(256),
+      turnOrigin: z.number().int().nonnegative(),
+      revisionSeq: z.number().int().nonnegative()
+    }).strict().optional(),
+    /** Durable ownership while one exact Native Stop remains unsettled. */
+    stop: z.object({
+      intentId: z.string().uuid(),
+      turnId: z.string().min(1).max(256),
+      userMessageId: z.string().min(1).max(256),
+      /** Bounded admission lease, monotonically extended to the exact bridge command deadline. */
+      expiresAt: z.number().nonnegative()
+    }).strict().optional()
+  }).strict().optional()
 });
 export type InputEntry = z.infer<typeof entrySchema>;
 const STATE = 'session-input';
@@ -166,6 +193,16 @@ async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   if (entry.opening && entry.sessionId && !entry.deliveredAt) {
     const session = await getSession(entry.sessionId);
     if (session?.origin?.kind === 'desktop' && !session.conversationId) return true;
+  }
+  if (entry.nativeChat) {
+    if (!entry.sessionId || entry.sessionId !== entry.nativeChat.sessionId ||
+        entry.conversationId !== entry.nativeChat.conversationId || entry.transportIntent !== 'browser' ||
+        entry.finishOwner || entry.directTurn || entry.silenceBoundary || entry.mode !== 'auto') return false;
+    const session = await getSession(entry.nativeChat.sessionId);
+    if (!session || session.conversationId !== entry.nativeChat.conversationId ||
+        session.origin?.kind === 'worker' || session.origin?.kind === 'helper' ||
+        isChatBlocked(entry.nativeChat.conversationId) || await conversationWasSuperseded(entry.nativeChat.conversationId)) return false;
+    return (await sessionInputPolicy(entry.nativeChat.sessionId)).browserAllowed;
   }
   if (entry.mode === 'finish' && entry.sessionId && entry.afterTurn !== true) {
     const session = await getSession(entry.sessionId);
@@ -490,6 +527,13 @@ async function transition(current: InputEntry[], next: InputEntry[], automated: 
 /** Freeze the exact transport bytes with its durable claim, never the authored enqueue payload. */
 async function prepare(entry: InputEntry, suffix = ''): Promise<InputEntry> {
   if (entry.purpose === 'decision') return entry;
+  // Native Chat is the owner's ordinary ChatGPT message. Do not append Goal,
+  // skill, finish, AGENTS or other transport prose; exact authored bytes are
+  // later correlated with ChatGPT's own native user row.
+  if (entry.nativeChat) {
+    if (suffix) throw new Error('Native Chat does not accept generated prompt suffixes');
+    return { ...entry, deliveryText: entry.deliveryText ?? entry.text };
+  }
   // Generated openings and plans cannot replace the user's complete request.
   // Keep the authored text intact; freeze the complete objective in the same
   // delivery claim so retries cannot reconstruct a different opening message.
@@ -541,6 +585,17 @@ function append(current: InputEntry[], entry: InputEntry, stackDirect = false): 
   }), ...active, ...current.filter(row => !retained.has(row.id) && active.some(root => sameDelivery(root, row) || root.id === row.companionInputId)), entry];
 }
 async function target(entry: InputEntry): Promise<string | null> {
+  if (entry.nativeChat) {
+    if (!entry.sessionId || entry.sessionId !== entry.nativeChat.sessionId || entry.conversationId !== entry.nativeChat.conversationId)
+      throw new Error('Native Chat target identity changed');
+    const session = await getSession(entry.nativeChat.sessionId);
+    if (!session || session.conversationId !== entry.nativeChat.conversationId ||
+        session.origin?.kind === 'worker' || session.origin?.kind === 'helper' ||
+        isChatBlocked(entry.nativeChat.conversationId) || await conversationWasSuperseded(entry.nativeChat.conversationId)) {
+      throw new Error('Native Chat target is no longer current');
+    }
+    return entry.nativeChat.conversationId;
+  }
   if (entry.purpose === 'decision') {
     if (entry.conversationId && isChatBlocked(entry.conversationId)) throw new Error('Unblock this helper conversation before sending');
     return entry.conversationId;
@@ -668,6 +723,179 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       throw error;
     }
     return { ...next.find(row => row.id === entry.id)! };
+  });
+}
+
+/**
+ * Queue one owner-authored Night Build Chat message for one exact, already
+ * existing ordinary ChatGPT conversation. This path grants no model, Goal,
+ * attachment, fresh-chat or retargeting authority.
+ */
+export function enqueueNativeChatInput(raw: NativeChatInputArgs): Promise<InputEntry> {
+  return serial(async () => {
+    const input = nativeChatInputArgs.parse(raw);
+    const current = await load();
+    const prior = current.find((entry) => entry.id === input.id);
+    if (prior) {
+      if (!prior.nativeChat || prior.nativeChat.sessionId !== input.sessionId ||
+          prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text) {
+        throw new Error('Native Chat intent id already belongs to different input');
+      }
+      return { ...prior };
+    }
+    const session = await getSession(input.sessionId);
+    if (!session || session.conversationId !== input.conversationId ||
+        session.origin?.kind === 'worker' || session.origin?.kind === 'helper' ||
+        isChatBlocked(input.conversationId) || await conversationWasSuperseded(input.conversationId)) {
+      throw new Error('Native Chat conversation is no longer current');
+    }
+    const policy = await sessionInputPolicy(input.sessionId);
+    if (!policy.browserAllowed) throw new Error('Native Chat conversation is not idle');
+    const createdAt = Date.now();
+    const entry: InputEntry = {
+      id: input.id,
+      sessionId: input.sessionId,
+      text: input.text,
+      mode: 'auto',
+      dueAt: createdAt,
+      model: null,
+      reasoningEffort: null,
+      transportIntent: 'browser',
+      state: 'queued',
+      owner: null,
+      createdAt,
+      conversationId: input.conversationId,
+      nativeChat: { sessionId: input.sessionId, conversationId: input.conversationId }
+    };
+    await commit(append(current, entry));
+    return { ...entry };
+  });
+}
+
+export interface NativeChatAcceptanceProof {
+  messageId: string;
+  turnId: string;
+  turnOrigin: number;
+  revisionSeq: number;
+}
+
+/** Persist only an already-proved recorder identity; this never creates proof. */
+export function recordNativeChatAcceptance(
+  id: string,
+  sessionId: string,
+  conversationId: string,
+  proof: NativeChatAcceptanceProof
+): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find((entry) => entry.id === id);
+    if (!row?.nativeChat || row.nativeChat.sessionId !== sessionId ||
+        row.nativeChat.conversationId !== conversationId ||
+        row.messageId !== proof.messageId || row.deliveredAt === undefined ||
+        (row.state !== 'sent' && row.state !== 'cancelled')) return false;
+    const prior = row.nativeChat.acceptance;
+    if (prior) {
+      return prior.messageId === proof.messageId && prior.turnId === proof.turnId &&
+        prior.turnOrigin === proof.turnOrigin && prior.revisionSeq === proof.revisionSeq;
+    }
+    await commit(current.map((entry) => entry === row ? {
+      ...entry,
+      nativeChat: { ...row.nativeChat!, acceptance: { ...proof } }
+    } : entry));
+    return true;
+  });
+}
+
+/** Queue/claim/unknown Send or unsettled Stop owns conversation mutation. */
+export function nativeChatMutationPendingForSession(sessionId: string): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const now = Date.now();
+    let changed = false;
+    const reconciled: InputEntry[] = current.map((row): InputEntry => {
+      if (!row.nativeChat?.stop || row.nativeChat.sessionId !== sessionId ||
+          row.nativeChat.stop.expiresAt > now) return row;
+      // The strict bridge command can no longer be handed out after this exact
+      // durable deadline. Its outcome can remain unknown, but it no longer owns
+      // future conversation mutation.
+      const { stop: _stop, ...nativeChat } = row.nativeChat;
+      changed = true;
+      return { ...row, nativeChat } as InputEntry;
+    });
+    if (changed) await commit(reconciled);
+    return reconciled.some((row) => {
+      if (!row.nativeChat || row.nativeChat.sessionId !== sessionId) return false;
+      if (row.nativeChat.stop) return true;
+      if (row.nativeChat.acceptance) return false;
+      if (row.state === 'failed') return false;
+      if (row.state === 'cancelled' && row.sendAuthorizedAt === undefined) return false;
+      return true;
+    });
+  });
+}
+
+/** Claim exact Stop ownership before browser command publication. */
+export function beginNativeChatStopMutation(
+  sendId: string,
+  sessionId: string,
+  conversationId: string,
+  stop: { intentId: string; turnId: string; userMessageId: string; expiresAt: number }
+): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find((entry) => entry.id === sendId);
+    if (!row?.nativeChat || row.nativeChat.sessionId !== sessionId ||
+        row.nativeChat.conversationId !== conversationId || !row.nativeChat.acceptance ||
+        row.nativeChat.acceptance.turnId !== stop.turnId ||
+        row.nativeChat.acceptance.messageId !== stop.userMessageId) return false;
+    const prior = row.nativeChat.stop;
+    if (prior) {
+      return prior.intentId === stop.intentId && prior.turnId === stop.turnId &&
+        prior.userMessageId === stop.userMessageId && prior.expiresAt === stop.expiresAt;
+    }
+    await commit(current.map((entry) => entry === row ? {
+      ...entry,
+      nativeChat: { ...row.nativeChat!, stop: { ...stop } }
+    } : entry));
+    return true;
+  });
+}
+
+export function setNativeChatStopExpiry(
+  sendId: string,
+  intentId: string,
+  expiresAt: number
+): Promise<boolean> {
+  return serial(async () => {
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return false;
+    const current = await load();
+    const row = current.find((entry) => entry.id === sendId);
+    if (!row?.nativeChat?.stop || row.nativeChat.stop.intentId !== intentId) return false;
+    const prior = row.nativeChat.stop.expiresAt;
+    if (expiresAt < prior) return false;
+    if (expiresAt === prior) return true;
+    await commit(current.map((entry) => entry === row ? {
+      ...entry,
+      nativeChat: {
+        ...row.nativeChat!,
+        stop: { ...row.nativeChat!.stop!, expiresAt }
+      }
+    } : entry));
+    return true;
+  });
+}
+
+export function clearNativeChatStopMutation(
+  sendId: string,
+  intentId: string
+): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find((entry) => entry.id === sendId);
+    if (!row?.nativeChat?.stop || row.nativeChat.stop.intentId !== intentId) return false;
+    const { stop: _stop, ...nativeChat } = row.nativeChat;
+    await commit(current.map((entry) => entry === row ? { ...entry, nativeChat } : entry));
+    return true;
   });
 }
 function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry[] {
@@ -1173,9 +1401,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; nativePinned?: true }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; nativePinned?: true }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1194,7 +1422,8 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ...(entry.directTurn ? { directTurn: entry.directTurn } : {}),
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
             ? { supersededConversationId: entry.conversationId } : {}),
-          ...(entry.lifetime ? { lifetime: entry.lifetime } : {}) });
+          ...(entry.lifetime ? { lifetime: entry.lifetime } : {}),
+          ...(entry.nativeChat ? { nativePinned: true as const } : {}) });
       } catch { /* blocked/deleted stays user-visible */ }
     }
     return result;
@@ -1207,6 +1436,9 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (!entry || !preparable(entry) || (entry.state === 'browser' && !requiresAuthorization) || entry.dueAt > Date.now() || !owner) return null;
     if (entry.recovery && entry.state === 'browser' && entry.owner !== owner) return null;
     if (entry.recovery?.reloadOwner === owner) return null;
+    // A native Chat attempt is one already-existing browser document forever.
+    // Losing that document cannot transfer an authored prompt to a replacement.
+    if (entry.nativeChat && (!requiresAuthorization || (entry.state === 'browser' && entry.owner !== null && entry.owner !== owner))) return null;
     if (companionOf(current, entry)) return null;
     const completedTurnId = entry.state === 'browser' ? entry.completedTurnId : queuedFollowup(entry)
       ? await completedStageBoundary(entry, current) : manualInput(entry) ? await eligibleStageEnd(entry) : undefined;
@@ -1248,7 +1480,7 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     let claimed: InputEntry;
     const prepareClaim = (checkpoint?: InputEntry) => prepare({ ...combinedInput(entry, checkpoint), ...(checkpoint ? { companionInputId: checkpoint.id } : {}), ...(completedTurnId ? { completedTurnId } : {}),
       ...(entry.transportIntent === 'tool' ? { transportIntent: 'browser' } : {}),
-      state: 'browser', owner, conversationId, offeredAt: entry.offeredAt ?? Date.now(), requiresAuthorization }, suffix);
+      state: 'browser', owner, conversationId, offeredAt: entry.offeredAt ?? Date.now(), requiresAuthorization }, entry.nativeChat ? '' : suffix);
     try {
       try { claimed = await prepareClaim(companion); }
       catch (error) {
@@ -1322,6 +1554,12 @@ export function acknowledgeBrowserInput(id: string, owner: string, conversationI
     // Keep the authored sessionId unchanged so retrying the original enqueue is idempotent.
     if ((entry.opening || !entry.sessionId) && entry.purpose !== 'decision' && !conversationId && !entry.conversationId) return false;
     if (messageId !== undefined && (!messageId || messageId.length > 256)) return false;
+    // Native Chat's claim/authorize split is a security boundary, not merely a
+    // browser convenience. No ACK can create durable receipt evidence before
+    // the exact elected document was authorized to click Send, and native
+    // delivery always carries ChatGPT's own stable user-message identity.
+    if (entry.nativeChat && (entry.requiresAuthorization !== true ||
+        entry.sendAuthorizedAt === undefined || !messageId)) return false;
     if ((entry.state !== 'browser' && entry.state !== 'cancelled') || (entry.state === 'cancelled' && entry.deliveredAt !== undefined)) { await publishHistory(); return true; }
     const deliveredConversation = conversationId ?? entry.conversationId;
     if (entry.opening && deliveredConversation) {

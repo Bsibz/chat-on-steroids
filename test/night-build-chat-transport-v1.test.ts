@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createNightBuildChatTransportSource } from '../src/main/night-build-chat-transport-source.js';
+import { createNightBuildChatTransportSource, resolveNightBuildChatNativeSendProof } from '../src/main/night-build-chat-transport-source.js';
 import {
   startNightBuildChatTransportV1,
   type NightBuildChatTransportV1Handle
@@ -85,6 +85,7 @@ async function writeFixture(root: string, options: {
   active?: boolean;
   outcome?: 'completed' | 'failed' | 'stopped' | 'interrupted' | 'stalled' | 'unknown' | null;
   resume?: boolean;
+  inputId?: string;
 } = {}): Promise<{ dir: string; meta: Record<string, unknown> }> {
   const id = options.id ?? 'session-0001';
   const conversationId = options.conversationId ?? 'conversation-0001';
@@ -119,7 +120,8 @@ async function writeFixture(root: string, options: {
   await fs.writeFile(path.join(dir, 'meta.json'), JSON.stringify(meta));
   await writeCanonical(dir, {
     seq: 1, time: 100, source: 'extension', kind: 'user_message',
-    messageId: 'message-user-0001', message: stored('Hello from ordinary ChatGPT')
+    messageId: 'message-user-0001', message: stored('Hello from ordinary ChatGPT'),
+    ...(options.inputId ? { inputId: options.inputId, inputDelivery: 'confirmed', authoredText: 'Hello from ordinary ChatGPT' } : {})
   });
   await writeCanonical(dir, {
     seq: 8, origin: 3, time: 300, source: 'extension', kind: 'assistant_message',
@@ -535,6 +537,67 @@ describe('Night Build Chat Transport v1 durable projection', () => {
       expect(await fs.readFile(original.file)).toEqual(original.bytes);
       expect((await fs.stat(original.file)).mtimeMs).toBe(original.mtime);
     }
+  });
+
+  it('proves a native Send only from the exact durable input id, native user row and turn question', async () => {
+    const root = await tempRoot();
+    const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await writeFixture(root, { inputId });
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    expect(conversation).toBeDefined();
+    await expect(resolveNightBuildChatNativeSendProof(root, 'test-generation-secret', conversation!.handle, 'different-input'))
+      .resolves.toBeNull();
+    await expect(resolveNightBuildChatNativeSendProof(root, 'test-generation-secret', conversation!.handle, inputId))
+      .resolves.toMatchObject({
+        messageId: 'message-user-0001',
+        turnId: 'turn-0000001',
+        turnOrigin: 2,
+        revisionSeq: 1
+      });
+  });
+
+  it('does not treat the app-authored ACK projection as native ChatGPT acceptance proof', async () => {
+    const root = await tempRoot();
+    const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const fixture = await writeFixture(root, { inputId });
+    await writeCanonical(fixture.dir, {
+      seq: 1,
+      time: 100,
+      source: 'app',
+      kind: 'user_message',
+      messageId: 'message-user-0001',
+      inputId,
+      inputDelivery: 'confirmed',
+      authoredText: 'Hello from ordinary ChatGPT',
+      message: stored('Hello from ordinary ChatGPT')
+    });
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    await expect(resolveNightBuildChatNativeSendProof(
+      root, 'test-generation-secret', conversation!.handle, inputId
+    )).resolves.toBeNull();
+
+    // The later recorder echo of ChatGPT's own stable row carries the same
+    // canonical key and retained inputId; only this extension observation may
+    // establish Native Chat acceptance.
+    await writeCanonical(fixture.dir, {
+      seq: 9,
+      origin: 1,
+      time: 110,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'message-user-0001',
+      inputId,
+      inputDelivery: 'confirmed',
+      authoredText: 'Hello from ordinary ChatGPT',
+      message: stored('Hello from ordinary ChatGPT')
+    });
+    fixture.meta['__historySeq'] = 9;
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+    await expect(resolveNightBuildChatNativeSendProof(
+      root, 'test-generation-secret', conversation!.handle, inputId
+    )).resolves.toMatchObject({ messageId: 'message-user-0001', turnId: 'turn-0000001' });
   });
 });
 

@@ -433,7 +433,16 @@ type CommandSpec =
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
   | { type: 'resume'; sessionId: string; token: string }
-  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string };
+  | {
+      type: 'stop';
+      sessionId: string;
+      conversationId: string;
+      turnId: string;
+      userMessageId?: string;
+      nativeIntentId?: string;
+      /** Exact extension document owner that accepted the corresponding Native Send. */
+      nativeBrowserOwner?: string;
+    };
 
 interface Command {
   id: string;
@@ -1554,23 +1563,129 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
   }
   return sessionControlsFor(sessionId);
 }
+
+/**
+ * Night Build native Chat Stop is intentionally narrower than the ordinary CoS
+ * controller Stop. It cannot open a browser, retarget a conversation, disable
+ * Goal/Loop, cancel a continuation, or omit the accepted user-message anchor.
+ */
+export async function requestNativeChatStop(input: {
+  intentId: string;
+  sessionId: string;
+  conversationId: string;
+  turnId: string;
+  userMessageId: string;
+  browserOwner: string;
+  /** Persist the exact command deadline before this command can wake a browser. */
+  persistMutationDeadline: (expiresAt: number) => Promise<boolean>;
+}): Promise<number> {
+  const existing = commands.find((entry) => entry.spec.type === 'stop' && entry.spec.nativeIntentId === input.intentId);
+  if (existing) {
+    const spec = existing.spec as Extract<CommandSpec, { type: 'stop' }>;
+    if (spec.sessionId !== input.sessionId || spec.conversationId !== input.conversationId ||
+        spec.turnId !== input.turnId || spec.userMessageId !== input.userMessageId ||
+        spec.nativeBrowserOwner !== input.browserOwner) {
+      throw new Error('native_stop_intent_conflict');
+    }
+    const expiresAt = existing.createdAt + STOP_COMMAND_TIMEOUT_MS;
+    if (!await input.persistMutationDeadline(expiresAt)) throw new Error('native_stop_dispatch_unknown');
+    return expiresAt;
+  }
+  if (commands.some((entry) => entry.spec.type === 'stop' && entry.spec.sessionId === input.sessionId && entry.spec.turnId === input.turnId)) {
+    throw new Error('native_stop_already_pending');
+  }
+  const controlled = await controlledConversation(input.sessionId);
+  if (controlled !== input.conversationId) throw new Error('active_turn_changed');
+  const assertCurrent = async (): Promise<void> => {
+    const latest = await getSession(input.sessionId);
+    if (latest?.conversationId !== input.conversationId || latest.activeTurnId !== input.turnId || !input.turnId ||
+        await conversationWasSuperseded(input.conversationId) || (await sessionControlsFor(input.sessionId)).activeTurnId !== input.turnId) {
+      throw new Error('active_turn_changed');
+    }
+    const anchor = await stopUserAnchor(input.sessionId, input.turnId);
+    if (!anchor || anchor !== input.userMessageId) throw new Error('active_turn_changed');
+  };
+  await assertCurrent();
+  if (!input.browserOwner || input.browserOwner.length > 512) throw new Error('active_turn_changed');
+  // Persist the mutation fence before this Stop even enters the shared command
+  // queue. A queued command is observable by connected extension clients, so
+  // the deadline cannot be an after-the-fact companion write.
+  const createdAt = Date.now();
+  const expiresAt = createdAt + STOP_COMMAND_TIMEOUT_MS;
+  if (!await input.persistMutationDeadline(expiresAt)) throw new Error('stop_request_not_durable');
+  await assertCurrent();
+  const command = queue({
+    type: 'stop',
+    sessionId: input.sessionId,
+    conversationId: input.conversationId,
+    turnId: input.turnId,
+    userMessageId: input.userMessageId,
+    nativeIntentId: input.intentId,
+    nativeBrowserOwner: input.browserOwner
+  }, createdAt);
+  try {
+    const pendingLease = commandWrites.get(command.id);
+    if (pendingLease && !await pendingLease) throw new Error('stop_request_not_durable');
+    if (!commands.includes(command) || (command.claimedAt === null && !await persistCommandLease(command, null, Date.now()))) {
+      throw new Error('stop_request_not_durable');
+    }
+    await assertCurrent();
+  } catch (error) {
+    retire(command, 'native stop request could not be saved or its turn changed');
+    // Once the command entered the queue, a connected exact document may have
+    // observed it even if the later durable lease/revalidation failed. Keep the
+    // already-persisted mutation deadline and report ambiguity; never downgrade
+    // this to a definite pre-send failure.
+    throw new Error('native_stop_dispatch_unknown', { cause: error });
+  }
+  armDeadline(command);
+  wakeBrowserWork();
+  changed();
+  return expiresAt;
+}
+
+/** Observation only for the v2 stop-intent projection. */
+export function nativeChatStopPending(intentId: string): boolean {
+  return commands.some((entry) => entry.spec.type === 'stop' && entry.spec.nativeIntentId === intentId);
+}
 async function stopCommandCurrent(spec: Extract<CommandSpec, { type: 'stop' }>): Promise<boolean> {
   const session = await getSession(spec.sessionId);
-  return Boolean(session?.conversationId === spec.conversationId && session.activeTurnId === spec.turnId &&
-    !await conversationWasSuperseded(spec.conversationId));
+  if (!(session?.conversationId === spec.conversationId && session.activeTurnId === spec.turnId &&
+      !await conversationWasSuperseded(spec.conversationId))) return false;
+  if (spec.nativeIntentId) {
+    if (!spec.userMessageId) return false;
+    return await stopUserAnchor(spec.sessionId, spec.turnId) === spec.userMessageId;
+  }
+  return true;
 }
 function stopRequestedFor(conversationId: string, turnId = liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId): boolean {
   return commands.some(command => command.spec.type === 'stop' && command.spec.conversationId === conversationId &&
     (!turnId || command.spec.turnId === turnId) && Date.now() - command.createdAt < STOP_COMMAND_TIMEOUT_MS);
 }
-async function pendingStopCommands(): Promise<Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }>> {
+async function pendingStopCommands(): Promise<Array<{
+  id: string;
+  conversationId: string;
+  turnId: string;
+  expiresAt: number;
+  nativePinned?: true;
+  browserOwner?: string;
+}>> {
   const pending = [];
   for (const command of [...commands]) {
     if (command.spec.type !== 'stop' || commandWrites.has(command.id)) continue;
     if (Date.now() - command.createdAt >= STOP_COMMAND_TIMEOUT_MS || !await stopCommandCurrent(command.spec)) {
       retire(command, 'the requested turn is no longer stoppable'); continue;
     }
-    if (commands.includes(command)) pending.push({ id: command.id, conversationId: command.spec.conversationId, turnId: command.spec.turnId, expiresAt: command.createdAt + STOP_COMMAND_TIMEOUT_MS });
+    if (commands.includes(command)) pending.push({
+      id: command.id,
+      conversationId: command.spec.conversationId,
+      turnId: command.spec.turnId,
+      expiresAt: command.createdAt + STOP_COMMAND_TIMEOUT_MS,
+      ...(command.spec.nativeIntentId ? {
+        nativePinned: true as const,
+        browserOwner: command.spec.nativeBrowserOwner
+      } : {})
+    });
   }
   return pending;
 }
@@ -4792,7 +4907,7 @@ export function shutdownBridge(): Promise<void> {
 // ------------------------------------------------------------------ commands
 
 function specKey(spec: CommandSpec): string {
-  if (spec.type === 'stop') return `stop:${spec.sessionId}:${spec.turnId}`;
+  if (spec.type === 'stop') return spec.nativeIntentId ? `native-stop:${spec.nativeIntentId}` : `stop:${spec.sessionId}:${spec.turnId}`;
   if (spec.type === 'worker') return `worker:${spec.runId}:${spec.agent}`;
   if (spec.type === 'revive') return `revive:${spec.runId}:${spec.agent}`;
   return `resume:${spec.sessionId}`;
@@ -5017,7 +5132,7 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
   });
 }
 
-function queue(spec: CommandSpec): Command {
+function queue(spec: CommandSpec, createdAt = Date.now()): Command {
   const key = specKey(spec);
   const existing = commands.find((command) => specKey(command.spec) === key);
   if (existing) {
@@ -5050,7 +5165,7 @@ function queue(spec: CommandSpec): Command {
   const command: Command = {
     id: randomBytes(8).toString('hex'),
     spec,
-    createdAt: Date.now(),
+    createdAt,
     claimedAt: null,
     timer: null,
     lastError: null,
@@ -8625,7 +8740,14 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
         typeof stop.conversationId !== 'string' || !conversationId(stop.conversationId) ||
         typeof stop.turnId !== 'string' || !stop.turnId || stop.turnId.length > 256) return null;
     if (stop.userMessageId !== undefined && (typeof stop.userMessageId !== 'string' || !stop.userMessageId || stop.userMessageId.length > 256)) return null;
-    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}) };
+    if (stop.nativeIntentId !== undefined && (typeof stop.nativeIntentId !== 'string' || !/^[0-9a-f-]{36}$/i.test(stop.nativeIntentId))) return null;
+    if (stop.nativeBrowserOwner !== undefined && (typeof stop.nativeBrowserOwner !== 'string' || !stop.nativeBrowserOwner || stop.nativeBrowserOwner.length > 512)) return null;
+    // Native Stop is never allowed to degrade into the broader ordinary Stop
+    // authority when restored from disk.
+    if (stop.nativeIntentId !== undefined && (!stop.userMessageId || !stop.nativeBrowserOwner)) return null;
+    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId,
+      ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}),
+      ...(stop.nativeIntentId ? { nativeIntentId: stop.nativeIntentId, nativeBrowserOwner: stop.nativeBrowserOwner! } : {}) };
   }
   if (
     version >= 3 &&

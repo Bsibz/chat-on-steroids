@@ -6,6 +6,7 @@ import { requestSessionFinishGoal, setFinishNotifier } from './session/finish.js
  */
 
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session } from 'electron';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
@@ -18,6 +19,8 @@ import { pluginManager } from './plugins/manager.js';
 import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
 import { startNightBuildBridgeV2, type NightBuildBridgeV2Handle } from './night-build-bridge-v2.js';
 import { createInProcessNightBuildBridgeV2Source } from './night-build-bridge-v2-in-process.js';
+import { startNightBuildChatTransportV2, type NightBuildChatTransportV2Handle } from './night-build-chat-transport-v2.js';
+import { createInProcessNightBuildChatTransportV2Source } from './night-build-chat-transport-v2-source.js';
 import { flushSessions, initSessionStore } from './session/store.js';
 import { initSkillsPath } from './skills.js';
 import { usageOverview } from './session/usage.js';
@@ -90,6 +93,7 @@ let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
 let nightBuildBridge: NightBuildBridgeV2Handle | null = null;
+let nightBuildChatTransportV2: NightBuildChatTransportV2Handle | null = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
 const usageWarmup = new AbortController();
@@ -446,6 +450,17 @@ void app.whenReady().then(async () => {
     // paths. Keep startup logs bounded instead of copying raw exception prose.
     logWarn('Night Build bridge could not start');
   }
+  try {
+    const chatSalt = randomBytes(32).toString('base64url');
+    nightBuildChatTransportV2 = await startNightBuildChatTransportV2(
+      userData,
+      createInProcessNightBuildChatTransportV2Source(userData, chatSalt)
+    );
+  } catch {
+    // The native Chat write lane is optional. Never leak local paths, tokens or
+    // storage errors into logs when its discovery/service cannot start.
+    logWarn('Night Build Chat v2 transport could not start');
+  }
   logInfo('app started');
 
   // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
@@ -511,7 +526,12 @@ app.on('will-quit', (event) => {
       {
         name: 'admission/drain',
         budgetMs: 40_000,
-        run: () => [shutdownConnection(), shutdownBridge(), nightBuildBridge?.stop() ?? Promise.resolve()]
+        run: () => [
+          shutdownConnection(),
+          shutdownBridge(),
+          nightBuildBridge?.stop() ?? Promise.resolve(),
+          nightBuildChatTransportV2?.stop() ?? Promise.resolve()
+        ]
       },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {

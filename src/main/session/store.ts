@@ -386,6 +386,20 @@ function enqueueSessionOperation<T>(entry: OpenSession, label: string, operation
 }
 
 /**
+ * Serialize admission for operations that can change which durable owner may
+ * mutate one conversation. The operation itself owns its durable marker before
+ * this returns; long-running browser work must not hold the session queue.
+ */
+export async function withSessionMutationAdmission<T>(
+  id: string,
+  label: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, label, operation);
+}
+
+/**
  * The summary is rewritten on a short delay rather than on every event. A long agent
  * session appends thousands of events; rewriting the summary for each one would turn
  * an append-only log into a write-amplified one for no benefit.
@@ -1613,6 +1627,27 @@ export async function readRecentEvents(
   assertSessionId(sessionId);
   await flushSession(sessionId);
   return readRecentEventsFromDisk(sessionId, limit, options);
+}
+
+/**
+ * Exact historical terminal lookup for one native turn. Streams the journal
+ * backwards in fixed-size chunks until the matching turn_end is found; memory
+ * remains bounded even when the retained stop intent is much older than the
+ * normal recent-event window.
+ */
+export async function readTurnEnd(
+  sessionId: string,
+  turnId: string
+): Promise<Extract<SessionEvent, { kind: 'turn_end' }> | null> {
+  assertSessionId(sessionId);
+  if (!turnId || turnId.length > 256) return null;
+  await flushSession(sessionId);
+  const [event] = await readRecentEventsFromDisk(sessionId, 1, {
+    kinds: ['turn_end'],
+    before: Number.POSITIVE_INFINITY,
+    acceptEvent: (candidate) => candidate.kind === 'turn_end' && candidate.turnId === turnId
+  });
+  return event?.kind === 'turn_end' ? event : null;
 }
 
 /** The latest authored question. A recovery source excludes its injected corrections,

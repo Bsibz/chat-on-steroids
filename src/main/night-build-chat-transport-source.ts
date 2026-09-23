@@ -939,13 +939,47 @@ export async function resolveNightBuildChatNativeSendProof(
 ): Promise<NightBuildChatNativeSendProof | null> {
   const row = await catalogRowForHandle(userData, salt, handle);
   if (!row) return null;
+  // The exact native message id comes from the browser ACK after it witnessed
+  // ChatGPT's newly-created user row. During generation the full transcript
+  // projection intentionally rejects a snapshot if streaming metadata changes
+  // across its reads. Acceptance proof does not need that whole projection: the
+  // canonical user shard and append-only turn-start identity are immutable once
+  // observed. Read only that durable identity slice so proof can settle while the
+  // assistant is still streaming.
+  if (expectedMessageId) {
+    const dir = path.join(userData, 'sessions', row.directoryId);
+    const canonical = await readCanonicalMessages(dir);
+    const journal = await readJournal(dir, canonical.canonicalKeys);
+    const lowerBoundOrigin = await currentLowerBound(userData, row, canonical.messages, journal, dir);
+    const identity = rebuildIdentity(canonical.messages, canonical.identityTools, journal);
+    const messages = canonical.messages.filter((message) =>
+      message.kind === 'user_message' && message.source === 'extension' &&
+      message.origin >= lowerBoundOrigin && message.messageId === expectedMessageId &&
+      (!message.inputId || message.inputId === inputId)
+    );
+    if (messages.length !== 1) return null;
+    const message = messages[0]!;
+    const turns = Object.entries(identity.timelineTurns).filter(([, turn]) => turn.questionId === message.messageId);
+    if (turns.length !== 1) return null;
+    const [turnId, turn] = turns[0]!;
+    if (!turnId || turn.origin < lowerBoundOrigin) return null;
+    const finalMeta = parseMeta(await readJson(path.join(dir, 'meta.json'), MAX_META_BYTES), row.directoryId);
+    if (!finalMeta || finalMeta.conversationId !== row.meta.conversationId ||
+        finalMeta.lastCommittedResumeHandoffId !== row.meta.lastCommittedResumeHandoffId) {
+      throw new Error('chat_transport_projection_changed');
+    }
+    return {
+      messageId: message.messageId,
+      turnId,
+      turnOrigin: turn.origin,
+      revisionSeq: message.seq
+    };
+  }
+
   const projection = await selectedProjection(userData, row);
   const messages = projection.messages.filter((message) =>
     message.kind === 'user_message' && message.source === 'extension' &&
-    message.origin >= projection.lowerBoundOrigin &&
-    (expectedMessageId
-      ? message.messageId === expectedMessageId && (!message.inputId || message.inputId === inputId)
-      : message.inputId === inputId)
+    message.inputId === inputId && message.origin >= projection.lowerBoundOrigin
   );
   if (messages.length !== 1) return null;
   const message = messages[0]!;

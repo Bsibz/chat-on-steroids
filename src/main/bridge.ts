@@ -516,6 +516,8 @@ export interface BridgeCommand {
   kind: 'open-chat' | 'stop-turn';
   turnId?: string;
   userMessageId?: string;
+  /** Absolute lifetime for Stop authority. The page rechecks this at the irreversible click. */
+  expiresAt?: number;
   /**
    * Why this chat is being opened.
    *
@@ -8428,7 +8430,19 @@ function revivalFor(agent: string, runId: string): WorkerRevival | null {
 function describe(command: Command, client: string | null, claimedSummary?: string): BridgeCommand {
   const spec = command.spec;
   const selection = spec.type === 'resume' ? continuationByToken(spec.token)?.requestedModel : null;
-  if (spec.type === 'stop') return { id: command.id, kind: 'stop-turn', type: 'stop', text: '', agent: null, model: null, reasoningEffort: null, conversationId: spec.conversationId, turnId: spec.turnId, ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {}) };
+  if (spec.type === 'stop') return {
+    id: command.id,
+    kind: 'stop-turn',
+    type: 'stop',
+    text: '',
+    agent: null,
+    model: null,
+    reasoningEffort: null,
+    conversationId: spec.conversationId,
+    turnId: spec.turnId,
+    expiresAt: command.createdAt + STOP_COMMAND_TIMEOUT_MS,
+    ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {})
+  };
   // A resume's claim is persisted by /commands/redeem before this renderer is called. A
   // command shown to app/UI code without a browser document still carries no brief at all.
   const text = spec.type === 'resume'

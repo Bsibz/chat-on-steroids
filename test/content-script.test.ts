@@ -18777,6 +18777,16 @@ describe('app Stop command uses current native turn proof', () => {
     expect(await live!.runtimeMessage(h.request)).toEqual({ ok: true });
     expect(h.clicks()).toBe(1);
   });
+  it('refuses a Stop redeemed before expiry when authority expires before the irreversible click', async () => {
+    const h = await setup();
+    const expiresAt = live!.window.Date.now() + 1000;
+    live!.reply.set('stop_redeem', () => {
+      live!.advance(1001);
+      return { ok: true, command: { type: 'stop', turnId: h.request.turnId, conversationId: h.request.conversationId, expiresAt } };
+    });
+    expect(await live!.runtimeMessage({ ...h.request, expiresAt })).toEqual({ ok: false });
+    expect(h.clicks()).toBe(0);
+  });
 
   it('captures a completed final hydrated later in a hidden tab after the settle window', async () => {
     live = await harness();

@@ -2066,7 +2066,7 @@ async function offerStopTurns(requests, background = false) {
             String(tab.id) + ':' + documentId + ':' + navigationEpoch !== expectedOwner || latest.pendingUrl ||
             conversationFromUrl(latest.url) !== request.conversationId) return;
         await chrome.tabs.sendMessage(tab.id, { type: 'clf-stop-turn', id: request.id,
-          conversationId: request.conversationId, turnId: request.turnId }, { documentId });
+          conversationId: request.conversationId, turnId: request.turnId, expiresAt: request.expiresAt }, { documentId });
         return;
       }
       let election = stopOpenings[request.id];
@@ -2100,7 +2100,8 @@ async function offerStopTurns(requests, background = false) {
       const latest = await chrome.tabs.get(tab.id);
       if (!current() || !ownsDocument(source) || latest.pendingUrl || conversationFromUrl(latest.url) !== request.conversationId) return;
       await chrome.tabs.sendMessage(tab.id, { type: 'clf-stop-turn', id: request.id,
-        conversationId: request.conversationId, turnId: request.turnId }, { documentId });
+        conversationId: request.conversationId, turnId: request.turnId,
+        ...(Number.isFinite(request.expiresAt) ? { expiresAt: request.expiresAt } : {}) }, { documentId });
     })().catch(() => undefined).finally(() => stopOffers.delete(request.id)));
   }
   await Promise.all(offers);

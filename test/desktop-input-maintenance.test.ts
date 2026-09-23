@@ -1205,7 +1205,7 @@ describe('Stop owns one exact existing or newly opened browser document', () => 
     await h.offerStopTurns([{ ...request, id: '1122334455667701' }]);
     expect(h.sendMessage).toHaveBeenCalledWith(
       7,
-      { type: 'clf-stop-turn', id: '1122334455667701', conversationId: firstId, turnId: 'exact-turn' },
+      { type: 'clf-stop-turn', id: '1122334455667701', conversationId: firstId, turnId: 'exact-turn', expiresAt: request.expiresAt },
       { documentId: 'native-send-document' }
     );
     expect(h.create).not.toHaveBeenCalled();
@@ -1231,7 +1231,7 @@ describe('Stop owns one exact existing or newly opened browser document', () => 
     const source = await h.authorizeDocument({ tab: { id: 1 }, documentId: 'opened-stop', frameId: 0, url: h.tabs[0].url }, { navigationEpoch: 1 });
     await h.noteTabConversation(source, firstId);
     await h.offerStopTurns([request]);
-    expect(h.sendMessage).toHaveBeenCalledWith(1, { type: 'clf-stop-turn', id: request.id, conversationId: firstId, turnId: request.turnId }, { documentId: 'opened-stop' });
+    expect(h.sendMessage).toHaveBeenCalledWith(1, { type: 'clf-stop-turn', id: request.id, conversationId: firstId, turnId: request.turnId, expiresAt: request.expiresAt }, { documentId: 'opened-stop' });
     expect(h.create).toHaveBeenCalledTimes(1);
   });
   it.each(['loading', 'unregistered'])('elects an existing %s exact tab instead of opening another', async mode => {

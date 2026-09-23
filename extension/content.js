@@ -1691,8 +1691,10 @@
   }
   async function stopAppTurn(request) {
     const expected = request?.turnId, target = request?.conversationId, commandId = request?.id;
+    const offeredExpiry = Number.isFinite(request?.expiresAt) ? request.expiresAt : null;
     const heldEpoch = epoch;
     if (typeof expected !== 'string' || !expected || typeof commandId !== 'string' || !commandId) return false;
+    if (offeredExpiry !== null && Date.now() >= offeredExpiry) return false;
     // A background document may not have received its next rendering observation.
     // Refresh the existing lifecycle owner from the current DOM before using its
     // native-turn mapping; a stale paint cache is not a reason to ignore Stop.
@@ -1711,7 +1713,10 @@
     observe();
     const command = reply?.command;
     if (!reply?.ok || command?.type !== 'stop' || command.turnId !== expected || command.conversationId !== target) return false;
-    const canStop = () => current() && generating && (!unwitnessedGeneration || stopQuestionMatches(command.userMessageId)) && latestNative()?.role === 'assistant' &&
+    const commandExpiry = Number.isFinite(command.expiresAt) ? command.expiresAt : offeredExpiry;
+    if (commandExpiry !== null && Date.now() >= commandExpiry) return false;
+    const canStop = () => (commandExpiry === null || Date.now() < commandExpiry) && current() && generating &&
+      (!unwitnessedGeneration || stopQuestionMatches(command.userMessageId)) && latestNative()?.role === 'assistant' &&
       latestNative()?.id === nativeId && pageTurnIds.get(expected) === nativeId;
     // Concurrent redemptions may finish after the first click, before ChatGPT removes Stop.
     const stopped = stoppedAppCommands.has(commandId) || (canStop() && CLF_DOM.stopGeneration(canStop));

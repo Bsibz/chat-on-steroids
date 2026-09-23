@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 if (process.platform !== 'darwin') {
@@ -19,9 +20,15 @@ const executable = path.resolve(
 );
 if (!existsSync(executable)) throw new Error(`Could not find unpacked macOS ${arch} app executable`);
 
-const child = spawn(executable, [], {
+// A packaged smoke must never contend with or write into the developer's real CoS profile.
+// Electron honors --user-data-dir before app.requestSingleInstanceLock(), so this also makes
+// the candidate its own single-instance universe while an installed copy is running.
+const smokeUserData = mkdtempSync(path.join(os.tmpdir(), 'cos-packaged-gui-smoke-'));
+const childEnv = { ...process.env, CLF_DEBUG: '1', CLF_BRIDGE_PORTS: '0' };
+delete childEnv.ELECTRON_RUN_AS_NODE;
+const child = spawn(executable, [`--user-data-dir=${smokeUserData}`], {
   stdio: ['ignore', 'pipe', 'pipe'],
-  env: { ...process.env, CLF_DEBUG: '1' }
+  env: childEnv
 });
 let output = '';
 child.stdout.on('data', (chunk) => { output += chunk; });
@@ -105,6 +112,7 @@ async function terminateChild() {
 // This tests launch readiness, not the application's own quit flow.
 const exited = await terminateChild();
 process.stdout.write(output);
+rmSync(smokeUserData, { recursive: true, force: true });
 if (startupError) {
   if (!exited) startupError.message += '; child also resisted SIGTERM/SIGKILL';
   throw startupError;

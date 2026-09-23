@@ -772,6 +772,86 @@ export function enqueueNativeChatInput(raw: NativeChatInputArgs): Promise<InputE
   });
 }
 
+/**
+ * Read-only preflight for Native Chat before the caller acquires the session's
+ * mutation-admission queue. This may flush recorder state, so it must never run
+ * from inside withSessionMutationAdmission().
+ */
+export async function assertNativeChatInputReady(raw: NativeChatInputArgs): Promise<void> {
+  const input = nativeChatInputArgs.parse(raw);
+  const current = await load();
+  const prior = current.find((entry) => entry.id === input.id);
+  if (prior) {
+    if (!prior.nativeChat || prior.nativeChat.sessionId !== input.sessionId ||
+        prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text) {
+      throw new Error('Native Chat intent id already belongs to different input');
+    }
+    return;
+  }
+  const session = await getSession(input.sessionId);
+  if (!session || session.conversationId !== input.conversationId ||
+      session.origin?.kind === 'worker' || session.origin?.kind === 'helper' ||
+      isChatBlocked(input.conversationId) || await conversationWasSuperseded(input.conversationId)) {
+    throw new Error('Native Chat conversation is no longer current');
+  }
+  if (!(await sessionInputPolicy(input.sessionId)).browserAllowed) {
+    throw new Error('Native Chat conversation is not idle');
+  }
+}
+
+/**
+ * Final Native Chat enqueue while the caller owns this exact session's mutation
+ * admission. Deliberately avoids recorder reads that flush/re-enter the same
+ * session queue. Browser delivery rechecks the full policy again before Send.
+ */
+export function enqueueAdmittedNativeChatInput(
+  raw: NativeChatInputArgs,
+  admittedSession: Readonly<SessionSummary>
+): Promise<InputEntry> {
+  return serial(async () => {
+    const input = nativeChatInputArgs.parse(raw);
+    const current = await load();
+    const prior = current.find((entry) => entry.id === input.id);
+    if (prior) {
+      if (!prior.nativeChat || prior.nativeChat.sessionId !== input.sessionId ||
+          prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text) {
+        throw new Error('Native Chat intent id already belongs to different input');
+      }
+      return { ...prior };
+    }
+    const activity = deliveryHooks?.activity?.(admittedSession) ?? {
+      possible: !!admittedSession.activeTurnId,
+      exact: !!admittedSession.activeTurnId
+    };
+    if (admittedSession.id !== input.sessionId ||
+        admittedSession.conversationId !== input.conversationId ||
+        admittedSession.origin?.kind === 'worker' || admittedSession.origin?.kind === 'helper' ||
+        admittedSession.activeTurnId || activity.possible || activity.exact ||
+        inFlightToolCalls(input.conversationId) > 0 || isChatBlocked(input.conversationId) ||
+        await conversationWasSuperseded(input.conversationId)) {
+      throw new Error('Native Chat conversation is no longer idle');
+    }
+    const createdAt = Date.now();
+    const entry: InputEntry = {
+      id: input.id,
+      sessionId: input.sessionId,
+      text: input.text,
+      mode: 'auto',
+      dueAt: createdAt,
+      model: null,
+      reasoningEffort: null,
+      transportIntent: 'browser',
+      state: 'queued',
+      owner: null,
+      createdAt,
+      conversationId: input.conversationId,
+      nativeChat: { sessionId: input.sessionId, conversationId: input.conversationId }
+    };
+    await commit(append(current, entry));
+    return { ...entry };
+  });
+}
+
 export interface NativeChatAcceptanceProof {
   messageId: string;
   turnId: string;

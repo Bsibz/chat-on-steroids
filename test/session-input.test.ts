@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
 import {
   fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput, enqueueNativeChatInput,
+  assertNativeChatInputReady, enqueueAdmittedNativeChatInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
   authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy,
   beginNativeChatStopMutation, nativeChatMutationPendingForSession, recordNativeChatAcceptance,
@@ -15,7 +16,7 @@ import {
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
 import { stageInputAttachment } from '../src/main/session/input-attachments.js';
-import { listUsageSessions, turnHasMcpCall } from '../src/main/session/store.js';
+import { getSession, listUsageSessions, readRecentEvents, turnHasMcpCall } from '../src/main/session/store.js';
 import { trackInFlight, emptyEvidence, type CallContext } from '../src/main/mcp/call-context.js';
 // Ownership tests inspect messages; batch-specific assertions use the complete delivery below.
 const offerToolInput = async (...args: Parameters<typeof offerToolInputBatch>) => (await offerToolInputBatch(...args)).messages;
@@ -113,6 +114,20 @@ describe('durable user input ownership', () => {
     expect((await listInputs()).find((entry) => entry.id === id)).toMatchObject({
       state: 'sent', messageId: 'native-message-id', text
     });
+  });
+
+  it('keeps flush-capable Native Chat preflight outside the admitted durable enqueue', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const input = { id: randomUUID(), sessionId, conversationId: binding.conversationId, text: 'Admit without re-entry' };
+    await assertNativeChatInputReady(input);
+    expect(vi.mocked(readRecentEvents)).toHaveBeenCalled();
+    vi.mocked(readRecentEvents).mockClear();
+    const admitted = await getSession(sessionId);
+    expect(admitted).not.toBeNull();
+    const row = await enqueueAdmittedNativeChatInput(input, admitted!);
+    expect(row).toMatchObject({ id: input.id, state: 'queued', nativeChat: { sessionId, conversationId: binding.conversationId } });
+    expect(vi.mocked(readRecentEvents)).not.toHaveBeenCalled();
   });
 
   it('never retargets or replays a native Chat intent after its pinned conversation changes', async () => {

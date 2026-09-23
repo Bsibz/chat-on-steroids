@@ -13,9 +13,10 @@ import { nativeChatStopPending, requestNativeChatStop, startBridge, STOP_COMMAND
 import { readDurable, writeDurableNow } from './durable.js';
 import { continuationForSession } from './session/continuation.js';
 import {
+  assertNativeChatInputReady,
   beginNativeChatStopMutation,
   clearNativeChatStopMutation,
-  enqueueNativeChatInput,
+  enqueueAdmittedNativeChatInput,
   listInputs,
   recordNativeChatAcceptance,
   setNativeChatStopExpiry
@@ -216,6 +217,15 @@ export function createInProcessNightBuildChatTransportV2Source(
       // Starting the existing authenticated browser bridge grants no new external
       // authority; it only lets the extension collect the already-durable pinned input.
       if (!await startBridge()) throw new Error('native_chat_browser_unavailable');
+      const nativeInput = {
+        id: input.id,
+        sessionId: resolved.sessionId,
+        conversationId: resolved.conversationId,
+        text: input.text
+      };
+      // This preflight may flush recorder state. Keep it outside mutation admission;
+      // final exact ownership is rechecked again while the session queue is owned.
+      await assertNativeChatInputReady(nativeInput);
       await withSessionMutationAdmission(resolved.sessionId, 'native chat send admission', async () => {
         const current = await resolveNightBuildChatConversation(userData, salt, input.conversation);
         if (!current || current.sessionId !== resolved.sessionId ||
@@ -223,12 +233,11 @@ export function createInProcessNightBuildChatTransportV2Source(
             continuationForSession(resolved.sessionId)) {
           throw new Error('native_chat_conversation_busy');
         }
-        await enqueueNativeChatInput({
-          id: input.id,
-          sessionId: resolved.sessionId,
-          conversationId: resolved.conversationId,
-          text: input.text
-        });
+        // ensureOpen() has made this summary live before admission runs, so
+        // getSession() is an in-memory read here and cannot re-enter the queue.
+        const session = await getSession(resolved.sessionId);
+        if (!session) throw new Error('native_chat_conversation_unavailable');
+        await enqueueAdmittedNativeChatInput(nativeInput, session);
       });
       const status = await sendStatus(input.id);
       if (!status) throw new Error('native_chat_intent_unavailable');

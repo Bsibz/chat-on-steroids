@@ -50,6 +50,53 @@ export interface NightBuildChatTranscriptItemV1 {
   finalContentSeq?: number;
 }
 
+export type NightBuildChatActivityKindV1 =
+  | 'edit'
+  | 'create'
+  | 'delete'
+  | 'move'
+  | 'read'
+  | 'search'
+  | 'browse'
+  | 'run'
+  | 'process'
+  | 'screen'
+  | 'input'
+  | 'clipboard'
+  | 'session'
+  | 'agent'
+  | 'other';
+
+export type NightBuildChatActivityToneV1 = 'neutral' | 'good' | 'bad' | 'warn';
+
+export type NightBuildChatActivityPhaseV1 =
+  | 'started'
+  | 'completed'
+  | 'finished'
+  | 'failed'
+  | 'refused'
+  | 'internal_error'
+  | 'unknown';
+
+/** Compact public tool activity. Never carries args, results, or raw recorder ids. */
+export interface NightBuildChatActivityItemV1 {
+  activityId: string;
+  originSeq: number;
+  revisionSeq: number;
+  turnOrigin: number;
+  time: number;
+  tool: string;
+  kind: NightBuildChatActivityKindV1;
+  tone: NightBuildChatActivityToneV1;
+  title: string;
+  detail?: string;
+  metric?: string;
+  phase: NightBuildChatActivityPhaseV1;
+  exitCode?: number;
+  durationMs?: number;
+  changedFiles?: number;
+}
+
 export type NightBuildChatCurrentTurnV1 =
   | { state: 'idle' }
   | { state: 'generating'; turnOrigin: number | null }
@@ -77,4 +124,6 @@ export interface NightBuildChatTranscriptV1 {
   };
   currentTurn: NightBuildChatCurrentTurnV1;
   items: NightBuildChatTranscriptItemV1[];
+  /** Present means this producer supports activity. Empty means none is currently visible. */
+  activity: NightBuildChatActivityItemV1[];
 }

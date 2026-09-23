@@ -1156,4 +1156,211 @@ describe('Night Build Chat Transport v1 local server', () => {
     expect(await handle.checkOwnershipNow()).toBe(false);
     await expect(fs.readFile(path.join(root, NIGHT_BUILD_CHAT_TRANSPORT_V1_DISCOVERY_FILE), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it('projects journal-only git activity between the prompt and the final answer', async () => {
+    const root = await tempRoot();
+    const home = os.homedir();
+    const fixture = await writeFixture(root, { historySeq: 10, active: false, outcome: 'completed' });
+    fixture.meta['timelineTurns'] = {
+      'turn-0000001': { origin: 1, time: 100, questionId: 'message-user-0001', endTime: 600, endOrigin: 6 }
+    };
+    fixture.meta['__historySeq'] = 10;
+    fixture.meta['activeTurnId'] = null;
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+    await writeCanonical(fixture.dir, {
+      seq: 1, origin: 1, time: 100, source: 'extension', kind: 'user_message', turnId: 'turn-0000001',
+      messageId: 'message-user-0001', message: stored('Show the git state')
+    });
+    await writeCanonical(fixture.dir, {
+      seq: 6, origin: 6, time: 600, source: 'extension', kind: 'assistant_message', turnId: 'turn-0000001',
+      messageId: 'message-assistant-0001', message: stored('Working tree is clean'),
+      state: 'final', final: true, finalContentSeq: 6
+    });
+    const call = (callId: string, seq: number, title: string) => ({
+      seq, origin: seq, time: seq * 100, source: 'mcp', kind: 'tool_call', turnId: 'turn-0000001',
+      call: {
+        callId,
+        tool: 'exec_command',
+        attribution: 'request_id',
+        attributionMethod: 'request_id',
+        requestId: 'request-CANARY-0001',
+        conversationId: 'conversation-0001',
+        nested: false,
+        args: { text: `ARGS-CANARY ${home}/secret Bearer CANARYTOKEN`, command: 'git status --short' },
+        result: { text: 'RESULT-CANARY sk-proj-abcdefghijklmnopqrstuvwxyz012345' },
+        outcome: 'ok',
+        durationMs: 18,
+        summary: {
+          kind: 'run',
+          tone: 'good',
+          title: `${title} in ${home}/Developer`,
+          detail: 'Bearer CANARYTOKEN sk-proj-abcdefghijklmnopqrstuvwxyz012345'
+        }
+      }
+    });
+    await writeJournal(fixture.dir, [
+      { seq: 2, time: 200, source: 'extension', kind: 'turn_start', turnId: 'turn-0000001' },
+      call('call-CANARY-status', 3, 'Ran git status --short'),
+      call('call-CANARY-head', 4, 'Ran git rev-parse HEAD'),
+      { seq: 5, time: 500, source: 'extension', kind: 'turn_end', turnId: 'turn-0000001', outcome: 'completed' },
+      {
+        seq: 7, time: 700, source: 'mcp', kind: 'tool_call', turnId: 'turn-0000001',
+        call: {
+          ...call('call-CANARY-nested', 7, 'Ran nested').call,
+          nested: true
+        }
+      },
+      {
+        seq: 8, time: 800, source: 'mcp', kind: 'tool_call', turnId: 'turn-0000001',
+        call: { ...call('call-CANARY-foreign', 8, 'Ran foreign').call, conversationId: 'conversation-other' }
+      },
+      {
+        seq: 9, time: 900, source: 'mcp', kind: 'tool_call',
+        call: { ...call('call-CANARY-unattributed', 9, 'Ran unattributed').call, attribution: 'unattributed', attributionMethod: 'unattributed' }
+      },
+      {
+        seq: 10, time: 1_000, source: 'mcp', kind: 'tool_call', turnId: 'turn-missing',
+        call: call('call-CANARY-noturn', 10, 'Ran without turn').call
+      }
+    ]);
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.items.map((item) => item.text)).toEqual(['Show the git state', 'Working tree is clean']);
+    expect(transcript.activity.map((row) => row.title)).toEqual([
+      'Ran git status --short in ~/Developer',
+      'Ran git rev-parse HEAD in ~/Developer'
+    ]);
+    expect(transcript.activity.map((row) => row.phase)).toEqual(['completed', 'completed']);
+    expect(transcript.activity.every((row) => row.turnOrigin === 1)).toBe(true);
+    expect(transcript.page.earliestOrigin).toBe(1);
+    const encoded = JSON.stringify(transcript);
+    for (const canary of [
+      'call-CANARY-status', 'call-CANARY-head', 'call-CANARY-nested', 'call-CANARY-foreign',
+      'call-CANARY-unattributed', 'call-CANARY-noturn', 'request-CANARY-0001', 'conversation-0001',
+      'session-0001', 'turn-0000001', 'ARGS-CANARY', 'RESULT-CANARY', 'CANARYTOKEN',
+      'sk-proj-abcdefghijklmnopqrstuvwxyz012345', home
+    ]) {
+      expect(encoded).not.toContain(canary);
+    }
+  });
+
+  it('folds a canonical process completion over the journal launch and pages by revision', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root, { historySeq: 9, active: false, outcome: 'completed' });
+    fixture.meta['timelineTurns'] = {
+      'turn-0000001': { origin: 1, time: 100, questionId: 'message-user-0001', endTime: 900, endOrigin: 9 }
+    };
+    fixture.meta['__historySeq'] = 9;
+    fixture.meta['activeTurnId'] = null;
+    fixture.meta['requestTurns'] = {
+      'request-CANARY-proc': { turnId: 'turn-0000001', conversationId: 'conversation-0001', origin: 1 }
+    };
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+    await writeCanonical(fixture.dir, {
+      seq: 9, origin: 4, time: 900, source: 'mcp', kind: 'tool_call', turnId: 'turn-0000001',
+      call: {
+        callId: 'call-CANARY-proc',
+        tool: 'exec_command',
+        attribution: 'request_id',
+        attributionMethod: 'request_id',
+        requestId: 'request-CANARY-proc',
+        conversationId: 'conversation-0001',
+        args: { text: 'ARGS-CANARY' },
+        result: { text: 'RESULT-CANARY' },
+        outcome: 'ok',
+        durationMs: 20,
+        process: { sessionId: 'process-CANARY', completedAt: 900, exitCode: 0, durationMs: 4_200 },
+        summary: { kind: 'process', tone: 'good', title: 'Running focused tests', metric: '✓ 4.2s' },
+        changes: [{ path: `${os.homedir()}/secret.ts`, added: 1, removed: 0, approximate: false }]
+      }
+    });
+    await writeJournal(fixture.dir, [
+      { seq: 2, time: 200, source: 'extension', kind: 'turn_start', turnId: 'turn-0000001' },
+      {
+        seq: 4, origin: 4, time: 400, source: 'mcp', kind: 'tool_call', turnId: 'turn-0000001',
+        call: {
+          callId: 'call-CANARY-proc',
+          tool: 'exec_command',
+          attribution: 'request_id',
+          attributionMethod: 'request_id',
+          requestId: 'request-CANARY-proc',
+          conversationId: 'conversation-0001',
+          args: { text: 'ARGS-CANARY' },
+          result: { text: '' },
+          outcome: 'ok',
+          durationMs: 1,
+          process: { sessionId: 'process-CANARY' },
+          summary: { kind: 'process', tone: 'neutral', title: 'Running focused tests', metric: 'running' }
+        }
+      },
+      { seq: 8, time: 800, source: 'extension', kind: 'turn_end', turnId: 'turn-0000001', outcome: 'completed' }
+    ]);
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const recent = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(recent.activity).toHaveLength(1);
+    expect(recent.activity[0]).toMatchObject({
+      originSeq: 4,
+      revisionSeq: 9,
+      phase: 'finished',
+      metric: '✓ 4.2s',
+      title: 'Running focused tests',
+      changedFiles: 1
+    });
+    expect(recent.activity[0]!.activityId).not.toContain('call-CANARY-proc');
+    const encoded = JSON.stringify(recent);
+    for (const canary of ['call-CANARY-proc', 'request-CANARY-proc', 'process-CANARY', 'ARGS-CANARY', 'RESULT-CANARY', os.homedir()]) {
+      expect(encoded).not.toContain(canary);
+    }
+    const delta = await source.transcript({ conversation: conversation!.handle, limit: 100, afterRevision: 8 });
+    expect(delta.items).toHaveLength(0);
+    expect(delta.activity.map((row) => row.revisionSeq)).toEqual([9]);
+    const settled = await source.transcript({ conversation: conversation!.handle, limit: 100, afterRevision: 9 });
+    expect(settled.activity).toEqual([]);
+    expect(settled.items).toEqual([]);
+    const earlier = await source.transcript({ conversation: conversation!.handle, limit: 100, beforeOrigin: 4 });
+    expect(earlier.activity).toEqual([]);
+    expect(earlier.items.some((item) => item.role === 'user')).toBe(true);
+  });
+
+  it('projects a request-owned call only when that request belongs to the current conversation', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root, { historySeq: 8, active: true });
+    fixture.meta['__historySeq'] = 8;
+    fixture.meta['requestTurns'] = {
+      'request-owned-0001': { turnId: 'turn-0000001', conversationId: 'conversation-0001', origin: 2 },
+      'request-foreign-001': null
+    };
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+    const baseCall = {
+      tool: 'exec_command',
+      attribution: 'request_id',
+      attributionMethod: 'request_id',
+      conversationId: 'conversation-0001',
+      outcome: 'ok',
+      durationMs: 5,
+      args: { text: 'hidden' },
+      result: { text: 'hidden' },
+      summary: { kind: 'run', tone: 'neutral', title: 'Ran owned command' }
+    };
+    await writeJournal(fixture.dir, [
+      { seq: 2, time: 200, source: 'extension', kind: 'turn_start', turnId: 'turn-0000001' },
+      {
+        seq: 3, origin: 3, time: 300, source: 'mcp', kind: 'tool_call',
+        call: { ...baseCall, callId: 'call-owned-0001', requestId: 'request-owned-0001' }
+      },
+      {
+        seq: 4, origin: 4, time: 400, source: 'mcp', kind: 'tool_call',
+        call: { ...baseCall, callId: 'call-foreign-0001', requestId: 'request-foreign-001', title: 'should not matter' }
+      }
+    ]);
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.activity.map((row) => row.title)).toEqual(['Ran owned command']);
+    expect(transcript.activity[0]!.turnOrigin).toBe(2);
+    expect(JSON.stringify(transcript)).not.toContain('call-owned-0001');
+    expect(JSON.stringify(transcript)).not.toContain('request-owned-0001');
+  });
 });

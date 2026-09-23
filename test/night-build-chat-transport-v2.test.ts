@@ -59,7 +59,8 @@ function dataSource(overrides: Partial<NightBuildChatTransportV2DataSource> = {}
         latestRevision: 0
       },
       currentTurn: { state: 'idle' },
-      items: []
+      items: [],
+      activity: []
     }),
     createSend: async (input) => ({
       id: input.id,

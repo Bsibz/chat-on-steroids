@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import type {
+  NightBuildChatActivityItemV1,
   NightBuildChatConversationListV1,
   NightBuildChatConversationV1,
   NightBuildChatCurrentTurnV1,
@@ -10,6 +12,11 @@ import type {
   NightBuildChatTranscriptV1,
   NightBuildChatTurnOutcome
 } from '../shared/night-build-chat-transport-v1.js';
+import {
+  parseNightBuildActivityCandidate,
+  projectNightBuildToolActivity,
+  type NightBuildActivityCandidate
+} from './session/tool-activity.js';
 
 const SESSION_ID = /^[0-9a-z-]{8,64}$/i;
 const CHAT_ID = /^[0-9a-z_-]{8,256}$/i;
@@ -109,6 +116,7 @@ interface JournalSnapshot {
   identityEvents: JournalIdentityEvent[];
   turnEnds: Array<{ seq: number; time: number; turnId: string; outcome: NightBuildChatTurnOutcome }>;
   handoffs: Array<{ seq: number; handoffId: string }>;
+  toolActivity: NightBuildActivityCandidate[];
 }
 
 interface CatalogRow { directoryId: string; meta: SessionMeta }
@@ -121,6 +129,7 @@ interface SelectedProjection {
   lowerBoundOrigin: number;
   highWaterSeq: number;
   assistantResponseOrigins: Map<string, number | null>;
+  toolActivity: NightBuildActivityCandidate[];
 }
 
 export interface NightBuildChatTranscriptQuery {
@@ -452,10 +461,12 @@ async function readCanonicalMessages(dir: string): Promise<{
   identityTools: CanonicalIdentityToolCall[];
   canonicalKeys: Set<string>;
   maxSeq: number;
+  toolActivity: NightBuildActivityCandidate[];
 }> {
   const all = new Map<string, CanonicalMessage>();
   const identityTools = new Map<string, CanonicalIdentityToolCall>();
   const canonicalKeys = new Set<string>();
+  const toolActivity: NightBuildActivityCandidate[] = [];
   let maxSeq = 0;
   try {
     const raw = object(await readJson(path.join(dir, 'messages.json'), MAX_LEGACY_CANONICAL_BYTES), 'chat_transport_legacy_messages_invalid');
@@ -471,6 +482,8 @@ async function readCanonicalMessages(dir: string): Promise<{
       if (message) all.set(key, message);
       const tool = parseCanonicalIdentityTool(event, key);
       if (tool) identityTools.set(key, tool);
+      const activity = parseNightBuildActivityCandidate(event, 'canonical');
+      if (activity) toolActivity.push(activity);
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -487,13 +500,20 @@ async function readCanonicalMessages(dir: string): Promise<{
       if (!key) throw new Error('chat_transport_canonical_key_invalid');
       if (createHash('sha256').update(key).digest('hex') + '.json' !== name) throw new Error('chat_transport_message_hash_mismatch');
       const seq = safeInt(event['seq'], 'chat_transport_message_seq_invalid', false);
-      return { key, seq, message: parseCanonicalMessage(event, key), tool: parseCanonicalIdentityTool(event, key) };
+      return {
+        key,
+        seq,
+        message: parseCanonicalMessage(event, key),
+        tool: parseCanonicalIdentityTool(event, key),
+        activity: parseNightBuildActivityCandidate(event, 'canonical')
+      };
     }));
     for (const row of batch) {
       canonicalKeys.add(row.key);
       maxSeq = Math.max(maxSeq, row.seq);
       if (row.message) all.set(row.key, row.message);
       if (row.tool) identityTools.set(row.key, row.tool);
+      if (row.activity) toolActivity.push(row.activity);
     }
   }
   const collapsed = collapseProviderAliases(all);
@@ -501,7 +521,8 @@ async function readCanonicalMessages(dir: string): Promise<{
     messages: [...collapsed.values()].sort((a, b) => a.origin - b.origin || a.seq - b.seq),
     identityTools: [...identityTools.values()],
     canonicalKeys,
-    maxSeq
+    maxSeq,
+    toolActivity
   };
 }
 
@@ -515,7 +536,7 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
   try { raw = await readBounded(path.join(dir, 'events.jsonl'), MAX_JOURNAL_BYTES, true); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    return { maxSeq: 0, activeTurnId: null, identityEvents: [], turnEnds: [], handoffs: [] };
+    return { maxSeq: 0, activeTurnId: null, identityEvents: [], turnEnds: [], handoffs: [], toolActivity: [] };
   }
   const lines = raw.split('\n');
   if (lines.at(-1) === '') lines.pop();
@@ -526,6 +547,7 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
   const identityEvents: JournalIdentityEvent[] = [];
   const turnEnds: JournalSnapshot['turnEnds'] = [];
   const handoffs: JournalSnapshot['handoffs'] = [];
+  const toolActivity: NightBuildActivityCandidate[] = [];
   for (const line of lines) {
     if (!line) continue;
     if (Buffer.byteLength(line, 'utf8') > MAX_JOURNAL_LINE_BYTES) continue;
@@ -536,10 +558,16 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
       const time = safeInt(event['time'], 'chat_transport_journal_time_invalid');
       const kind = event['kind'];
       const key = canonicalKey(event);
+      if (kind === 'tool_call' && event['source'] === 'mcp') {
+        const activity = parseNightBuildActivityCandidate(event, 'journal');
+        if (activity) toolActivity.push(activity);
+      }
       if (key && canonicalKeys.has(key)) {
         // Canonical message/tool shards are the authority for these rows. The
         // journal copy is intentionally ignored rather than allowed to move the
-        // durable cursor based on a partially validated duplicate.
+        // durable cursor based on a partially validated duplicate. Activity
+        // still keeps the journal launch so a later process revision can fold
+        // onto the original origin.
         continue;
       }
       let relevant = false;
@@ -595,7 +623,7 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
       continue;
     }
   }
-  return { maxSeq, activeTurnId, identityEvents, turnEnds, handoffs };
+  return { maxSeq, activeTurnId, identityEvents, turnEnds, handoffs, toolActivity };
 }
 
 function positionOf(event: { seq: number; origin?: number }): number {
@@ -1129,7 +1157,8 @@ async function selectedProjection(userData: string, row: CatalogRow): Promise<Se
     identitySource,
     lowerBoundOrigin,
     highWaterSeq,
-    assistantResponseOrigins
+    assistantResponseOrigins,
+    toolActivity: [...canonical.toolActivity, ...journal.toolActivity]
   };
 }
 
@@ -1147,27 +1176,58 @@ export function createNightBuildChatTransportSource(userData: string, salt: stri
       const matches = rows.filter((row) => conversationHandle(row, salt) === query.conversation);
       if (matches.length !== 1) throw new Error('chat_transport_conversation_not_found');
       const projection = await selectedProjection(userData, matches[0]!);
-      const all = projection.messages.filter((message) => message.origin >= projection.lowerBoundOrigin);
-      let selected: CanonicalMessage[];
+      const activity = projectNightBuildToolActivity(
+        projection.toolActivity,
+        {
+          conversationId: projection.row.meta.conversationId,
+          lowerBoundOrigin: projection.lowerBoundOrigin,
+          turnOrigin: (turnId) => projectedTurnOrigin(projection.identity, turnId),
+          requestTurn: (requestId) => {
+            if (!Object.hasOwn(projection.identity.requestTurns, requestId)) return undefined;
+            const owner = projection.identity.requestTurns[requestId];
+            return owner && owner.conversationId === projection.row.meta.conversationId ? owner : null;
+          }
+        },
+        salt,
+        os.homedir()
+      );
+      const messages = projection.messages.filter((message) => message.origin >= projection.lowerBoundOrigin);
+      type PageRow = {
+        origin: number;
+        revision: number;
+        item?: NightBuildChatTranscriptItemV1;
+        activity?: NightBuildChatActivityItemV1;
+      };
+      const timeline: PageRow[] = [
+        ...messages.map((message) => {
+          const item = publicItem(message, projection, salt);
+          return { origin: item.originSeq, revision: item.revisionSeq, item };
+        }),
+        ...activity.map((row) => ({ origin: row.originSeq, revision: row.revisionSeq, activity: row }))
+      ];
+      let selected: PageRow[];
       let mode: NightBuildChatTranscriptV1['page']['mode'];
       let hasEarlier = false;
       let hasMore = false;
       if (query.afterRevision !== undefined) {
         mode = 'incremental';
-        const changed = all.filter((message) => message.seq > query.afterRevision!).sort((a, b) => a.seq - b.seq);
+        const changed = timeline.filter((row) => row.revision > query.afterRevision!).sort((a, b) => a.revision - b.revision || a.origin - b.origin);
         selected = changed.slice(0, query.limit);
         hasMore = changed.length > selected.length;
       } else if (query.beforeOrigin !== undefined) {
         mode = 'backfill';
-        const earlier = all.filter((message) => message.origin < query.beforeOrigin!);
+        const earlier = timeline.filter((row) => row.origin < query.beforeOrigin!).sort((a, b) => a.origin - b.origin || a.revision - b.revision);
         selected = earlier.slice(-query.limit);
         hasEarlier = earlier.length > selected.length;
       } else {
         mode = 'recent';
-        selected = all.slice(-query.limit);
-        hasEarlier = all.length > selected.length;
+        const ordered = [...timeline].sort((a, b) => a.origin - b.origin || a.revision - b.revision);
+        selected = ordered.slice(-query.limit);
+        hasEarlier = ordered.length > selected.length;
       }
-      const items = selected.map((message) => publicItem(message, projection, salt));
+      const items = selected.flatMap((row) => row.item ? [row.item] : []);
+      const pageActivity = selected.flatMap((row) => row.activity ? [row.activity] : []);
+      const origins = selected.map((row) => row.origin);
       return {
         conversation: {
           handle: query.conversation,
@@ -1185,11 +1245,12 @@ export function createNightBuildChatTransportSource(userData: string, salt: stri
           mode,
           hasEarlier,
           hasMore,
-          earliestOrigin: items.length ? Math.min(...items.map((item) => item.originSeq)) : null,
-          latestRevision: items.reduce((max, item) => Math.max(max, item.revisionSeq), query.afterRevision ?? 0)
+          earliestOrigin: origins.length ? Math.min(...origins) : null,
+          latestRevision: selected.reduce((max, row) => Math.max(max, row.revision), query.afterRevision ?? 0)
         },
         currentTurn: currentTurn(projection),
-        items
+        items,
+        activity: pageActivity
       };
     }
   };

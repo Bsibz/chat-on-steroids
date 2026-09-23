@@ -12081,6 +12081,8 @@ describe('app requests to stop one exact active turn', () => {
     expect(persistMutationDeadline).toHaveBeenCalledTimes(2);
     expect((await request('GET', '/status')).body.stopTurns).toHaveLength(1);
     const command = (await request('GET', '/status')).body.stopTurns[0];
+    expect(command).toMatchObject({ nativePinned: true, browserOwner: '7:native-stop-page:1' });
+    expect(command.expiresAt).toEqual(expect.any(Number));
     const redeemed = await request('POST', '/commands/redeem', { body: { id: command.id, client: 'native-stop-page', conversationId } });
     expect(redeemed.status).toBe(200);
     expect(redeemed.body.command).toMatchObject({ kind: 'stop-turn', turnId: 'native-turn', userMessageId: 'native-question' });

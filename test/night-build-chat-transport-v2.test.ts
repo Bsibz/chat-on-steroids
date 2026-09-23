@@ -9,7 +9,10 @@ import {
   startNightBuildChatTransportV2,
   type NightBuildChatTransportV2Handle
 } from '../src/main/night-build-chat-transport-v2.js';
-import type { NightBuildChatTransportV2DataSource } from '../src/main/night-build-chat-transport-v2-source.js';
+import {
+  classifyNativeChatStopTerminalOutcome,
+  type NightBuildChatTransportV2DataSource
+} from '../src/main/night-build-chat-transport-v2-source.js';
 import {
   NIGHT_BUILD_CHAT_TRANSPORT_V2_DISCOVERY_FILE,
   NIGHT_BUILD_CHAT_TRANSPORT_V2_PROTOCOL_HEADER,
@@ -148,6 +151,23 @@ async function request(
 const auth = (discovery: NightBuildChatTransportV2Discovery) => ({
   token: discovery.token,
   protocol: '2'
+});
+
+describe('Native Chat Stop terminal classification', () => {
+  it.each([
+    ['stopped', 'stopped'],
+    ['completed', 'completed'],
+    ['failed', 'unknown'],
+    ['interrupted', 'unknown'],
+    ['stalled', 'unknown'],
+    ['unknown', 'unknown']
+  ] as const)('maps exact turn_end outcome %s to %s', (outcome, expected) => {
+    expect(classifyNativeChatStopTerminalOutcome(outcome)).toBe(expected);
+  });
+
+  it('keeps missing terminal evidence distinct from a durable unknown terminal', () => {
+    expect(classifyNativeChatStopTerminalOutcome(null)).toBeNull();
+  });
 });
 
 describe('Night Build Chat Transport v2 local server', () => {

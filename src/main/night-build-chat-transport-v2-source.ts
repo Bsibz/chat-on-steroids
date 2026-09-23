@@ -7,6 +7,7 @@ import type {
   NightBuildChatStopCreateV2,
   NightBuildChatStopIntentV2
 } from '../shared/night-build-chat-transport-v2.js';
+import type { TurnOutcome } from '../shared/session.js';
 import { getConfig } from './config.js';
 import { nativeChatStopPending, requestNativeChatStop, startBridge, STOP_COMMAND_TIMEOUT_MS } from './bridge.js';
 import { readDurable, writeDurableNow } from './durable.js';
@@ -45,6 +46,16 @@ function opaque(salt: string, domain: string, value: string): string {
 function sendError(row: Awaited<ReturnType<typeof listInputs>>[number]): NightBuildChatSendIntentV2['error'] {
   if (row.state === 'cancelled' && row.sendAuthorizedAt !== undefined) return 'acceptance_unknown';
   if (row.state === 'failed' || row.state === 'cancelled') return 'pre_send_failed';
+  return null;
+}
+
+/** Internal classifier for exact durable turn terminal evidence. */
+export function classifyNativeChatStopTerminalOutcome(
+  outcome: TurnOutcome | null
+): NightBuildChatStopIntentV2['state'] | null {
+  if (outcome === 'stopped') return 'stopped';
+  if (outcome === 'completed') return 'completed';
+  if (outcome !== null) return 'unknown';
   return null;
 }
 
@@ -160,12 +171,12 @@ export function createInProcessNightBuildChatTransportV2Source(
     const conversation = opaque(salt, 'conversation', row.sessionId + '\0' + row.conversationId);
     const terminal = await readTurnEnd(row.sessionId, row.turnId);
     const outcome = terminal?.outcome ?? null;
-    const state: NightBuildChatStopIntentV2['state'] = outcome
-      ? outcome === 'stopped' ? 'stopped' : 'completed'
-      : row.error ? 'failed'
+    const terminalState = classifyNativeChatStopTerminalOutcome(outcome);
+    const state: NightBuildChatStopIntentV2['state'] = terminalState
+      ?? (row.error ? 'failed'
         : nativeChatStopPending(row.id) ? 'queued'
-          : 'unknown';
-    if (state === 'stopped' || state === 'completed' || state === 'failed') {
+          : 'unknown');
+    if (outcome !== null || state === 'failed') {
       await clearNativeChatStopMutation(row.sendId, row.id);
     }
     return {

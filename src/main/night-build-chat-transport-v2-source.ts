@@ -124,15 +124,25 @@ export function createInProcessNightBuildChatTransportV2Source(
     const conversation = opaque(
       salt, 'conversation', row.nativeChat.sessionId + '\0' + row.nativeChat.conversationId
     );
-    let proof = row.nativeChat.acceptance ?? (row.messageId && row.deliveredAt !== undefined
-      ? await resolveNightBuildChatNativeSendProofByIdentity(
-        userData,
-        salt,
-        row.nativeChat.sessionId,
-        row.nativeChat.conversationId,
-        row.id
-      )
-      : null);
+    let proof = row.nativeChat.acceptance ?? null;
+    if (!proof && row.messageId && row.deliveredAt !== undefined) {
+      try {
+        proof = await resolveNightBuildChatNativeSendProofByIdentity(
+          userData,
+          salt,
+          row.nativeChat.sessionId,
+          row.nativeChat.conversationId,
+          row.id
+        );
+      } catch (error) {
+        // A live ChatGPT turn can revise canonical shards/metadata between the
+        // projection's before/after snapshots. That race says only "proof is not
+        // readable this instant"; it does not make an already-durable Send
+        // unknown. Preserve queued/claimed so the same intent id keeps
+        // reconciling. Every other projection/storage error still fails closed.
+        if ((error as Error).message !== 'chat_transport_projection_changed') throw error;
+      }
+    }
     if (proof && !row.nativeChat.acceptance) {
       if (!await recordNativeChatAcceptance(
         row.id, row.nativeChat.sessionId, row.nativeChat.conversationId, proof

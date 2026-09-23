@@ -557,6 +557,22 @@ describe('Night Build Chat Transport v1 durable projection', () => {
       });
   });
 
+  it('proves a native Send from durable user + turn-start evidence while summary metadata lags', async () => {
+    const root = await tempRoot();
+    const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await writeFixture(root, { inputId, historySeq: 1 });
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    expect(conversation).toBeDefined();
+    await expect(resolveNightBuildChatNativeSendProof(root, 'test-generation-secret', conversation!.handle, inputId))
+      .resolves.toMatchObject({
+        messageId: 'message-user-0001',
+        turnId: 'turn-0000001',
+        turnOrigin: 2,
+        revisionSeq: 1
+      });
+  });
+
   it('does not treat the app-authored ACK projection as native ChatGPT acceptance proof', async () => {
     const root = await tempRoot();
     const inputId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';

@@ -226,7 +226,7 @@ export function createInProcessNightBuildChatTransportV2Source(
       // This preflight may flush recorder state. Keep it outside mutation admission;
       // final exact ownership is rechecked again while the session queue is owned.
       await assertNativeChatInputReady(nativeInput);
-      await withSessionMutationAdmission(resolved.sessionId, 'native chat send admission', async () => {
+      const admitted = await withSessionMutationAdmission(resolved.sessionId, 'native chat send admission', async () => {
         const current = await resolveNightBuildChatConversation(userData, salt, input.conversation);
         if (!current || current.sessionId !== resolved.sessionId ||
             current.conversationId !== resolved.conversationId ||
@@ -237,11 +237,21 @@ export function createInProcessNightBuildChatTransportV2Source(
         // getSession() is an in-memory read here and cannot re-enter the queue.
         const session = await getSession(resolved.sessionId);
         if (!session) throw new Error('native_chat_conversation_unavailable');
-        await enqueueAdmittedNativeChatInput(nativeInput, session);
+        return enqueueAdmittedNativeChatInput(nativeInput, session);
       });
-      const status = await sendStatus(input.id);
-      if (!status) throw new Error('native_chat_intent_unavailable');
-      return status;
+      // POST proves only durable admission. Do not make the HTTP acknowledgement
+      // wait on a projection that ChatGPT may be actively revising after the
+      // browser picks the input up. Exact acceptance is upgraded exclusively by
+      // the same-id status/inspect path once recorder proof exists.
+      return {
+        id: admitted.id,
+        conversation: input.conversation,
+        state: 'queued',
+        createdAt: admitted.createdAt,
+        claimedAt: null,
+        receipt: null,
+        error: null
+      } satisfies Omit<NightBuildChatSendIntentV2, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>;
     },
     send: sendStatus,
     inspectSend: sendStatus,

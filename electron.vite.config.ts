@@ -10,7 +10,8 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
-          'night-build-bridge-sidecar': resolve(__dirname, 'src/main/night-build-bridge-sidecar.ts')
+          'night-build-bridge-sidecar': resolve(__dirname, 'src/main/night-build-bridge-sidecar.ts'),
+          'night-build-chat-transport-sidecar': resolve(__dirname, 'src/main/night-build-chat-transport-sidecar.ts')
         }
       }
     }

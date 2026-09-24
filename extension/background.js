@@ -1958,6 +1958,28 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       if (!documentId || !ownsDocument(source)) continue;
       const current = await chrome.tabs.get(sourceTab.id).catch(() => null);
       if (!ownsDocument(source) || !current || current.pendingUrl || conversationForTab(current) !== freshSource) continue;
+      // A freshly opened /c/<id> can briefly exist before ChatGPT redirects a Project chat to
+      // /g/<project>/c/<id>. Treating that transient root URL as authoritative loses Project
+      // placement. For app-opened sources, require the exact origin+pathname to survive one
+      // ordinary maintenance interval before deriving a destination. Existing user-open tabs
+      // were already stable before this intent and do not pay this delay.
+      if (elected?.stage === 'source-opening') {
+        let route = null;
+        try {
+          const url = new URL(current.url);
+          route = `${url.origin}${url.pathname}`;
+        } catch { /* malformed provider URL stays queued */ }
+        if (!route) continue;
+        if (elected.sourceRoute !== route || !Number.isFinite(elected.sourceRouteObservedAt)) {
+          await elect(input.id, {
+            ...elected,
+            sourceRoute: route,
+            sourceRouteObservedAt: Date.now()
+          });
+          continue;
+        }
+        if (Date.now() - elected.sourceRouteObservedAt < 1500) continue;
+      }
       const freshProjectId = projectFromUrl(current.url);
       let destination = null;
       try {

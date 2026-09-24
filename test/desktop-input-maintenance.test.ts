@@ -222,6 +222,45 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
   });
 
+  it('does not mistake a newly opened transient root source URL for final Project placement', async () => {
+    const h = await worker(
+      [{ id: firstId, conversationId: null, freshSourceConversationId: secondId }],
+      undefined,
+      { inputOpenings: { [firstId]: { tab: 8, stage: 'source-opening', sourceConversationId: secondId } } }
+    );
+    h.tabs.push({ id: 8, url: `https://chatgpt.com/c/${secondId}` });
+    await h.authorizeDocument({ tab: { id: 8 }, documentId: 'source-root', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.create).not.toHaveBeenCalled();
+    expect((h.localSaved.inputOpenings as any)[firstId]).toMatchObject({
+      stage: 'source-opening',
+      sourceRoute: `https://chatgpt.com/c/${secondId}`
+    });
+  });
+
+  it('uses a stable app-opened source route only after its stabilization fence', async () => {
+    const project = 'g-p-11111111222233334444555555555555';
+    const route = `https://chatgpt.com/g/${project}-night-build/c/${secondId}`;
+    const h = await worker(
+      [{ id: firstId, conversationId: null, freshSourceConversationId: secondId }],
+      undefined,
+      { inputOpenings: { [firstId]: {
+        tab: 8,
+        stage: 'source-opening',
+        sourceConversationId: secondId,
+        sourceRoute: route,
+        sourceRouteObservedAt: 1
+      } } }
+    );
+    h.tabs.push({ id: 8, url: route });
+    await h.authorizeDocument({ tab: { id: 8 }, documentId: 'source-project', frameId: 0, url: route }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: `https://chatgpt.com/g/${project}-night-build/project?cos-input=${firstId}#cos-input=${firstId}`
+    }));
+  });
+
   it('does not spend fresh-source opening authority twice after an elected source tab disappears', async () => {
     const h = await worker(
       [{ id: firstId, conversationId: null, freshSourceConversationId: secondId }],

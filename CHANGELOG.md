@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.18] — Fresh source route stabilization
+
+- Fence app-opened fresh-chat source conversations until the exact provider route is stable before deriving Project placement.
+- Avoid mistaking ChatGPT's transient root `/c/<id>` load for the final Project-qualified source URL.
+- Preserve the existing one-shot source-opening and fail-closed fresh-chat guarantees.
+
+Reload the existing unpacked companion after updating; the stable extension folder remains unchanged.
+
 ## [2.1.17] — Exact fresh-chat destination routing
 
 - After restoring the exact source conversation for Night Build New Chat, derive the fresh destination from that source URL instead of depending on ChatGPT's Project UI controls.

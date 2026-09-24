@@ -10055,6 +10055,26 @@ describe('evidence from the page context', () => {
     ]);
   });
 
+  it('confirms a UUID request from the live response stream', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'ae9a06c4-a735-4c02-8dba-9f2f50e4f82d';
+    live.reply.set('correlate', () => ({
+      ok: true,
+      status: 200,
+      data: { ok: true, conversationId, confirmed: [requestId], complete: true }
+    }));
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: 1_700_000_001_000 }
+    }));
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([
+      expect.objectContaining({ conversationId, calls: [{ requestId, messageId: null, createTime: 1_700_000_001 }] })
+    ]);
+  });
+
   it('retains one-shot stream proof through a failed ACK without overlapping or repeating a confirmed request', async () => {
     live = await harness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', requestId = 'wfr_retry_once';
@@ -10136,7 +10156,7 @@ describe('evidence from the page context', () => {
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
     for (const data of [
       { type: 'cos-request-origin', conversationId: '11111111-2222-3333-4444-555555555555', requestIds: ['wfr_foreign'] },
-      { type: 'cos-request-origin', conversationId, requestIds: ['not-a-workflow'] },
+      { type: 'cos-request-origin', conversationId, requestIds: ['not/a/request-id'] },
       { type: 'cos-request-origin', conversationId, requestIds: Array.from({ length: 17 }, (_, i) => `wfr_${i}`) }
     ]) {
       live.window.dispatchEvent(new live.window.MessageEvent('message', {

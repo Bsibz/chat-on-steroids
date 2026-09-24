@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.20] — UUID request attribution
+
+- Accept current ChatGPT UUID connector request IDs in the passive SSE/WebSocket ownership observer using the same bounded opaque-id contract as MCP ingress.
+- Preserve exact conversation + structured server-metadata proof; quoted/model text and malformed IDs still cannot establish caller ownership.
+- Restore early request attribution when the React/Fiber helper is temporarily empty, avoiding the first-call dormant-worker identity wait when the provider stream already exposes the exact join.
+
+Reload the existing unpacked companion after updating so the new page observer is active.
+
 ## [2.1.19] — Daily-driver performance and recovery
 
 - Remove avoidable attribution stalls from explicit read-only request-scoped calls while preserving exact blocked, superseded and worker lifecycle fences.

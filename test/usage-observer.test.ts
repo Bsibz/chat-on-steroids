@@ -124,6 +124,18 @@ describe('MAIN-world usage projection', () => {
     expect(h.posts).toHaveLength(1);
     h.request(); expect(h.posts).toHaveLength(2);
   });
+  it('accepts current UUID connector request ids from the Pro socket handoff', () => {
+    const h = harness(), socket = h.socket();
+    const conversation_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const request_id = 'ae9a06c4-a735-4c02-8dba-9f2f50e4f82d';
+    const frame = `data: ${JSON.stringify({ conversation_id, message: { metadata: { request_id } } })}\n\n`;
+    socket.receive([{ type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+      type: 'stream-item', conversation_id, encoded_item: frame
+    } } }]);
+    expect(h.posts).toEqual([
+      { type: 'cos-request-origin', conversationId: conversation_id, requestIds: [request_id], observedAt: expect.any(Number) }
+    ]);
+  });
   it('rejects foreign sockets, contradictory envelopes and request IDs hidden in model text', () => {
     const h = harness(), socket = h.socket();
     const conversation_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -276,6 +288,18 @@ describe('MAIN-world usage projection', () => {
     ]);
     expect(JSON.stringify(h.posts)).not.toContain('private prompt');
     expect(JSON.stringify(h.posts)).not.toContain('tool args');
+  });
+
+  it('publishes a UUID request id from structured SSE metadata', async () => {
+    const h = harness();
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const requestId = 'ae9a06c4-a735-4c02-8dba-9f2f50e4f82d';
+    await h.feedSse([
+      `data: ${JSON.stringify({ conversation_id: conversationId, metadata: { request_id: requestId } })}\n\n`
+    ]);
+    expect(h.posts).toEqual([
+      { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: expect.any(Number) }
+    ]);
   });
 
   it('reattaches after the page runtime replaces fetch during startup', async () => {

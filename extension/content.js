@@ -3026,6 +3026,9 @@
   const FIBER_MAX_ACTIVITIES = 200;
   const FIBER_MAX_IMAGES = 200;
   const TOOL_NAME = /^[a-z0-9_.-]{1,64}$/i;
+  // Same opaque request-id alphabet/bound as MCP ingress. Do not assume the historical
+  // wfr_* prefix: current ChatGPT can use UUID request ids for connector calls.
+  const REQUEST_ID = /^[a-z0-9_-]{1,100}$/i;
   const FIBER_BUSY_CAPTIONS = new Set(['thinking', 'thinking about it', 'reasoning', 'working', 'loading', 'done', 'called tool']);
   const FIBER_TIMER_CAPTION = /^(?:worked|thought|reasoned|thinking)\s+for\s+[\d.,]+\s*(?:s|m|h|sec|secs|seconds?|min|mins|minutes?|hours?)\b/;
 
@@ -10701,7 +10704,7 @@
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed)) return;
     const raw = Array.isArray(event.data.requestIds) ? event.data.requestIds : [];
     if (raw.length === 0 || raw.length > 16) return;
-    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' && /^wfr_[a-zA-Z0-9_-]{1,96}$/.test(id)))];
+    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' && REQUEST_ID.test(id)))];
     if (requestIds.length === 0) return;
     const observedAt = Number.isFinite(event.data.observedAt) ? event.data.observedAt : Date.now();
     confirmStreamRequestOrigin(claimed, requestIds, observedAt);

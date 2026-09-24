@@ -14,6 +14,7 @@ import {
   observeRequestCorrelation,
   observeRequestCorrelations,
   requestCorrelation,
+  beginRequestCorrelationWindow,
   awaitRequestCorrelation,
   restoreRequestCorrelations,
   resetCorrelationRegistryForTests
@@ -50,6 +51,22 @@ describe('request correlation ownership', () => {
     expect(await first).toBeNull();
     expect(await second).toBeNull();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('starts the request evidence budget at ingress without waiting or creating a negative verdict', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    beginRequestCorrelationWindow('wfr-ingress');
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(40);
+    const lateSensitiveCall = awaitRequestCorrelation('wfr-ingress', 60);
+    await vi.advanceTimersByTimeAsync(19);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await lateSensitiveCall).toBeNull();
+
+    observeRequestCorrelation({ requestId: 'wfr-ingress', conversationId: 'conv-late',
+      sessionId: 'session-late', messageId: 'message-late', tool: 'exec_command', observedAt: 1 });
+    expect((await awaitRequestCorrelation('wfr-ingress', 60))?.conversationId).toBe('conv-late');
   });
 
   it('retains the remaining longer recorder grace after a shorter identity timeout', async () => {

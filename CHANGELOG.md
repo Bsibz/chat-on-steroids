@@ -9,6 +9,17 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.19] — Daily-driver performance and recovery
+
+- Remove avoidable attribution stalls from explicit read-only request-scoped calls while preserving exact blocked, superseded and worker lifecycle fences.
+- Reuse one request-level attribution window, avoid redundant worker-owner reconciliation, and keep unresolved recording off the tool-response path.
+- Give fresh worker chats bounded composer-readiness retries under the app-owned command deadline instead of failing after one delayed mount.
+- Restore a previously connected tunnel on relaunch unless the owner explicitly disconnected, with finite backoff and no startup blocking.
+- Refresh the packaged companion into the stable unpacked extension folder on startup; local dogfood builds now ask only for Chrome Reload instead of linking nonexistent release assets.
+- Treat ChatGPT's `Resume stream unavailable` as a provider transport failure and reuse the existing exact-turn, one-shot recovery boundary without re-executing the turn.
+
+Reload the existing unpacked companion after updating. No Load unpacked step is required.
+
 ## [2.1.18] — Fresh source route stabilization
 
 - Fence app-opened fresh-chat source conversations until the exact provider route is stable before deriving Project placement.

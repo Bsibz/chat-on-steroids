@@ -270,6 +270,24 @@ async function releaseDigests(version: string): Promise<Map<string, string>> {
   return digests;
 }
 
+/**
+ * Whether this exact app version has the public standalone extension recovery asset.
+ *
+ * The latest-release check cannot answer this for an older installed public build, and version
+ * ordering cannot prove that an intermediate tag was ever published. The release checksum
+ * manifest is already the updater's authority for which assets actually exist, so reuse that
+ * exact-version proof here. Failure/offline simply means the bundled stable folder remains the
+ * safe recovery path; callers never open a URL that GitHub has not proved exists.
+ */
+export async function publishedExtensionRelease(version: string): Promise<boolean> {
+  if (!/^\d+\.\d+\.\d+$/.test(version)) return false;
+  try {
+    return (await releaseDigests(version)).has('Chat-On-Steroids-Extension.zip');
+  } catch {
+    return false;
+  }
+}
+
 /** The url of one release asset. Built here, never taken from a response body. */
 function assetUrl(version: string, name: string): string {
   return `https://github.com/${REPO}/releases/download/v${encodeURIComponent(version)}/${name}`;

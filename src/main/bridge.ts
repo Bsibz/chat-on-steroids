@@ -516,7 +516,7 @@ export interface BridgeCommand {
   kind: 'open-chat' | 'stop-turn';
   turnId?: string;
   userMessageId?: string;
-  /** Absolute lifetime for Stop authority. The page rechecks this at the irreversible click. */
+  /** Absolute lifetime for this browser command. The page rechecks this at irreversible Send/Stop. */
   expiresAt?: number;
   /**
    * Why this chat is being opened.
@@ -8450,6 +8450,11 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
       ? bootstrapText(spec, claimedSummary)
       : ''
     : bootstrapText(spec, '');
+  // A claimed open-chat command has one app-owned absolute deadline. Send that same boundary to
+  // the page so a slow ChatGPT bootstrap can keep waiting for readiness without ever typing after
+  // the bridge could already have expired/released its worker slot. Unclaimed descriptions are UI
+  // snapshots only and carry no browser authority, so they need no deadline.
+  const expiresAt = client ? Date.now() + Math.max(0, commandDeadlineDelay(command)) : undefined;
   return {
     id: command.id,
     kind: 'open-chat',
@@ -8461,6 +8466,7 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
     agent: spec.type === 'resume' ? null : spec.agent,
     model: spec.type === 'worker' ? spec.model : selection?.model ?? null,
     reasoningEffort: spec.type === 'worker' ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
     // The fence the page enforces before it types. Only a revival has one: the other two
     // kinds open a chat that does not exist yet, so there is nothing to compare against.
     conversationId: spec.type === 'revive' ? spec.conversationId : null

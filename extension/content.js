@@ -10061,9 +10061,10 @@
    * immediately when the composer already exists, otherwise wake the instant React mounts
    * one, with only a bounded timer as the failure deadline.
    */
-  function waitForComposer(timeoutMs = 12_000) {
-    const current = CLF_DOM.composer();
-    if (current && current.isConnected) return Promise.resolve(current);
+  function waitForComposer(timeoutMs = 12_000, current = () => true) {
+    if (!current()) return Promise.resolve(null);
+    const existing = CLF_DOM.composer();
+    if (existing && existing.isConnected) return Promise.resolve(existing);
     return new Promise((resolve) => {
       let timer = null;
       let observer = null;
@@ -10073,6 +10074,7 @@
         resolve(value);
       };
       const check = () => {
+        if (!current()) return finish(null);
         const composer = CLF_DOM.composer();
         if (composer && composer.isConnected) finish(composer);
       };
@@ -10082,6 +10084,34 @@
       // Close the tiny race between the first lookup and installing the observer.
       check();
     });
+  }
+
+  /**
+   * Waits for a fresh ChatGPT page to become usable without turning one slow mount into a
+   * terminal worker failure.
+   *
+   * Each slice is event-driven by DOM mutation and followed by bounded exponential backoff. The
+   * bridge's own absolute expiry remains the authority: every retry and the eventual Send stay at
+   * least one second inside it. Older compatible replies without an expiry get a conservative
+   * 45-second local budget, still well inside the bridge's ordinary 90-second command deadline.
+   */
+  async function waitForBootstrapComposer(current, expiresAt) {
+    const fallbackDeadline = Date.now() + 45_000;
+    const deadline = Number.isFinite(expiresAt) ? expiresAt : fallbackDeadline;
+    const safetyMs = 1_000;
+    let backoffMs = 250;
+    while (current()) {
+      const remaining = deadline - Date.now() - safetyMs;
+      if (remaining <= 0) return null;
+      const composer = await waitForComposer(Math.min(6_000, remaining), current);
+      if (composer && current() && Date.now() < deadline - safetyMs) return composer;
+      if (!current()) return null;
+      const afterWait = deadline - Date.now() - safetyMs;
+      if (afterWait <= 0) return null;
+      await sleep(Math.min(backoffMs, afterWait));
+      backoffMs = Math.min(2_000, backoffMs * 2);
+    }
+    return null;
   }
 
   async function runCommand(id = markerId(), fromUrl = true, onClaim = null, options = {}) {
@@ -10279,7 +10309,9 @@
     // The composer is the readiness signal. Page-level `readyState` says whether every
     // resource finished loading, not whether this editing host is usable, and waiting on it
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
-    const readyComposer = await waitForComposer();
+    const bootstrapCurrent = () => stillOnTarget() &&
+      (!Number.isFinite(boot.expiresAt) || Date.now() < boot.expiresAt - 1_000);
+    const readyComposer = await waitForBootstrapComposer(bootstrapCurrent, boot.expiresAt);
     if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
     if (await failIfRetargeted()) return;
 
@@ -10401,7 +10433,7 @@
         return;
       }
     }
-    if (!stillOnTarget() || !exactBootstrapDraft()) { await rejectChangedBootstrap(); return; }
+    if (!bootstrapCurrent() || !exactBootstrapDraft()) { await rejectChangedBootstrap(); return; }
     // The destination Resume prompt is the first authored evidence in a brand-new chat.
     // Record it before send() clicks so reportMessages can open B's turn immediately instead
     // of waiting until Fiber eventually exposes the first connector request.
@@ -11559,6 +11591,7 @@
       currentActivityPullDelay,
       notePresentation,
       presentationPending,
+      waitForBootstrapComposer,
       runCommand,
       startCompact,
       cancelCompact,

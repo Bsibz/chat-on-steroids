@@ -1176,6 +1176,9 @@ export interface ToolCallInput {
 const requestRecordings = new Map<string, Promise<void>>();
 const sessionRecordings = new Map<string, Promise<void>>();
 const pendingRecordings = new Set<Promise<unknown>>();
+/** One diagnostic per unresolved request. Later calls share the same evidence verdict/window. */
+const warnedUnattributedRequests = new Set<string>();
+const MAX_WARNED_UNATTRIBUTED_REQUESTS = 2_000;
 
 function serializeRecording<T>(queues: Map<string, Promise<void>>, key: string, run: () => Promise<T>): Promise<T> {
   const work = (queues.get(key) ?? Promise.resolve()).then(run);
@@ -1232,10 +1235,14 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
           // one outcome whose cause always lives in the browser half of the join, so the log
           // has to carry the id that the page never confirmed — it is the only handle anyone
           // has for matching this against what the extension believed it sent.
-          if (!conversationId) {
+          if (!conversationId && !warnedUnattributedRequests.has(input.requestId!)) {
+            warnedUnattributedRequests.add(input.requestId!);
+            while (warnedUnattributedRequests.size > MAX_WARNED_UNATTRIBUTED_REQUESTS) {
+              warnedUnattributedRequests.delete(warnedUnattributedRequests.values().next().value!);
+            }
             logWarn(
               `request attribution: no page evidence for ${input.requestId} within ` +
-                `${REQUEST_ID_GRACE_MS}ms; filing ${input.tool} under Unattributed activity`
+                `${REQUEST_ID_GRACE_MS}ms request window; filing calls under Unattributed activity until exact evidence arrives`
             );
           }
           if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
@@ -2658,6 +2665,7 @@ export function resetRecorderForTests(): void {
   requestRecordings.clear();
   sessionRecordings.clear();
   pendingRecordings.clear();
+  warnedUnattributedRequests.clear();
   lastActiveSessionId = null;
   if (attributionRepairTimer) {
     clearTimeout(attributionRepairTimer);

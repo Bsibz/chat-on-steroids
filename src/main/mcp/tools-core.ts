@@ -71,7 +71,7 @@ import {
   DEFAULT_TTY,
   DEFAULT_WRITE_STDIN_YIELD_TIME_MS
 } from '../codex/unified-exec-constants.js';
-import { defaultUserShell, deriveExecArgs, getShellByModelProvidedPath, shlexJoin } from '../codex/shell.js';
+import { defaultUserShell, deriveExecArgs, getShellByModelProvidedPath, shlexJoin, type ShellType } from '../codex/shell.js';
 import {
   APPLY_PATCH_ARGUMENT_DESCRIPTION,
   APPLY_PATCH_DESCRIPTION,
@@ -230,6 +230,19 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
     logInfo(`exec_command: filled in unset toolchain variables (${added.join(', ')})`);
   }
   return applyUnifiedExecEnv(env);
+}
+
+/**
+ * POSIX login shells are allowed to run the owner's profile, but those profiles can rewrite PATH
+ * after Node has already built the scrubbed child environment. Re-assert only the app-owned
+ * ripgrep directory at command entry so `command -v rg` and nested tools see the same verified
+ * binary the MCP surface advertises, while preserving every other profile/environment change.
+ */
+function restoreBundledRipgrepAfterLogin(command: string, shellType: ShellType, executable: string | null): string {
+  if (!executable || (shellType !== 'zsh' && shellType !== 'bash' && shellType !== 'sh')) return command;
+  const directory = nodePath.dirname(executable);
+  const quoted = `'${directory.replace(/'/g, `'\\''`)}'`;
+  return `PATH=${quoted}:"$PATH"; export PATH; ${command}`;
 }
 
 /** One stable owner for the running model turn, upgraded lazily when page proof arrives. */
@@ -723,6 +736,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // line PowerShell can actually parse, and a line it cannot repair is left exactly
           // as written for the shell to refuse and the hint to explain.
           const commandNotes: string[] = [];
+          const bundledRipgrep = shell.shellType === 'cmd' ? null : locateRipgrep();
           const boundCommands = rawCommands.map((rawCommand, index) => {
             const repaired = repairPowerShellQuoting(rawCommand, shell.shellType);
             const normalized = normalizeShellCommand(repaired.cmd, shell.shellType, (relativeDirectory = '.') =>
@@ -732,7 +746,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             const bound = bindBundledRipgrep(
               normalized.cmd,
               shell.shellType,
-              shell.shellType === 'cmd' ? null : locateRipgrep()
+              bundledRipgrep
             );
             const chained = normalizePowerShellOperators(bound, shell.shellType, shell.shellPath);
             commandNotes.push(
@@ -757,13 +771,20 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // profile work before the requested command even begins. Keep explicit login=true,
           // but make the deterministic/no-profile path the Windows default.
           const useLoginShell = input.login ?? process.platform !== 'win32';
-          const command = deriveExecArgs(shell, boundCommand, useLoginShell);
+          const executableCommand = useLoginShell
+            ? restoreBundledRipgrepAfterLogin(boundCommand, shell.shellType, bundledRipgrep)
+            : boundCommand;
+          // Interception inspects exactly what the model asked the shell to run. The PATH repair
+          // is execution scaffolding added by this adapter and must not hide an otherwise explicit
+          // apply_patch invocation from the Codex parser.
+          const inspectionCommand = deriveExecArgs(shell, boundCommand, useLoginShell);
+          const command = deriveExecArgs(shell, executableCommand, useLoginShell);
           try {
             // Current Codex intercepts an explicit `apply_patch` shell invocation before spawning
             // the shell process. The parser is the port of apply-patch/src/invocation.rs and uses
             // the same tree-sitter-bash grammar/query as upstream.
             if (!isBatch) {
-              const interceptedPatch = maybeParseApplyPatchForExec(command, dir.real);
+              const interceptedPatch = maybeParseApplyPatchForExec(inspectionCommand, dir.real);
               if (interceptedPatch.kind === 'correctness_error') {
                 return fail(`apply_patch verification failed: ${interceptedPatch.error.message}`);
               }

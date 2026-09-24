@@ -20,6 +20,7 @@ import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
 import { publishPluginSurface, unpublishPluginSurface, pluginRefreshPublications } from './plugin-refresh.js';
 import { pluginManager } from './plugins/manager.js';
+import { readDurable, writeDurableNow } from './durable.js';
 
 let endpoint: McpEndpoint | null = null;
 /** Retain custody while draining so final shutdown can bound that same stop. */
@@ -63,6 +64,38 @@ let connectionGeneration = 0;
  * briefly bringing a connector online while the app is already leaving.
  */
 let shutdownRequested = false;
+const CONNECTION_INTENT_STATE = 'connection-intent';
+const CONNECTION_INTENT_VERSION = 1;
+const STARTUP_RECONNECT_DELAYS_MS = [0, 1_000, 5_000, 15_000] as const;
+let startupReconnectGeneration = 0;
+
+interface ConnectionIntentSnapshot {
+  version: 1;
+  wantsConnected: boolean;
+}
+
+function validConnectionIntent(value: unknown): value is ConnectionIntentSnapshot {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Partial<ConnectionIntentSnapshot>;
+  return row.version === CONNECTION_INTENT_VERSION && typeof row.wantsConnected === 'boolean';
+}
+
+async function savedConnectionIntent(): Promise<boolean | null> {
+  const saved = await readDurable<ConnectionIntentSnapshot>(CONNECTION_INTENT_STATE);
+  return validConnectionIntent(saved) ? saved.wantsConnected : null;
+}
+
+async function saveConnectionIntent(wantsConnected: boolean): Promise<void> {
+  await writeDurableNow(CONNECTION_INTENT_STATE, {
+    version: CONNECTION_INTENT_VERSION,
+    wantsConnected
+  } satisfies ConnectionIntentSnapshot);
+}
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => {
+  const timer = setTimeout(resolve, ms);
+  timer.unref?.();
+});
 
 function enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
   const run = lifecycleQueue.then(operation, operation);
@@ -508,6 +541,16 @@ export function connect(): Promise<void> {
   return enqueueLifecycle(connectImpl);
 }
 
+/**
+ * Owner-originated Connect. Successful connection becomes durable relaunch intent; a failed
+ * attempt does not manufacture a forever-retry preference the owner never actually had working.
+ */
+export async function connectByOwner(): Promise<void> {
+  startupReconnectGeneration += 1;
+  await connect();
+  if (status.state === 'connected' || status.state === 'offline') await saveConnectionIntent(true);
+}
+
 export function disconnect(): Promise<void> {
   if (pendingDisconnect) return pendingDisconnect;
   connectionGeneration += 1;
@@ -515,6 +558,47 @@ export function disconnect(): Promise<void> {
   setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
   pendingDisconnect = enqueueLifecycle(disconnectImpl).finally(() => { pendingDisconnect = null; });
   return pendingDisconnect;
+}
+
+/** Explicit owner Disconnect outranks both the old auto-connect preference and startup retries. */
+export async function disconnectByOwner(): Promise<void> {
+  startupReconnectGeneration += 1;
+  let persistenceError: unknown = null;
+  try {
+    await saveConnectionIntent(false);
+  } catch (error) {
+    persistenceError = error;
+  }
+  await disconnect();
+  if (persistenceError) throw persistenceError;
+}
+
+/**
+ * Restores a previously working connection without blocking app startup.
+ *
+ * A durable explicit Connect/Disconnect decision wins. Existing installs with no decision yet
+ * fall back to the legacy autoConnect checkbox. Attempts are finite and exponentially spaced;
+ * every wake re-reads durable intent so pressing Disconnect cancels the sequence instead of
+ * racing one more tunnel into existence.
+ */
+export function restoreConnectionOnStartup(legacyAutoConnect: boolean): void {
+  const generation = ++startupReconnectGeneration;
+  void (async () => {
+    const initial = await savedConnectionIntent();
+    if (!(initial ?? legacyAutoConnect)) return;
+    for (const delay of STARTUP_RECONNECT_DELAYS_MS) {
+      if (delay) await sleep(delay);
+      if (generation !== startupReconnectGeneration || shutdownRequested) return;
+      const currentIntent = await savedConnectionIntent();
+      if (currentIntent === false) return;
+      await connect();
+      if (generation !== startupReconnectGeneration || shutdownRequested) return;
+      if (status.state === 'connected' || status.state === 'offline') return;
+    }
+    logWarn('startup reconnect stopped after bounded retries');
+  })().catch(error => {
+    logWarn(`startup reconnect deferred: ${error instanceof Error ? error.message : String(error)}`);
+  });
 }
 
 /**

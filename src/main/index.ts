@@ -9,7 +9,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { app, Notification, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session } from 'electron';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
-import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
+import { connect, disconnect, getStatus, onStatusChange, restoreConnectionOnStartup, shutdownConnection } from './connection.js';
 import { registerIpc } from './ipc.js';
 import { getChatModels, restoreChatModels, startChatModelDiscovery } from './chat-models.js';
 import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLogOnCrash } from './logger.js';
@@ -86,6 +86,7 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
+import { extensionDir } from './extension-path.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -320,6 +321,12 @@ void app.whenReady().then(async () => {
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
+  // A packaged update carries the matching companion. Refresh Chrome's stable unpacked source
+  // before any bridge/version UI can observe this app generation, so a local dogfood build never
+  // requires another Load unpacked step — Chrome only needs Reload to execute the replaced files.
+  if (app.isPackaged && !extensionDir()) {
+    logWarn('Bundled browser extension could not be synchronized into the stable extension folder');
+  }
   await pluginManager.initialize(userData);
   if (windowActivation.isDisabled()) return;
   try { applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
@@ -495,7 +502,7 @@ void app.whenReady().then(async () => {
   if (browserExtensionRequired(getConfig())) {
     void startBridge();
   }
-  if (getConfig().ui.autoConnect) void connect();
+  restoreConnectionOnStartup(getConfig().ui.autoConnect);
 
   // Never awaited: an unreachable GitHub, a slow download or a broken release must not delay a
   // window that is already on screen. Everything it learns arrives through the ordinary state

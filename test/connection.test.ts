@@ -39,7 +39,8 @@ const mocks = vi.hoisted(() => {
     tunnelStartReached: vi.fn(),
     tunnelStop: vi.fn(async () => undefined),
     secretGate: null as Promise<void> | null,
-    secretReached: vi.fn()
+    secretReached: vi.fn(),
+    connectionIntent: null as null | { version: 1; wantsConnected: boolean }
   };
 });
 
@@ -51,6 +52,12 @@ vi.mock('../src/main/config.js', () => ({
 }));
 
 vi.mock('../src/main/logger.js', () => ({ logError: vi.fn(), logInfo: vi.fn(), logWarn: vi.fn() }));
+vi.mock('../src/main/durable.js', () => ({
+  readDurable: vi.fn(async (name: string) => name === 'connection-intent' ? mocks.connectionIntent : null),
+  writeDurableNow: vi.fn(async (name: string, value: unknown) => {
+    if (name === 'connection-intent') mocks.connectionIntent = value as { version: 1; wantsConnected: boolean };
+  })
+}));
 
 vi.mock('../src/main/mcp/server.js', () => ({
   lastRequestAt: () => null,
@@ -109,6 +116,7 @@ describe('connection surface state', () => {
     mocks.tunnelStop.mockClear();
     mocks.secretReached.mockClear();
     mocks.secretGate = null;
+    mocks.connectionIntent = null;
     Object.assign(mocks.caps, {
       browse: true,
       search: true,
@@ -265,6 +273,34 @@ describe('connection surface state', () => {
     const reconnecting = connection.connect();
     await Promise.all([disconnecting, reconnecting]);
     expect(connection.getStatus().state).toBe('connected');
+  });
+
+  it('restores a successful owner connection on relaunch but explicit Disconnect wins over legacy auto-connect', async () => {
+    let connection = await import('../src/main/connection.js');
+    await connection.connectByOwner();
+    expect(mocks.connectionIntent).toEqual({ version: 1, wantsConnected: true });
+    await connection.disconnect();
+
+    // A fresh process sees the durable owner intent and reconnects even though the old static
+    // auto-connect checkbox is off.
+    vi.resetModules();
+    connection = await import('../src/main/connection.js');
+    connection.restoreConnectionOnStartup(false);
+    await vi.waitFor(() => expect(connection.getStatus().state).toBe('connected'));
+    expect(mocks.starts).toBe(2);
+
+    await connection.disconnectByOwner();
+    expect(mocks.connectionIntent).toEqual({ version: 1, wantsConnected: false });
+
+    // Explicit Disconnect remains authoritative across another relaunch even if the legacy
+    // preference is still true. No reconnect timer gets armed into another tunnel.
+    vi.resetModules();
+    connection = await import('../src/main/connection.js');
+    connection.restoreConnectionOnStartup(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(connection.getStatus().state).toBe('disconnected');
+    expect(mocks.starts).toBe(2);
   });
 
   it('bounds Disconnect when final shutdown arrives before its queued drain starts', async () => {

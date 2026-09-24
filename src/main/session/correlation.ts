@@ -79,6 +79,24 @@ function wake(requestId: string): void {
   for (const resolve of held) resolve();
 }
 
+/**
+ * Starts this request's bounded evidence clock without waiting for it.
+ *
+ * Admission, not the first identity-sensitive tool, is the request-level boundary. A workflow
+ * may begin with a self-contained/read-only call that needs no exact chat and only later issue a
+ * call that does. Starting the clock at ingress means that later call consumes only the grace
+ * still remaining for this request instead of paying a fresh 15-20 second hold. This is not a
+ * negative cache and does not decide ownership: exact page evidence can still arrive at any time
+ * and `merge()` immediately upgrades the request and clears this bookkeeping row.
+ */
+export function beginRequestCorrelationWindow(requestId: string | null | undefined): void {
+  if (!requestId || byRequest.has(requestId) || evidenceWindowStarts.has(requestId)) return;
+  evidenceWindowStarts.set(requestId, performance.now());
+  while (evidenceWindowStarts.size > MAX_EVIDENCE_WINDOWS) {
+    evidenceWindowStarts.delete(evidenceWindowStarts.keys().next().value!);
+  }
+}
+
 function trim(): void {
   while (byRequest.size > MAX_CORRELATIONS) {
     const first = byRequest.keys().next().value as string | undefined;
@@ -333,13 +351,8 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
   if (immediate || timeoutMs <= 0) return immediate;
 
   const now = performance.now();
+  beginRequestCorrelationWindow(requestId);
   const startedAt = evidenceWindowStarts.get(requestId) ?? now;
-  if (!evidenceWindowStarts.has(requestId)) {
-    evidenceWindowStarts.set(requestId, startedAt);
-    if (evidenceWindowStarts.size > MAX_EVIDENCE_WINDOWS) {
-      evidenceWindowStarts.delete(evidenceWindowStarts.keys().next().value!);
-    }
-  }
   const remainingMs = timeoutMs - (now - startedAt);
   if (remainingMs <= 0) return null;
 

@@ -627,6 +627,26 @@ let requestOwnerRecovery: Promise<void> | null = null;
 let requestOwnerRecoveryAgain = false;
 let requestOwnerEpoch = 0;
 
+/**
+ * Whether exact request proof exists for a provisional request-owned family and therefore there
+ * is useful reconciliation work to do.
+ *
+ * The dispatcher used to await a full reconciliation before *and* after every MCP tool call.
+ * In the common case there is no provisional owner, so that scanned all active/dormant families
+ * and could read session state twice for no possible state transition. Page evidence already
+ * schedules reconciliation when it lands, and startup performs one explicit reconciliation.
+ * Keep this cheap predicate as a defensive catch-up path for a proof that arrived just before
+ * dispatch without putting unrelated calls behind those scans.
+ */
+export function agentRequestOwnerReconciliationNeeded(): boolean {
+  const needs = (owner: Run | DormantRun): boolean =>
+    !owner.primeConversationId && Boolean(owner.primeRequestId && requestCorrelation(owner.primeRequestId)) &&
+    !('runId' in owner && unpublishedRuns.has(owner));
+  for (const owner of runs.values()) if (needs(owner)) return true;
+  for (const owner of dormantRuns.values()) if (needs(owner)) return true;
+  return false;
+}
+
 /** Rebuild the fleet projection from exact request proof and the durable current frontend.
  * No request is relabelled as a newer turn. Workers discovered after an anonymous spawn keep
  * their worker role; their already-accepted fleet is entrusted to the real root prime. */

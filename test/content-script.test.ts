@@ -137,6 +137,7 @@ interface Hook {
   currentActivityPullDelay(): number;
   notePresentation(messageId: string, text: string, now?: number): boolean;
   presentationPending(now?: number): boolean;
+  waitForBootstrapComposer(current: () => boolean, expiresAt?: number): Promise<HTMLElement | null>;
   runCommand(): Promise<void>;
   startCompact(automatic?: boolean): Promise<void>;
   cancelCompact(): Promise<void>;
@@ -13446,6 +13447,39 @@ describe('the fresh chat the app opened', () => {
         error: expect.stringMatching(/composer changed|draft was preserved|replaced the composer/)
       })
     ]);
+  });
+
+  it('keeps a delayed fresh-chat composer retryable beyond the old one-shot readiness window', async () => {
+    live = await harness();
+    const form = live.document.querySelector('#composer-form')!;
+    const composer = live.document.querySelector('#prompt-textarea') as HTMLElement;
+    form.remove();
+    const start = (live.window as any).Date.now();
+    const waiting = live.hook.waitForBootstrapComposer(() => true, start + 40_000);
+
+    // The production waiter is mutation-driven; moving the harness clock proves this mount is
+    // later than the former 12-second terminal failure without spending real wall time.
+    live.advance(13_000);
+    live.document.body.append(form);
+    await settle(20);
+
+    expect(await waiting).toBe(composer);
+    expect((live.window as any).Date.now() - start).toBeGreaterThan(12_000);
+  });
+
+  it('never accepts a bootstrap composer after the app-owned command deadline', async () => {
+    live = await harness();
+    const form = live.document.querySelector('#composer-form')!;
+    form.remove();
+    const start = (live.window as any).Date.now();
+    const waiting = live.hook.waitForBootstrapComposer(() => true, start + 2_000);
+    await settle(20);
+    expect(await waiting).toBeNull();
+
+    // A later provider mount cannot resurrect already-expired Send authority.
+    live.document.body.append(form);
+    await settle();
+    expect(await waiting).toBeNull();
   });
 
   it.each([true, false])('journals the verified worker model only after successful bootstrap (%s)', async confirmed => {

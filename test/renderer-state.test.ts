@@ -1219,8 +1219,10 @@ it('asks for an extension reload only when the extension is older than this app'
   expect(doc.getElementById('updateText')!.textContent).toContain('2.0.1');
   const action = doc.getElementById('updateExtension') as HTMLButtonElement;
   expect(action.hidden).toBe(false);
+  expect(action.textContent).toContain('Reload extension');
   action.click();
-  expect(doc.querySelector('[data-panel="setup"]')!.classList.contains('is-active')).toBe(true);
+  expect(doc.querySelector('[data-panel="setup"]')!.classList.contains('is-active')).toBe(false);
+  expect(doc.querySelector('.toast')!.textContent).toContain('click Reload on Chat On Steroids');
   const rejected = structuredClone(mounted.state) as any;
   rejected.bridge.present = false;
   mounted.push(rejected);

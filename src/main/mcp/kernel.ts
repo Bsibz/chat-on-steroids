@@ -51,6 +51,7 @@ import {
   acknowledgeOffersForCaller,
   currentRunForCaller,
   agentFamiliesForCaller,
+  agentRequestOwnerReconciliationNeeded,
   reconcileAgentRequestOwners,
   dormantWorkerNotice,
   reactivateDormantRunForConversation,
@@ -91,7 +92,7 @@ import {
   recordAgentMessage,
   recordToolCall
 } from '../session/recorder.js';
-import { requestCorrelation } from '../session/correlation.js';
+import { beginRequestCorrelationWindow, requestCorrelation } from '../session/correlation.js';
 import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import {
@@ -590,14 +591,21 @@ async function dispatchTracked(
   const isFinish = isFinishCall(name, args);
   const startedAt = context.startedAt;
   const allowUnattributed = context.allowUnattributed === true;
+  // Evidence grace belongs to the whole ChatGPT request, not whichever later tool first needs
+  // exact chat identity. Start the bounded clock at ingress without waiting or deciding anything.
+  // Late exact proof still upgrades the request immediately and permanently.
+  if (!nested) beginRequestCorrelationWindow(requestId);
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
   // touch state. If the page is one tick late this stays null; only handlers that actually
-  // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
+  // require identity wait for their own exact mate. Absolute reads/execs do not require
+  // workspace identity merely to resolve their target; lifecycle fences below still apply.
   if (!nested) setCallerConversation(context, callerConversation(name, startedAt, requestId));
-  await reconcileAgentRequestOwners().catch(error => {
-    logWarn(`Worker ownership recovery deferred: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  if (agentRequestOwnerReconciliationNeeded()) {
+    await reconcileAgentRequestOwners().catch(error => {
+      logWarn(`Worker ownership recovery deferred: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
   if (!context.caller.conversationId) setCallerConversation(context, callerConversation(name, startedAt, requestId));
   // Only calls that need an *existing* per-chat workspace before the handler runs are
   // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
@@ -607,6 +615,7 @@ async function dispatchTracked(
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
   const identitySensitive = needsWorkspaceIdentity(name, args);
+  const requestScopedSafeRead = safelyRequestScopedRead(name, args, surface, allowUnattributed);
   // update_plan and session_finish consume this exact session, even outside a swarm. Resolve it
   // before the shared blocked/superseded checks rather than guessing from selection.
   // Observation and its dependent input must resolve the same caller before either
@@ -638,7 +647,7 @@ async function dispatchTracked(
   // A run that ended leaves an explicit short-lived lease tombstone for each open worker
   // chat. Resolve exact request identity before ordinary tools too while such leases exist;
   // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
-  if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
+  if (!context.caller.conversationId && !requestScopedSafeRead && hasRetiredWorkerLeases() && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, identityWindow(IDENTITY_EVIDENCE_MS), { requestId })
@@ -649,7 +658,7 @@ async function dispatchTracked(
   // attribution an absolute read/exec would otherwise look like an unrelated ordinary chat and
   // run successfully. Resolve the exact mate for every call while such worker conversations
   // exist, just as we do for short-lived retired worker leases.
-  if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
+  if (!context.caller.conversationId && !requestScopedSafeRead && hasDormantWorkerLeases() && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, identityWindow(IDENTITY_EVIDENCE_MS), { requestId })
@@ -847,9 +856,11 @@ async function dispatchTracked(
     const resolved = callerConversation(name, startedAt, requestId);
     if (resolved) setCallerConversation(context, resolved);
   }
-  await reconcileAgentRequestOwners().catch(error => {
-    logWarn(`Worker ownership recovery deferred after tool completion: ${error instanceof Error ? error.message : String(error)}`);
-  });
+  if (agentRequestOwnerReconciliationNeeded()) {
+    await reconcileAgentRequestOwners().catch(error => {
+      logWarn(`Worker ownership recovery deferred after tool completion: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
   const deliveryFenced = blockedChat || compacting || supersededConversation || isChatBlocked(context.caller.conversationId) ||
     compactingConversation(context.caller.conversationId) !== null || Boolean(context.caller.conversationId &&
       (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded');
@@ -1008,6 +1019,37 @@ function needsWorkspaceIdentity(name: string, args: unknown): boolean {
     const workdir = input['workdir'];
     return swarmRunning() || workdir === undefined || relative(workdir);
   }
+  return false;
+}
+
+/**
+ * The only unattributed calls allowed to skip the global retired/dormant evidence hold.
+ *
+ * This is intentionally much narrower than "readOnlyHint". A request-scoped read is safe only
+ * when every filesystem target is explicit and absolute, so resolution cannot consume a chat's
+ * remembered workspace and the handler cannot mutate process/browser/session/agent state. The
+ * sandbox still proves every target is inside an approved root. Positive exact identity is always
+ * enforced by the ordinary superseded/retired/dormant/ended checks later in dispatch, while the
+ * global blocked/continuation fence still waits for exact identity above; this helper only avoids
+ * making an otherwise anonymous, self-contained read wait 15 seconds merely because historical
+ * worker leases exist somewhere else in the app.
+ */
+export function safelyRequestScopedRead(
+  name: string,
+  args: unknown,
+  surface: SurfaceId,
+  allowUnattributed: boolean
+): boolean {
+  if (!allowUnattributed || surface !== 'core') return false;
+  const input = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  const absolute = (value: unknown): boolean =>
+    typeof value === 'string' && (isAbsoluteVirtualPath(value) || isNativeWindowsPath(value));
+  if (name === 'read') {
+    const paths = Array.isArray(input['paths']) ? input['paths'] : [];
+    return paths.length > 0 && paths.every(absolute);
+  }
+  if (name === 'view_image') return absolute(input['path']);
+  if (name === 'find') return absolute(input['path']);
   return false;
 }
 

@@ -49,7 +49,7 @@ import {
   type Config
 } from '../shared/types.js';
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
-import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
+import { applySettings, connectByOwner, disconnectByOwner, getStatus, onStatusChange } from './connection.js';
 import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS } from './config.js';
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
@@ -107,7 +107,7 @@ import { tokenPressure } from '../shared/session.js';
 import { forgetWorkspaceRoot, renameWorkspaceRoot } from './workspace.js';
 import { hostPlatformInfo } from './platform.js';
 import { openInPreferredBrowser } from './browser.js';
-import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
+import { markInstallOnQuit, onUpdateChange, publishedExtensionRelease, updateStatus } from './update.js';
 import {
   getMacOSDesktopAccess,
   onMacOSDesktopAccessChange,
@@ -768,12 +768,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('connection:connect', async () => {
-    await connect();
+    await connectByOwner();
     return buildState();
   });
 
   handle('connection:disconnect', async () => {
-    await disconnect();
+    await disconnectByOwner();
     return buildState();
   });
 
@@ -1074,9 +1074,19 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('bridge:diagnostics', async () => companionDiagnostics());
 
   handle('bridge:downloadExtension', async () => {
-    // This is a recovery path for the extension bundled with *this installed app*. Never use
-    // releases/latest here: an old app must not fetch a newer extension with a newer protocol.
-    await shell.openExternal(extensionDownloadUrl(app.getVersion()));
+    // Use a release asset only when the updater has actually observed this exact app version as a
+    // public GitHub release. Local/ahead dogfood builds deliberately have no such asset: their
+    // bundled companion was already transactionally synced into extensionDir() on app launch, so
+    // sending the owner to an invented vX.Y.Z URL is both false and useless.
+    const version = app.getVersion();
+    if (await publishedExtensionRelease(version)) {
+      await shell.openExternal(extensionDownloadUrl(version));
+      return true;
+    }
+    const dir = extensionDir();
+    if (!dir) throw new Error('The bundled extension folder is missing from this installation.');
+    const error = await shell.openPath(dir);
+    if (error) throw new Error(`Could not open the extension folder: ${error}`);
     return true;
   });
 

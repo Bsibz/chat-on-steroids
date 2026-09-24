@@ -844,7 +844,7 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
     tone = 'bad';
   }
   if (missing) { lines.push(t("Browser extension not connected. Open ChatGPT and check the companion in Setup to load models and send messages.")); tone = 'bad'; }
-  return { text: lines.join(' '), tone, notice: Boolean(update.latest || stale || missing), extensionAction: stale ? t("Update extension") : missing ? t("Check extension") : null };
+  return { text: lines.join(' '), tone, notice: Boolean(update.latest || stale || missing), extensionAction: stale ? t("Reload extension") : missing ? t("Check extension") : null };
 }
 
 /** The header bar, the Activity line and the one notification, from that single sentence. */
@@ -1831,6 +1831,10 @@ document.addEventListener('keydown', (event) => {
 
 $('bridgeDownload').addEventListener('click', () => void run(api.downloadExtension()));
 $('updateExtension').addEventListener('click', () => {
+  if (state?.bridge.extensionVersion && isNewer(state.update.current, state.bridge.extensionVersion)) {
+    toast(t("The app’s extension folder is already updated. In Chrome’s Extensions page, click Reload on Chat On Steroids, then refresh ChatGPT."));
+    return;
+  }
   showAllSteps = true;
   if (state) apply(state);
   showTab('setup');

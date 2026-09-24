@@ -623,13 +623,54 @@ describe('bounded IPC identities and OS launch results', () => {
     expect(reply.error).toMatch(/could not open.*access is denied/i);
   });
 
-  it('opens the extension recovery ZIP from the installed app version, never releases/latest', async () => {
+  it('uses the bundled extension folder for an unpublished/local app version instead of inventing a GitHub asset', async () => {
     vi.mocked(app.getVersion).mockReturnValueOnce('1.8.8');
     const reply = await handlers.get('bridge:downloadExtension')!(null, undefined);
 
     expect(reply).toEqual({ ok: true, data: true });
-    expect(shell.openExternal).toHaveBeenCalledWith(extensionDownloadUrl('1.8.8'));
-    expect(vi.mocked(shell.openExternal).mock.calls[0]?.[0]).not.toContain('/releases/latest/');
+    expect(shell.openExternal).not.toHaveBeenCalledWith(extensionDownloadUrl('1.8.8'));
+    expect(shell.openPath).toHaveBeenCalledWith(process.cwd());
+  });
+
+  it('preserves the exact-version GitHub extension recovery asset when that exact public asset is proven', async () => {
+    const update = await import('../src/main/update.js');
+    update.resetUpdateForTests();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Chat-On-Steroids-Extension.zip\n', {
+      status: 200,
+      headers: { 'content-type': 'text/plain' }
+    })));
+    try {
+      vi.mocked(app.getVersion).mockReturnValueOnce('1.8.8');
+      vi.mocked(shell.openExternal).mockClear();
+      const reply = await handlers.get('bridge:downloadExtension')!(null, undefined);
+      expect(reply).toEqual({ ok: true, data: true });
+      expect(shell.openExternal).toHaveBeenCalledWith(extensionDownloadUrl('1.8.8'));
+      expect(vi.mocked(shell.openExternal).mock.calls[0]?.[0]).not.toContain('/releases/latest/');
+    } finally {
+      vi.unstubAllGlobals();
+      update.resetUpdateForTests();
+    }
+  });
+
+  it('falls back to the stable bundled folder when an exact release exists without the extension asset', async () => {
+    vi.mocked(app.getVersion).mockReturnValueOnce('1.8.8');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Chat-On-Steroids-macOS-arm64.dmg\n', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' }
+      }
+    )));
+    try {
+      vi.mocked(shell.openExternal).mockClear();
+      vi.mocked(shell.openPath).mockClear();
+      const reply = await handlers.get('bridge:downloadExtension')!(null, undefined);
+      expect(reply).toEqual({ ok: true, data: true });
+      expect(shell.openExternal).not.toHaveBeenCalled();
+      expect(shell.openPath).toHaveBeenCalledWith(process.cwd());
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('bounds and validates an agent id before it reaches the global broker', async () => {

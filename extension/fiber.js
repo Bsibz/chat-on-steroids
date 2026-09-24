@@ -253,9 +253,20 @@
     return { conversationId: found, conflict: false };
   }
 
-  /** An authored assistant message object, when a rendered prose node exposes one directly. */
+  /**
+   * Exact native identity for one rendered assistant block, plus the row-local page-model
+   * message when React exposes it.
+   *
+   * The turn-level `allMessages` snapshot can lag the row that is actively streaming. Live
+   * 2026-09-23, the durable recorder stopped one public commentary message at
+   * "duplicating UI scraping in" while Chrome visibly kept extending that same block for a
+   * tool-heavy turn. The row's `props.message` is still ChatGPT's typed message model — not
+   * DOM text — and carries the same provider message UUID. Preserve it here so the capture
+   * path can use a strictly longer append-only revision without weakening identity/privacy.
+   */
   function messageOf(fiber, candidates, conversationId) {
     let found = null;
+    let foundMessage = null;
     const scope = conversationEvidenceOf(fiber);
     if (scope.conflict || (scope.conversationId && conversationId && scope.conversationId !== conversationId)) return null;
     let at = fiber;
@@ -282,8 +293,12 @@
         if (found && found !== id) return null;
         found = id;
       }
+      if (direct) {
+        if (foundMessage && foundMessage !== candidate && str(foundMessage.id) !== direct) return null;
+        foundMessage = candidate;
+      }
     }
-    return found;
+    return found ? { id: found, message: foundMessage } : null;
   }
 
   /**
@@ -764,9 +779,11 @@
 
     const used = new Set();
     const ids = [];
+    const rowMessages = [];
     for (let at = 0; at < blocks.length; at++) {
       const block = blocks[at];
       let id = null;
+      let rowMessage = null;
       try {
         const holder = block.closest && block.closest('[data-message-id]');
         id = holder ? str(holder.getAttribute('data-message-id')) : null;
@@ -776,9 +793,14 @@
       if (!id) {
         try {
           const fiber = fiberOf(block);
-          if (fiber) id = messageOf(fiber, assistantCandidates, conversationId);
+          if (fiber) {
+            const identity = messageOf(fiber, assistantCandidates, conversationId);
+            id = identity?.id || null;
+            rowMessage = identity?.message || null;
+          }
         } catch {
           id = null;
+          rowMessage = null;
         }
       }
       let known = false;
@@ -786,12 +808,26 @@
       if (!known) id = null;
       if (id) used.add(id);
       ids.push(id);
+      rowMessages.push(rowMessage);
     }
     // Only direct native/Fiber identity can authorize DOM placement. The optional
     // HTML attachment fallbacks below must never become mutation anchors.
     for (let at = 0; at < ids.length; at++) {
       const id = ids[at];
-      if (id && ids.filter(value => value === id).length === 1) exactAnchors.set(blocks[at], id);
+      if (!id || ids.filter(value => value === id).length !== 1) continue;
+      exactAnchors.set(blocks[at], id);
+      const rowMessage = rowMessages[at];
+      if (!rowMessage || hiddenMessage(rowMessage) || analysisMessage(rowMessage) ||
+          rowMessage.author?.role !== 'assistant' || requestOf(rowMessage) || resultOf(rowMessage)) continue;
+      const candidate = assistantCandidates.find(value => value.id === id);
+      const rowText = authoredText(rowMessage);
+      // This path repairs a lagging turn-level snapshot only. Never let a shorter, divergent or
+      // merely different row-local object rewrite canonical prose; the ordinary turn model owns
+      // those cases. Streaming public text is append-only for the failure this seam addresses.
+      if (!candidate || !rowText || rowText.length <= candidate.rawText.length ||
+          !rowText.startsWith(candidate.rawText)) continue;
+      budget.remaining += candidate.rawText.length;
+      candidate.rawText = budgetedText(rowText, budget, MAX_RENDERED_TEXT);
     }
 
     const freeBlocks = [];

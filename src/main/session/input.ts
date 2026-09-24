@@ -27,6 +27,11 @@ import { recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
+  /** Internal browser-routing anchor for a fresh native Chat. The provider Project, if any,
+   * is derived from this exact source conversation's live URL; no Project id crosses Night Build. */
+  freshSourceConversationId: z.string().min(8).max(256).regex(/^[0-9a-z-]+$/i).optional(),
+  /** Opaque owner-local source identity retained only for idempotent v3 retries/status. */
+  freshSourceHandle: z.string().min(40).max(64).regex(/^[A-Za-z0-9_-]+$/).optional(),
   automation: z.enum(['off', 'goal', 'loop']).optional(),
   loopAfterTurn: z.boolean().optional(),
   objective: z.string().trim().max(16000).optional(),
@@ -52,7 +57,10 @@ const nativeChatInputArgs = z.object({
   id: z.string().uuid(),
   sessionId: z.string().min(8).max(64),
   conversationId: z.string().min(8).max(256),
-  text: z.string().min(1).max(MAX_CHATGPT_MESSAGE_CHARS).refine((value) => value.trim().length > 0)
+  text: z.string().min(1).max(MAX_CHATGPT_MESSAGE_CHARS).refine((value) => value.trim().length > 0),
+  model: z.string().min(1).max(80).regex(/^[a-zA-Z0-9._-]+$/).nullable().optional(),
+  reasoningEffort: z.enum(REASONING_EFFORTS).nullable().optional(),
+  attachments: z.array(attachmentSchema).max(4).optional()
 }).strict();
 export type NativeChatInputArgs = z.infer<typeof nativeChatInputArgs>;
 const entrySchema = inputArgs.extend({
@@ -634,6 +642,19 @@ async function materializeOpening(entry: InputEntry): Promise<void> {
 export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
+    if (input.freshSourceConversationId) {
+      if (input.sessionId !== null || input.mode !== 'auto' || input.projectId || input.stages?.length || finishOwner) {
+        throw new Error('Fresh native Chat must be an immediate unbound opening');
+      }
+      if (!input.freshSourceHandle) throw new Error('Fresh native Chat source identity is missing');
+      const source = await findSessionByConversation(input.freshSourceConversationId, { requireUnique: true });
+      if (!source || source.conversationId !== input.freshSourceConversationId ||
+          source.origin?.kind === 'worker' || source.origin?.kind === 'helper' ||
+          await conversationWasSuperseded(input.freshSourceConversationId) ||
+          isChatBlocked(input.freshSourceConversationId)) {
+        throw new Error('Fresh native Chat source is unavailable');
+      }
+    }
     if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
       throw new Error('Keep the complete plan below 12,000 characters');
     const current = await load();
@@ -728,8 +749,10 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
 
 /**
  * Queue one owner-authored Night Build Chat message for one exact, already
- * existing ordinary ChatGPT conversation. This path grants no model, Goal,
- * attachment, fresh-chat or retargeting authority.
+ * existing ordinary ChatGPT conversation. v2 callers omit the optional
+ * model/effort/attachment fields; the separately versioned owner-local control
+ * lane may supply them after validating provider catalogue/staged-file truth.
+ * This path still grants no Goal, fresh-chat or retargeting authority.
  */
 export function enqueueNativeChatInput(raw: NativeChatInputArgs): Promise<InputEntry> {
   return serial(async () => {
@@ -738,7 +761,10 @@ export function enqueueNativeChatInput(raw: NativeChatInputArgs): Promise<InputE
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
       if (!prior.nativeChat || prior.nativeChat.sessionId !== input.sessionId ||
-          prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text) {
+          prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text ||
+          prior.model !== (input.model ?? null) ||
+          prior.reasoningEffort !== (input.reasoningEffort ?? null) ||
+          JSON.stringify(prior.attachments ?? []) !== JSON.stringify(input.attachments ?? [])) {
         throw new Error('Native Chat intent id already belongs to different input');
       }
       return { ...prior };
@@ -758,8 +784,9 @@ export function enqueueNativeChatInput(raw: NativeChatInputArgs): Promise<InputE
       text: input.text,
       mode: 'auto',
       dueAt: createdAt,
-      model: null,
-      reasoningEffort: null,
+      model: input.model ?? null,
+      reasoningEffort: input.reasoningEffort ?? null,
+      ...(input.attachments?.length ? { attachments: input.attachments } : {}),
       transportIntent: 'browser',
       state: 'queued',
       owner: null,
@@ -783,7 +810,10 @@ export async function assertNativeChatInputReady(raw: NativeChatInputArgs): Prom
   const prior = current.find((entry) => entry.id === input.id);
   if (prior) {
     if (!prior.nativeChat || prior.nativeChat.sessionId !== input.sessionId ||
-        prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text) {
+        prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text ||
+        prior.model !== (input.model ?? null) ||
+        prior.reasoningEffort !== (input.reasoningEffort ?? null) ||
+        JSON.stringify(prior.attachments ?? []) !== JSON.stringify(input.attachments ?? [])) {
       throw new Error('Native Chat intent id already belongs to different input');
     }
     return;
@@ -797,6 +827,7 @@ export async function assertNativeChatInputReady(raw: NativeChatInputArgs): Prom
   if (!(await sessionInputPolicy(input.sessionId)).browserAllowed) {
     throw new Error('Native Chat conversation is not idle');
   }
+  if (input.attachments?.length) await validateInputAttachments(input.attachments);
 }
 
 /**
@@ -814,7 +845,10 @@ export function enqueueAdmittedNativeChatInput(
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
       if (!prior.nativeChat || prior.nativeChat.sessionId !== input.sessionId ||
-          prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text) {
+          prior.nativeChat.conversationId !== input.conversationId || prior.text !== input.text ||
+          prior.model !== (input.model ?? null) ||
+          prior.reasoningEffort !== (input.reasoningEffort ?? null) ||
+          JSON.stringify(prior.attachments ?? []) !== JSON.stringify(input.attachments ?? [])) {
         throw new Error('Native Chat intent id already belongs to different input');
       }
       return { ...prior };
@@ -838,8 +872,9 @@ export function enqueueAdmittedNativeChatInput(
       text: input.text,
       mode: 'auto',
       dueAt: createdAt,
-      model: null,
-      reasoningEffort: null,
+      model: input.model ?? null,
+      reasoningEffort: input.reasoningEffort ?? null,
+      ...(input.attachments?.length ? { attachments: input.attachments } : {}),
       transportIntent: 'browser',
       state: 'queued',
       owner: null,
@@ -1481,9 +1516,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; nativePinned?: true }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; nativePinned?: true; freshSourceConversationId?: string }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; nativePinned?: true }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner'; nativePinned?: true; freshSourceConversationId?: string }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1503,7 +1538,8 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
             ? { supersededConversationId: entry.conversationId } : {}),
           ...(entry.lifetime ? { lifetime: entry.lifetime } : {}),
-          ...(entry.nativeChat ? { nativePinned: true as const } : {}) });
+          ...(entry.nativeChat ? { nativePinned: true as const } : {}),
+          ...(entry.freshSourceConversationId ? { freshSourceConversationId: entry.freshSourceConversationId } : {}) });
       } catch { /* blocked/deleted stays user-visible */ }
     }
     return result;

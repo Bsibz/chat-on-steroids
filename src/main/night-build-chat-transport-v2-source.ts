@@ -7,6 +7,7 @@ import type {
   NightBuildChatStopCreateV2,
   NightBuildChatStopIntentV2
 } from '../shared/night-build-chat-transport-v2.js';
+import type { NightBuildChatConfiguredSendCreateV3 } from '../shared/night-build-chat-control-v3.js';
 import type { TurnOutcome } from '../shared/session.js';
 import { getConfig } from './config.js';
 import { nativeChatStopPending, requestNativeChatStop, startBridge, STOP_COMMAND_TIMEOUT_MS } from './bridge.js';
@@ -33,7 +34,7 @@ import {
 export interface NightBuildChatTransportV2DataSource {
   list(): Promise<NightBuildChatConversationListV1['conversations']>;
   transcript(query: NightBuildChatTranscriptQuery): Promise<Omit<NightBuildChatTranscriptV1, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>>;
-  createSend(input: NightBuildChatSendCreateV2): Promise<Omit<NightBuildChatSendIntentV2, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>>;
+  createSend(input: NightBuildChatSendCreateV2 | NightBuildChatConfiguredSendCreateV3): Promise<Omit<NightBuildChatSendIntentV2, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>>;
   send(id: string): Promise<Omit<NightBuildChatSendIntentV2, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'> | null>;
   inspectSend(id: string): Promise<Omit<NightBuildChatSendIntentV2, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'> | null>;
   createStop(input: NightBuildChatStopCreateV2): Promise<Omit<NightBuildChatStopIntentV2, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>>;
@@ -204,12 +205,19 @@ export function createInProcessNightBuildChatTransportV2Source(
     list: () => read.list(),
     transcript: (query) => read.transcript(query),
     async createSend(input) {
+      const configured = 'model' in input;
+      const requestedModel = configured ? input.model : null;
+      const requestedEffort = configured ? input.reasoningEffort : null;
+      const requestedAttachments = configured ? input.attachments : [];
       // A lost HTTP response is reconciled by the original intent id before
       // fresh admission. The first accepted send may already have made this
       // chat busy, which must not turn an idempotent retry into a new failure.
       const existing = (await listInputs()).find((entry) => entry.id === input.id);
       if (existing) {
-        if (!existing.nativeChat || existing.text !== input.text) {
+        if (!existing.nativeChat || existing.text !== input.text ||
+            existing.model !== requestedModel ||
+            existing.reasoningEffort !== requestedEffort ||
+            JSON.stringify(existing.attachments ?? []) !== JSON.stringify(requestedAttachments)) {
           throw new Error('Native Chat intent id already belongs to different input');
         }
         const originalHandle = opaque(
@@ -232,7 +240,10 @@ export function createInProcessNightBuildChatTransportV2Source(
         id: input.id,
         sessionId: resolved.sessionId,
         conversationId: resolved.conversationId,
-        text: input.text
+        text: input.text,
+        model: requestedModel,
+        reasoningEffort: requestedEffort,
+        ...(requestedAttachments.length ? { attachments: requestedAttachments } : {})
       };
       // This preflight may flush recorder state. Keep it outside mutation admission;
       // final exact ownership is rechecked again while the session queue is owned.

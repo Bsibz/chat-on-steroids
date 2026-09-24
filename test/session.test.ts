@@ -3132,6 +3132,36 @@ describe('tool summaries', () => {
     expect(summary.metric).toBe('~+4000 −3000');
   });
 
+  it('keeps only a tiny +/- code excerpt for a successful patch', () => {
+    const summary = summarize('apply_patch', {
+      patch: `*** Begin Patch
+*** Update File: /p/src/a.ts
+@@
+-const oldValue = computeOld();
++const newValue = computeNew();
+ const unchanged = true;
+-return oldValue;
++return newValue;
+*** End Patch`
+    }, {
+      changes: [{ path: '/p/src/a.ts', added: 2, removed: 2, approximate: false }]
+    });
+    expect(summary.detail).toBe(
+      '-const oldValue = computeOld();\n' +
+      '+const newValue = computeNew();\n' +
+      '-return oldValue;\n' +
+      '+return newValue;'
+    );
+
+    const refused = summarize('apply_patch', {
+      patch: '*** Begin Patch\n*** Update File: /p/src/a.ts\n-old secret\n+new secret\n*** End Patch'
+    }, {
+      changes: [{ path: '/p/src/a.ts', added: 1, removed: 1, approximate: false }]
+    }, 'tool_rejected');
+    expect(refused.detail).toBe('head line');
+    expect(refused.detail).not.toContain('-old secret');
+  });
+
   // One tool now covers create, edit, move and delete, so the title has to come from what
   // the patch did. A timeline that said "Applied a patch" four times would be useless.
   it('tells creates, deletes and moves apart from the patch itself', () => {

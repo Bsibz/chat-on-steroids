@@ -1832,10 +1832,15 @@ function inputReuseProbe(tabId, documentId) {
   return tabReply(tabId, { type: 'clf-input-reuse-state' }, { documentId });
 }
 
-function prepareDesktopInputReceipt(tabId, id, documentId) {
+function prepareDesktopInputReceipt(tabId, id, documentId, freshSourceConversationId = null, freshProjectId = null) {
   // The content-side maximum is 13s: sidebar, New Chat, then Work -> Chat.
   // Timeout keeps `preparing` custody; it never authorizes another tab or Send.
-  return tabReply(tabId, { type: 'clf-prepare-desktop-input', id }, { documentId }, 15000);
+  return tabReply(tabId, {
+    type: 'clf-prepare-desktop-input',
+    id,
+    ...(freshSourceConversationId ? { freshSourceConversationId } : {}),
+    ...(freshProjectId ? { freshProjectId } : {})
+  }, { documentId }, 15000);
 }
 
 function offerDesktopInput(tabId, message) {
@@ -1898,6 +1903,101 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       const current = await chrome.tabs.get(tab.id).catch(() => null);
       if (!current || current.pendingUrl || !ownsDocument(source) || conversationForTab(current) !== target) continue;
       offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target });
+      continue;
+    }
+    const freshSource = cleanConversationId(input.freshSourceConversationId);
+    if (input.freshSourceConversationId && !freshSource) continue;
+    if (freshSource) {
+      // A Night Build-created fresh chat inherits browser placement from one exact source
+      // conversation. In a Project this exact source document is the only safe doorway:
+      // ChatGPT's cold Project home can fail before its composer initializes, while the native
+      // header link carries the provider's current Project routing truth. Never silently fall
+      // back to a root New Chat if that Project transition cannot be proved.
+      if (elected?.tab != null) {
+        const held = tabs.find(candidate => candidate.id === elected.tab);
+        if (held && matchesInput(input, held)) {
+          offerDesktopInput(held.id, {
+            type: 'clf-desktop-input',
+            id: input.id,
+            conversationId: null,
+            ...(elected.freshProjectId ? { freshProjectId: elected.freshProjectId } : {})
+          });
+          continue;
+        }
+      }
+      const sourceTabs = tabs.filter(candidate =>
+        !candidate.pendingUrl && conversationForTab(candidate) === freshSource
+      );
+      if (sourceTabs.length !== 1) continue;
+      const sourceTab = sourceTabs[0];
+      if (!sourceTab || !Number.isInteger(sourceTab.id) || sourceTab.pinned) continue;
+      if (elected?.tab != null && elected.tab !== sourceTab.id) continue;
+      const documentId = tabDocuments[String(sourceTab.id)];
+      const source = {
+        tab: sourceTab.id,
+        documentId,
+        navigationEpoch: tabEpochs[String(sourceTab.id)]
+      };
+      if (!documentId || !ownsDocument(source)) continue;
+      const proof = await inputReuseProbe(sourceTab.id, documentId);
+      const current = await chrome.tabs.get(sourceTab.id).catch(() => null);
+      if (proof?.safe !== true || proof.navigationEpoch !== source.navigationEpoch ||
+          !ownsDocument(source) || !current || current.pendingUrl ||
+          conversationForTab(current) !== freshSource) continue;
+      const freshProjectId = projectFromUrl(current.url);
+      if (!elected) {
+        await elect(input.id, {
+          tab: sourceTab.id,
+          stage: 'preparing',
+          sourceConversationId: freshSource,
+          ...(freshProjectId ? { freshProjectId } : {})
+        });
+        elected = elections[input.id];
+      }
+      const prepared = await prepareDesktopInputReceipt(
+        sourceTab.id,
+        input.id,
+        documentId,
+        freshSource,
+        freshProjectId
+      );
+      const latest = await chrome.tabs.get(sourceTab.id).catch(() => null);
+      if (!latest || latest.pendingUrl || tabDocuments[String(sourceTab.id)] !== documentId) continue;
+      if (prepared?.ready === true && matchesInput(input, latest)) {
+        await elect(input.id, {
+          tab: sourceTab.id,
+          stage: 'ready',
+          sourceConversationId: freshSource,
+          ...(freshProjectId ? { freshProjectId } : {})
+        });
+        offerDesktopInput(sourceTab.id, {
+          type: 'clf-desktop-input',
+          id: input.id,
+          conversationId: null,
+          ...(freshProjectId ? { freshProjectId } : {})
+        });
+        continue;
+      }
+      if (prepared?.fallback === true && prepared.preSend === true && !freshProjectId) {
+        // Root chat only: the existing one-shot fallback remains safe. A Project source never
+        // reaches this path, because losing Project placement is worse than waiting queued.
+        await elect(input.id, {
+          tab: null,
+          stage: 'opening',
+          sourceConversationId: freshSource,
+          fallbackUsed: true
+        });
+        const url = `https://chatgpt.com/?${marker}#${marker}`;
+        const replacement = await createChatTab(url, background);
+        await protectCreatedTab(replacement);
+        await elect(input.id, {
+          tab: replacement.id,
+          stage: 'ready',
+          sourceConversationId: freshSource,
+          fallbackUsed: true
+        });
+        tabs.push(replacement);
+      }
       continue;
     }
     // A fresh app offer can follow a session rebind or the user's actual return.

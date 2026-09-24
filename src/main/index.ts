@@ -21,6 +21,8 @@ import { startNightBuildBridgeV2, type NightBuildBridgeV2Handle } from './night-
 import { createInProcessNightBuildBridgeV2Source } from './night-build-bridge-v2-in-process.js';
 import { startNightBuildChatTransportV2, type NightBuildChatTransportV2Handle } from './night-build-chat-transport-v2.js';
 import { createInProcessNightBuildChatTransportV2Source } from './night-build-chat-transport-v2-source.js';
+import { startNightBuildChatControlV3, type NightBuildChatControlV3Handle } from './night-build-chat-control-v3.js';
+import { createInProcessNightBuildChatControlV3Source } from './night-build-chat-control-v3-source.js';
 import { flushSessions, initSessionStore } from './session/store.js';
 import { initSkillsPath } from './skills.js';
 import { usageOverview } from './session/usage.js';
@@ -94,6 +96,7 @@ let tray: Tray | null = null;
 let quitting = false;
 let nightBuildBridge: NightBuildBridgeV2Handle | null = null;
 let nightBuildChatTransportV2: NightBuildChatTransportV2Handle | null = null;
+let nightBuildChatControlV3: NightBuildChatControlV3Handle | null = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
 const usageWarmup = new AbortController();
@@ -450,16 +453,35 @@ void app.whenReady().then(async () => {
     // paths. Keep startup logs bounded instead of copying raw exception prose.
     logWarn('Night Build bridge could not start');
   }
+  const chatSalt = randomBytes(32).toString('base64url');
+  const chatSource = createInProcessNightBuildChatTransportV2Source(userData, chatSalt);
   try {
-    const chatSalt = randomBytes(32).toString('base64url');
     nightBuildChatTransportV2 = await startNightBuildChatTransportV2(
       userData,
-      createInProcessNightBuildChatTransportV2Source(userData, chatSalt)
+      chatSource
     );
   } catch {
-    // The native Chat write lane is optional. Never leak local paths, tokens or
-    // storage errors into logs when its discovery/service cannot start.
+    // v2 is the stable Native Chat read/Send/Stop lane.
     logWarn('Night Build Chat v2 transport could not start');
+  }
+  if (nightBuildChatTransportV2) {
+    try {
+      // v3 is an additive control surface for this exact v2 owner generation, not
+      // an independent writer. Reuse the stable transport generation so Night Build
+      // can fail closed if one discovery file is replaced/restarted without the other.
+      nightBuildChatControlV3 = await startNightBuildChatControlV3(
+        userData,
+        createInProcessNightBuildChatControlV3Source(userData, chatSalt, chatSource),
+        {
+          startedAt: nightBuildChatTransportV2.discovery.startedAt,
+          instanceId: nightBuildChatTransportV2.discovery.instanceId
+        }
+      );
+    } catch {
+      // Rich controls are additive. Their failure must never imply that the
+      // already-started stable v2 transcript/Send/Stop lane is unavailable.
+      logWarn('Night Build Chat v3 control could not start');
+    }
   }
   logInfo('app started');
 
@@ -530,7 +552,8 @@ app.on('will-quit', (event) => {
           shutdownConnection(),
           shutdownBridge(),
           nightBuildBridge?.stop() ?? Promise.resolve(),
-          nightBuildChatTransportV2?.stop() ?? Promise.resolve()
+          nightBuildChatTransportV2?.stop() ?? Promise.resolve(),
+          nightBuildChatControlV3?.stop() ?? Promise.resolve()
         ]
       },
       // Phase 2: only after request handlers are done may their owned child processes go.

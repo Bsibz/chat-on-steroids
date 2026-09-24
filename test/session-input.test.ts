@@ -116,6 +116,36 @@ describe('durable user input ownership', () => {
     });
   });
 
+  it('preserves an explicitly validated native model and effort through the exact browser claim', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const id = randomUUID();
+    const row = await enqueueNativeChatInput({
+      id,
+      sessionId,
+      conversationId: binding.conversationId,
+      text: 'Use the selected native model',
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'high'
+    });
+    expect(row).toMatchObject({ model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+    const claim = await claimBrowserInput(id, 'native-model-document', binding.conversationId, true);
+    expect(claim).toMatchObject({
+      text: 'Use the selected native model',
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'high',
+      nativeChat: { sessionId, conversationId: binding.conversationId }
+    });
+    await expect(enqueueNativeChatInput({
+      id,
+      sessionId,
+      conversationId: binding.conversationId,
+      text: 'Use the selected native model',
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'medium'
+    })).rejects.toThrow('already belongs to different input');
+  });
+
   it('keeps flush-capable Native Chat preflight outside the admitted durable enqueue', async () => {
     binding.activeTurnId = null;
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };

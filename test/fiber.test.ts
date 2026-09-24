@@ -781,6 +781,59 @@ describe('the calls a turn says it made', () => {
     ]);
   });
 
+  it('repairs a lagging turn snapshot from the exact row-local typed message without reading DOM prose', async () => {
+    const partial = authored('assistant-live-row', 'duplicating UI scraping in', {
+      channel: 'commentary',
+      workingTurnId: 'working-live-row',
+      turnExchangeId: 'exchange-live-row',
+      createTime: 1_790_213_938.910
+    });
+    const complete = authored('assistant-live-row', 'duplicating UI scraping in Night Build.', {
+      channel: 'commentary',
+      workingTurnId: 'working-live-row',
+      turnExchangeId: 'exchange-live-row',
+      createTime: 1_790_213_938.910
+    });
+    const result = await scan([], [{
+      id: 'turn-live-row',
+      messages: [partial],
+      conversationProps: { conversationId: THREAD },
+      rendered: [{
+        html: '<p>This DOM text is deliberately not canonical.</p>',
+        fiberProps: { message: complete, conversation: { id: THREAD } }
+      }]
+    }]);
+
+    expect(result.turns[0]!.messages[0]!).toMatchObject({
+      rawMessageId: 'assistant-live-row',
+      rawText: 'duplicating UI scraping in Night Build.'
+    });
+    expect(result.turns[0]!.messages[0]!.rawText).not.toContain('deliberately not canonical');
+  });
+
+  it('never lets a shorter or divergent row-local snapshot rewrite turn-model prose', async () => {
+    const canonical = authored('assistant-row-regression', 'A complete canonical message.', {
+      workingTurnId: 'working-row-regression',
+      turnExchangeId: 'exchange-row-regression'
+    });
+    for (const rowText of ['A complete', 'Different visible rewrite.']) {
+      const row = authored('assistant-row-regression', rowText, {
+        workingTurnId: 'working-row-regression',
+        turnExchangeId: 'exchange-row-regression'
+      });
+      const result = await scan([], [{
+        id: 'turn-row-regression',
+        messages: [canonical],
+        conversationProps: { conversationId: THREAD },
+        rendered: [{
+          html: '<p>Presentation only</p>',
+          fiberProps: { message: row, conversation: { id: THREAD } }
+        }]
+      }]);
+      expect(result.turns[0]!.messages[0]!.rawText).toBe('A complete canonical message.');
+    }
+  });
+
   it.each(['native', 'scoped', 'foreign', 'unknown', 'text-only', 'duplicate'])('stamps only exact current native message anchors (%s)', async mode => {
     const message = authored('anchor-message', 'Public prose');
     const block = { html: 'Public prose', staleMessageStamp: 'old-scan:0:old-message',

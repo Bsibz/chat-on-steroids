@@ -10823,6 +10823,10 @@
     let sourceQuiet = silencePickup;
     if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !silencePickup) || pendingTools > 0 || goalBusy || job?.busy) return false;
     const target = message.conversationId || null;
+    const freshProject = typeof message.freshProjectId === 'string' &&
+      /^g-p-[0-9a-f]{32}$/.test(message.freshProjectId)
+      ? message.freshProjectId : null;
+    if (message.freshProjectId && !freshProject) return false;
     const forEpoch = epoch;
     const sourceTurn = turnId;
     const sourceActivity = turnProgressRevision;
@@ -10875,7 +10879,8 @@
     }
     if (message.directTurn && (!target || ((generating || CLF_DOM.generating()) &&
         (!sourceUser || sourceTurn !== message.directTurn.id)))) return false;
-    const ownsFreshPage = () => !target && onTarget() && location.pathname === '/' &&
+    const ownsFreshPage = () => !target && onTarget() &&
+      (freshProject ? CLF_DOM.projectHomeId() === freshProject : location.pathname === '/') &&
       new URL(location.href).searchParams.get('cos-input') === message.id && !CLF_DOM.turns().length;
     if (!target && !ownsFreshPage()) return false;
     desktopInputBusy = true;
@@ -11137,6 +11142,15 @@
   async function prepareDesktopInputPage(message) {
     if (!/^[a-f0-9-]{36}$/i.test(message.id) || !inputReuseSafe()) return { ready: false };
     const startEpoch = epoch, startConversation = CLF_DOM.conversationId();
+    const freshSource = typeof message.freshSourceConversationId === 'string' &&
+      /^[0-9a-z-]{8,256}$/i.test(message.freshSourceConversationId)
+      ? message.freshSourceConversationId : null;
+    const freshProject = typeof message.freshProjectId === 'string' &&
+      /^g-p-[0-9a-f]{32}$/.test(message.freshProjectId)
+      ? message.freshProjectId : null;
+    if (message.freshSourceConversationId && !freshSource) return { ready: false };
+    if (message.freshProjectId && !freshProject) return { ready: false };
+    if (freshSource && startConversation !== freshSource) return { ready: false };
     let interrupted = false;
     const interrupt = event => { if (event.isTrusted) interrupted = true; };
     document.addEventListener('pointerdown', interrupt, true);
@@ -11149,17 +11163,26 @@
     desktopInputBusy = true;
     try {
       if (startConversation) {
-        const control = await CLF_DOM.newChatControl(current);
-        if (!control || !current()) return failure();
-        control.click();
-        const home = await waitPageView(() => !CLF_DOM.conversationId() && location.pathname === '/' && !CLF_DOM.turns().length, current, 5000);
-        if (!home || !current()) return failure();
+        if (freshProject) {
+          if (!(await CLF_DOM.enterProject({ id: freshProject, sourceConversationId: freshSource }, current)) || !current()) {
+            return failure();
+          }
+        } else {
+          const control = await CLF_DOM.newChatControl(current);
+          if (!control || !current()) return failure();
+          control.click();
+          const home = await waitPageView(() => !CLF_DOM.conversationId() && location.pathname === '/' && !CLF_DOM.turns().length, current, 5000);
+          if (!home || !current()) return failure();
+        }
       }
       if (!(await CLF_DOM.prepareChatModelSurface(current)) || !current()) return failure();
       // A mounted editor can belong to a hidden/alternate surface. Do not stamp
       // it ready and strand the input there; the existing pre-send fallback owns
       // a clean New Chat when the native transition did not produce a usable one.
-      if (location.pathname !== '/' || CLF_DOM.conversationId() || CLF_DOM.turns().length || !CLF_DOM.composerVisible()) return failure();
+      const freshSurface = freshProject
+        ? CLF_DOM.projectHomeId() === freshProject
+        : location.pathname === '/';
+      if (!freshSurface || CLF_DOM.conversationId() || CLF_DOM.turns().length || !CLF_DOM.composerVisible()) return failure();
       const url = new URL(location.href);
       url.searchParams.delete('cos-model-catalog');
       url.searchParams.set('cos-input', message.id);

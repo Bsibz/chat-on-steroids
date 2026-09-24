@@ -492,6 +492,36 @@ describe('one synchronous page snapshot per observer turn', () => {
     expect(new URL(live.window.location.href).searchParams.has('cos-input')).toBe(false);
     expect(live.sent.filter(message => message.type === 'desktop_input')).toEqual([]);
   });
+  it('prepares a fresh chat inside the exact source ChatGPT Project through its native header link', async () => {
+    const project = 'g-p-11111111222233334444555555555555';
+    const source = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    live = await harness(`https://chatgpt.com/g/${project}-night-build/c/${source}`, {}, (document, dom) => {
+      prose(document, assistantTurn(document, 'completed-project-answer', []), 'completed-project-message', 'Finished project answer');
+      const header = document.createElement('header');
+      header.innerHTML = `<a href="/g/${project}-night-build/project"><span data-testid="project-folder-icon"></span>Night Build</a>`;
+      document.body.prepend(header);
+      header.querySelector('a')!.addEventListener('click', event => {
+        event.preventDefault();
+        document.querySelector('#thread')!.replaceChildren();
+        dom.reconfigure({ url: `https://chatgpt.com/g/${project}-night-build/project` });
+        const editor = document.getElementById('prompt-textarea')!;
+        editor.replaceWith(editor.cloneNode(true));
+        header.remove();
+      });
+    });
+    await settleTurn(live);
+    expect(await live.runtimeMessage({ type: 'clf-input-reuse-state' })).toMatchObject({ safe: true });
+    const result = await live.runtimeMessage({
+      type: 'clf-prepare-desktop-input',
+      id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      freshSourceConversationId: source,
+      freshProjectId: project
+    });
+    expect(result).toMatchObject({ ready: true });
+    expect(live.window.location.pathname).toBe(`/g/${project}-night-build/project`);
+    expect(new URL(live.window.location.href).searchParams.get('cos-input')).toBe('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+    expect(live.sent.filter(message => message.type === 'desktop_input')).toEqual([]);
+  });
   it('permits retiring a hydrated empty catalog home with the real close proof', async () => {
     live = await harness('https://chatgpt.com/?cos-model-catalog=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
     await settle();

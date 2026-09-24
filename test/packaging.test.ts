@@ -218,7 +218,11 @@ describe('cross-platform packaging targets', () => {
     expect(macGuiScript).toContain('startupDeadlineMs = 15_000');
     expect(macGuiScript).toContain("child.kill('SIGTERM')");
     expect(macGuiScript).toContain("child.kill('SIGKILL')");
-    expect(macGuiScript).not.toContain('ELECTRON_RUN_AS_NODE');
+    // The GUI smoke must not *run* Electron as Node. Explicitly deleting a
+    // possibly inherited runner variable is the fail-closed way to guarantee
+    // that, so the test should require the scrub rather than forbid its name.
+    expect(macGuiScript).toContain('delete childEnv.ELECTRON_RUN_AS_NODE');
+    expect(macGuiScript).not.toMatch(/ELECTRON_RUN_AS_NODE\s*[:=]/);
 
     const debGui = workflow.slice(
       workflow.indexOf('      - name: Launch installed DEB normally under Xvfb'),

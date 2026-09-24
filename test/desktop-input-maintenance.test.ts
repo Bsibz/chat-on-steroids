@@ -142,7 +142,7 @@ it('carries the direct-turn offer only to the elected existing conversation', as
 });
 
 type Tab = { id: number; url?: string; pendingUrl?: string; windowId?: number; active?: boolean; pinned?: boolean };
-async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; nativePinned?: true }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}) {
+async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; nativePinned?: true; freshSourceConversationId?: string }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}) {
   const tabs: Tab[] = [];
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
@@ -192,6 +192,39 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
 }
 
 describe('one browser maintenance flight per desktop outbox publication', () => {
+  it('opens a fresh Project chat only through the exact source document and carries that Project into Send', async () => {
+    const project = 'g-p-11111111222233334444555555555555';
+    const input = { id: firstId, conversationId: null, freshSourceConversationId: secondId };
+    const h = await worker([input]);
+    h.tabs.push({ id: 8, url: `https://chatgpt.com/g/${project}-night-build/c/${secondId}` });
+    await h.authorizeDocument({ tab: { id: 8 }, documentId: 'project-source', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    h.sendMessage.mockImplementation(async (tabId, message): Promise<any> => {
+      if (message.type === 'clf-input-reuse-state') return { safe: true, navigationEpoch: 1 };
+      if (message.type === 'clf-prepare-desktop-input') {
+        expect(tabId).toBe(8);
+        expect(message).toMatchObject({
+          freshSourceConversationId: secondId,
+          freshProjectId: project
+        });
+        h.tabs[0]!.url = `https://chatgpt.com/g/${project}-night-build/project?cos-input=${firstId}#cos-input=${firstId}`;
+        return { ready: true };
+      }
+      return { ok: true };
+    });
+    await h.maintain();
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
+      [8, { type: 'clf-desktop-input', id: firstId, conversationId: null, freshProjectId: project }]
+    ]);
+  });
+
+  it('never silently opens a root chat when the exact fresh-chat source document is unavailable', async () => {
+    const h = await worker([{ id: firstId, conversationId: null, freshSourceConversationId: secondId }]);
+    await h.maintain();
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+  });
+
   it.each(['returned', 'absent', 'foreign', 'original-present'] as const)('resumes a pending exact-chat input only in an already returned tab (%s)', async state => {
     const input = { id: firstId, conversationId: secondId };
     const h = await worker([input], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready', conversationId: secondId } } });

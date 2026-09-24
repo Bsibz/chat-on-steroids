@@ -58,6 +58,29 @@ function totalDelta(changes: readonly FileChange[]): string | null {
   return changes.some((change) => change.approximate) ? `~${text}` : text;
 }
 
+/**
+ * Tiny owner-facing code excerpt for a successful apply_patch.
+ *
+ * The public Native Chat activity contract deliberately does not expose raw tool args/results.
+ * Reuse the already-redacted patch argument only long enough to keep at most four changed
+ * source lines. Patch/file headers and context are excluded, each line is bounded, and the
+ * existing activity projection applies its own final 200-character hardening. Encoding this
+ * in the existing optional detail field keeps v1/v2 readers schema-compatible.
+ */
+function patchSnippet(patch: string, changed: boolean): string | null {
+  if (!changed) return null;
+  const lines: string[] = [];
+  for (const raw of patch.split(/\r?\n/)) {
+    if (!(raw.startsWith('+') || raw.startsWith('-'))) continue;
+    if (raw.startsWith('+++') || raw.startsWith('---')) continue;
+    const body = raw.slice(1).replace(/\t/g, '  ').slice(0, 72);
+    if (!body.trim()) continue;
+    lines.push(raw[0] + body);
+    if (lines.length === 4) break;
+  }
+  return lines.length ? lines.join('\n') : null;
+}
+
 /** "lines 200–420" -> "221 lines", for the glanceable right edge of a read row. */
 function lineRangeMetric(detail: string | null): string | null {
   if (!detail) return null;
@@ -291,10 +314,12 @@ function build(
               : 'edit';
       const verb =
         only === 'create' ? 'Created' : only === 'delete' ? 'Deleted' : only === 'move' ? 'Moved' : 'Edited';
+      const snippet = input.outcome === 'ok' ? patchSnippet(patch, changes.length > 0) : null;
       return {
         kind: only,
         tone: only === 'delete' ? 'warn' : 'good',
         title: changes.length === 0 ? 'Applied a patch' : fileTitle(verb, changes, null),
+        ...(snippet ? { detail: snippet } : {}),
         ...(delta ? { metric: delta } : {})
       };
     }

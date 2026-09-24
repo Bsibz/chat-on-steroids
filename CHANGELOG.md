@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.16] — Native Chat fresh-chat reliability
+
+- Let an explicit Night Build New Chat open exactly its recorded source conversation when that source is not already open, then derive Project placement from the provider-owned source route.
+- Keep that source opening one-shot: closing or replacing the elected source never grants another automatic open.
+- Follow the exact same-origin Project-home link even when ChatGPT changes the decorative Project icon/test id.
+
+Reload the companion extension after updating; the stable unpacked extension folder does not need to be added again.
+
 ## [2.1.15] — Native Chat daily-driver bridge
 
 - Add the bounded Night Build Native Chat v3 control surface for model/reasoning state, attachments, configured sends and fresh chats.

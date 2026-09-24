@@ -195,6 +195,20 @@ describe('native Project entry readiness', () => {
     expect(clicks).toBe(1);
   });
 
+  it('uses the exact native Project-home route even when the provider changes its decorative icon', async () => {
+    const link = sourceLink();
+    link.replaceChildren(document.createTextNode('Night Build Project'));
+    box.textContent = '';
+    const clicks = vi.fn((event: Event) => {
+      event.preventDefault();
+      dom.reconfigure({ url: projectUrl });
+      box.replaceWith(box.cloneNode(true));
+    });
+    link.addEventListener('click', clicks);
+    expect(await api.enterProject(entry)).toBe(true);
+    expect(clicks).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['missing', 'draft', 'cancelled', 'foreign-route'])('never clicks an unready or retired source: %s', async reason => {
     const link = sourceLink();
     box.textContent = reason === 'draft' ? 'Keep my draft' : '';

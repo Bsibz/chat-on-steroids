@@ -218,8 +218,20 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     ]);
   });
 
-  it('never silently opens a root chat when the exact fresh-chat source document is unavailable', async () => {
+  it('opens only the exact fresh-chat source conversation when its document is unavailable', async () => {
     const h = await worker([{ id: firstId, conversationId: null, freshSourceConversationId: secondId }]);
+    await h.maintain();
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: `https://chatgpt.com/c/${secondId}` }));
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+  });
+
+  it('does not spend fresh-source opening authority twice after an elected source tab disappears', async () => {
+    const h = await worker(
+      [{ id: firstId, conversationId: null, freshSourceConversationId: secondId }],
+      undefined,
+      { inputOpenings: { [firstId]: { tab: 77, stage: 'source-opening', sourceConversationId: secondId } } }
+    );
     await h.maintain();
     expect(h.create).not.toHaveBeenCalled();
     expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);

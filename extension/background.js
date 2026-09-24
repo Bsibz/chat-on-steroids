@@ -1928,6 +1928,23 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       const sourceTabs = tabs.filter(candidate =>
         !candidate.pendingUrl && conversationForTab(candidate) === freshSource
       );
+      if (sourceTabs.length === 0 && !elected) {
+        // An explicit Night Build "New Chat" owns exactly one bounded browser opening:
+        // first restore the exact recorded source conversation, then let its provider-native
+        // Project link decide where the fresh chat belongs. Opening /c/<source> is identity-safe
+        // (the app already resolved this source from durable recorder history) and avoids making
+        // the user manually open the old chat before a fresh send can proceed. Never spend this
+        // authority again after an elected source tab is closed or replaced.
+        const sourceTab = await createChatTab(`https://chatgpt.com/c/${encodeURIComponent(freshSource)}`, background);
+        await protectCreatedTab(sourceTab);
+        await elect(input.id, {
+          tab: sourceTab.id,
+          stage: 'source-opening',
+          sourceConversationId: freshSource
+        });
+        tabs.push(sourceTab);
+        continue;
+      }
       if (sourceTabs.length !== 1) continue;
       const sourceTab = sourceTabs[0];
       if (!sourceTab || !Number.isInteger(sourceTab.id) || sourceTab.pinned) continue;

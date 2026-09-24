@@ -2382,10 +2382,20 @@ var CLF_DOM = (() => {
         // actual editor is mounted and ready.
         const source = composer();
         if (!source?.isConnected || !composerSubmitReady() || hasComposerAttachments()) return;
-        const links = [...document.querySelectorAll('header a[href], [role="banner"] a[href]')].filter(link =>
-          link.querySelector('[data-testid="project-folder-icon"]') && !link.closest(OWN_SURFACES) &&
-          new URL(link.href, location.href).origin === location.origin && projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
-        if (links.length !== 1) return;
+        // The provider has changed the Project icon/test-id more than once. The exact same-origin
+        // /g/<project>/project destination is the durable identity proof; a decorative child icon
+        // is not. Accept multiple header affordances only when they all resolve to that same exact
+        // Project home route, then spend one click on the first native link.
+        const links = [...document.querySelectorAll('header a[href], [role="banner"] a[href]')].filter(link => {
+          if (link.closest(OWN_SURFACES)) return false;
+          const url = new URL(link.href, location.href);
+          return url.origin === location.origin && projectHomeId(url.pathname) === entry.id;
+        });
+        const routes = new Set(links.map(link => {
+          const url = new URL(link.href, location.href);
+          return `${url.origin}${url.pathname}`;
+        }));
+        if (!links.length || routes.size !== 1) return;
         sourceComposer = source;
         clicked = true;
         // Loading the source and following its link are separate page transitions.

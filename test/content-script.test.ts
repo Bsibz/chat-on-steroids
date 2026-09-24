@@ -1892,7 +1892,8 @@ async function replyFiber(
   // Describe blocks that keep their own harness variable pass it; everything else uses the
   // shared one.
   harnessed: Harness | null = null,
-  observeOnly = false
+  observeOnly = false,
+  diagnostics: Record<string, number> | null = null
 ): Promise<void> {
   const active = harnessed ?? live!;
   const window = active.window as any;
@@ -1938,7 +1939,16 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 13, scanOk: true, rows, turns: indexedTurns },
+        data: {
+          source: 'clf-fiber-reply',
+          nonce: event.data.nonce,
+          scanToken,
+          v: 13,
+          scanOk: true,
+          rows,
+          turns: indexedTurns,
+          ...(diagnostics ? { diagnostics } : {})
+        },
         source: window
       })
     );
@@ -10930,6 +10940,32 @@ describe('evidence from the page context', () => {
 
     expect(live.sent.filter((message) => message.type === 'repair_fiber')).toHaveLength(1);
     expect(live.hook.fiberFor(block)).toMatchObject({ tool: 'read' });
+  });
+
+  it('preserves count-only Fiber diagnostics through conversation filtering', async () => {
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], job: null } })
+    });
+    const diagnostics = {
+      shells: 7,
+      roleNodes: 7,
+      turnAttrs: 7,
+      turnIds: 6,
+      markdown: 5,
+      fibers: 7,
+      models: 0,
+      modelMessages: 0,
+      minModelDepth: -1
+    };
+
+    await replyFiber([], [], null, true, null, false, diagnostics);
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'activity').at(-1)).toMatchObject({
+      fiber: 'empty',
+      fiberDiag: '7,7,7,6,5,7,0,0,-1'
+    });
   });
 
   it('reads an unrecorded native row without taking over its presentation', async () => {

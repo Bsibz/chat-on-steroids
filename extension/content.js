@@ -3869,6 +3869,7 @@
       // conservative behaviour. No clock, active-tab or tool-name fallback enters the decision.
       answer = {
         scanToken: answer.scanToken,
+        diagnostics: answer.diagnostics || null,
         turns: answer.turns.filter((turn) => {
           if (turn?.conversationConflict === true && turn !== ownedPageTurn) return false;
           const pageConversation = concreteConversation(turn.conversationId);

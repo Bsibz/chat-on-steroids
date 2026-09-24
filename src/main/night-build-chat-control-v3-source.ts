@@ -17,7 +17,7 @@ import {
   resolveNightBuildChatNativeSendProofByIdentity
 } from './night-build-chat-transport-source.js';
 import { stageInputAttachment } from './session/input-attachments.js';
-import { enqueueInput, listInputs } from './session/input.js';
+import { cancelInput, enqueueInput, listInputs } from './session/input.js';
 import { automaticCompactionAllowed, getSession, readSessionPlan } from './session/store.js';
 
 type BareSendIntent = Omit<
@@ -39,9 +39,11 @@ export interface NightBuildChatControlV3DataSource {
   createSend(input: NightBuildChatConfiguredSendCreateV3): Promise<BareSendIntent>;
   send(id: string): Promise<BareSendIntent | null>;
   inspectSend(id: string): Promise<BareSendIntent | null>;
+  cancelSend(id: string): Promise<BareSendIntent | null>;
   createFreshSend(input: NightBuildChatFreshSendCreateV3): Promise<BareFreshSendIntent>;
   freshSend(id: string): Promise<BareFreshSendIntent | null>;
   inspectFreshSend(id: string): Promise<BareFreshSendIntent | null>;
+  cancelFreshSend(id: string): Promise<BareFreshSendIntent | null>;
 }
 
 function retainedAttachmentIds(rows: Awaited<ReturnType<typeof listInputs>>): Set<string> {
@@ -184,6 +186,12 @@ export function createInProcessNightBuildChatControlV3Source(
     },
     send: (id) => writable.send(id),
     inspectSend: (id) => writable.inspectSend(id),
+    async cancelSend(id) {
+      const row = (await listInputs()).find((entry) => entry.id === id && !!entry.nativeChat && !entry.freshSourceConversationId);
+      if (!row) return null;
+      await cancelInput(id);
+      return writable.send(id);
+    },
     async createFreshSend(input) {
       validateConfiguredSelection({
         id: input.id,
@@ -230,6 +238,14 @@ export function createInProcessNightBuildChatControlV3Source(
       return status;
     },
     freshSend: freshStatus,
-    inspectFreshSend: freshStatus
+    inspectFreshSend: freshStatus,
+    async cancelFreshSend(id) {
+      const row = (await listInputs()).find((entry) =>
+        entry.id === id && !!entry.freshSourceConversationId && !!entry.freshSourceHandle
+      );
+      if (!row) return null;
+      await cancelInput(id);
+      return freshStatus(id);
+    }
   };
 }

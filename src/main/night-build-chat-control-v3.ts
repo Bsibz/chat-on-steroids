@@ -237,6 +237,24 @@ function requestHandler(
           if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
           return writeJson(res, 202, { ...common(), ...intent });
         }
+        const cancelSend = url.pathname.match(/^\/v3\/send-intents\/([0-9a-f-]{36})\/cancel$/i);
+        if (cancelSend && UUID.test(cancelSend[1]!)) {
+          if (req.method !== 'POST') return writeJson(res, 405, { error: 'method_not_allowed' });
+          if (url.search !== '' || !noRequestBody(req)) return writeJson(res, 400, { error: 'bad_request' });
+          const intent = await source.cancelSend(cancelSend[1]!);
+          if (!intent) return writeJson(res, 404, { error: 'intent_not_found' });
+          if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
+          return writeJson(res, 200, { ...common(), ...intent });
+        }
+        const cancelFresh = url.pathname.match(/^\/v3\/fresh-send-intents\/([0-9a-f-]{36})\/cancel$/i);
+        if (cancelFresh && UUID.test(cancelFresh[1]!)) {
+          if (req.method !== 'POST') return writeJson(res, 405, { error: 'method_not_allowed' });
+          if (url.search !== '' || !noRequestBody(req)) return writeJson(res, 400, { error: 'bad_request' });
+          const intent = await source.cancelFreshSend(cancelFresh[1]!);
+          if (!intent) return writeJson(res, 404, { error: 'intent_not_found' });
+          if (!(await allowed())) return writeJson(res, 503, { error: 'controller_unavailable' });
+          return writeJson(res, 200, { ...common(), ...intent });
+        }
         const send = url.pathname.match(/^\/v3\/send-intents\/([0-9a-f-]{36})(\/inspect)?$/i);
         if (send && UUID.test(send[1]!)) {
           if (url.search !== '' || !noRequestBody(req)) return writeJson(res, 400, { error: 'bad_request' });

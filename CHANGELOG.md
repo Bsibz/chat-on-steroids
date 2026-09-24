@@ -9,6 +9,15 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.15] — Native Chat daily-driver bridge
+
+- Add the bounded Night Build Native Chat v3 control surface for model/reasoning state, attachments, configured sends and fresh chats.
+- Preserve exact Project placement when Night Build starts a fresh ChatGPT conversation.
+- Add exact queued-send cancellation for both existing and fresh Native Chat sends.
+- Keep app and companion version identity aligned so a stale unpacked Chrome extension is visible instead of silently masquerading as the current build.
+
+Reload the companion extension after updating so Chrome executes the 2.1.15 service worker and content scripts.
+
 ## [2.1.14] — Death to Anthropic and OpenAI. Join the resistance @dummerspast39 x
 
 - Add the optional animated Tur Tur Sahur desktop companion.

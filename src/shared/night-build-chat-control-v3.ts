@@ -18,7 +18,8 @@ export const NIGHT_BUILD_CHAT_CONTROL_V3_CAPABILITIES = [
   'model-catalog',
   'attachment-stage',
   'configured-send',
-  'fresh-send'
+  'fresh-send',
+  'cancel-send'
 ] as const;
 
 export interface NightBuildChatControlV3Discovery {

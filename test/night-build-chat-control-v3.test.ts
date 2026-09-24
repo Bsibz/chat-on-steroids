@@ -80,6 +80,15 @@ function dataSource(overrides: Partial<NightBuildChatControlV3DataSource> = {}):
     }),
     send: async () => null,
     inspectSend: async () => null,
+    cancelSend: async (id) => ({
+      id,
+      conversation: CONVERSATION,
+      state: 'failed',
+      createdAt: 1,
+      claimedAt: null,
+      receipt: null,
+      error: 'pre_send_failed'
+    }),
     createFreshSend: async (input) => ({
       id: input.id,
       destinationConversation: null,
@@ -90,7 +99,16 @@ function dataSource(overrides: Partial<NightBuildChatControlV3DataSource> = {}):
       error: null
     }),
     freshSend: async () => null,
-    inspectFreshSend: async () => null
+    inspectFreshSend: async () => null,
+    cancelFreshSend: async (id) => ({
+      id,
+      destinationConversation: null,
+      state: 'failed',
+      createdAt: 1,
+      claimedAt: null,
+      receipt: null,
+      error: 'pre_send_failed'
+    })
   };
   return { ...base, ...overrides };
 }
@@ -158,7 +176,7 @@ describe('Night Build Chat Control v3 local server', () => {
     expect(discovery.host).toBe('127.0.0.1');
     expect(discovery.instanceId).toBe(sharedInstance);
     expect(discovery.startedAt).toBe(123);
-    expect(discovery.capabilities).toEqual(['state', 'model-catalog', 'attachment-stage', 'configured-send', 'fresh-send']);
+    expect(discovery.capabilities).toEqual(['state', 'model-catalog', 'attachment-stage', 'configured-send', 'fresh-send', 'cancel-send']);
     expect((await request(discovery)).status).toBe(401);
     expect((await request(discovery, { token: discovery.token })).status).toBe(426);
     expect((await request(discovery, { ...auth(discovery), origin: 'https://example.invalid' })).status).toBe(403);
@@ -239,6 +257,32 @@ describe('Night Build Chat Control v3 local server', () => {
       state: 'queued'
     });
     expect(response.text).not.toMatch(/g-p-|sourceConversation/);
+  });
+
+  it('cancels exact queued configured and fresh sends without a request body', async () => {
+    const root = await tempRoot();
+    const cancelSend = vi.fn(dataSource().cancelSend);
+    const cancelFreshSend = vi.fn(dataSource().cancelFreshSend);
+    const handle = await startNightBuildChatControlV3(root, dataSource({ cancelSend, cancelFreshSend }));
+    handles.push(handle);
+
+    const configured = await request(handle.discovery, {
+      ...auth(handle.discovery),
+      method: 'POST',
+      path: `/v3/send-intents/${SEND_ID}/cancel`
+    });
+    expect(configured.status).toBe(200);
+    expect(cancelSend).toHaveBeenCalledWith(SEND_ID);
+    expect(JSON.parse(configured.text)).toMatchObject({ id: SEND_ID, state: 'failed', error: 'pre_send_failed' });
+
+    const fresh = await request(handle.discovery, {
+      ...auth(handle.discovery),
+      method: 'POST',
+      path: `/v3/fresh-send-intents/${SEND_ID}/cancel`
+    });
+    expect(fresh.status).toBe(200);
+    expect(cancelFreshSend).toHaveBeenCalledWith(SEND_ID);
+    expect(JSON.parse(fresh.text)).toMatchObject({ id: SEND_ID, state: 'failed', error: 'pre_send_failed' });
   });
 
   it('stages raw bytes without accepting a filesystem path and carries only returned metadata into Send', async () => {

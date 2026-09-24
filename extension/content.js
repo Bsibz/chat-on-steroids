@@ -1682,6 +1682,7 @@
     fiberTurns = new Map();
     fiberScanToken = null;
     fiberPresent = null;
+    fiberDiagnostics = null;
   }
 
   const stoppedAppCommands = new Set();
@@ -3044,6 +3045,7 @@
   let fiberAsking = null;
   /** Off until the helper answers once, so a browser without it behaves exactly as before. */
   let fiberPresent = null; // Unknown until this document gets a reply or a definitive repair failure.
+  let fiberDiagnostics = null; // Count-only page structure; never transcript text or ids.
   /** Avoid turning a missing MAIN-world helper into one script injection per observer tick. */
   let fiberRepairAt = -Infinity;
   let fiberRepairing = null;
@@ -3531,6 +3533,19 @@
         // being accidentally interpreted against the current descriptor indexes.
         if (data.scanToken !== nonce) return;
         if (data.scanOk !== true) return finish(null);
+        let diagnostics = null;
+        if (data.diagnostics && typeof data.diagnostics === 'object') {
+          const keys = ['shells', 'roleNodes', 'turnAttrs', 'turnIds', 'markdown', 'fibers', 'models', 'modelMessages', 'minModelDepth'];
+          const candidate = {};
+          let valid = true;
+          for (const key of keys) {
+            const value = data.diagnostics[key];
+            const minimum = key === 'minModelDepth' ? -1 : 0;
+            if (!Number.isInteger(value) || value < minimum || value > 9999) { valid = false; break; }
+            candidate[key] = value;
+          }
+          if (valid) diagnostics = candidate;
+        }
         const turns = [];
         if (Array.isArray(data.turns)) {
           for (const raw of data.turns.slice(0, FIBER_MAX_TURNS)) {
@@ -3538,7 +3553,7 @@
             if (turn) turns.push(turn);
           }
         }
-        if (!Array.isArray(data.rows)) return finish({ rows: new Map(), turns, scanToken: data.scanToken });
+        if (!Array.isArray(data.rows)) return finish({ rows: new Map(), turns, scanToken: data.scanToken, diagnostics });
         const rows = new Map();
         for (const raw of data.rows.slice(0, FIBER_MAX_ROWS)) {
           const row = readDescriptor(raw);
@@ -3548,7 +3563,7 @@
           else rows.set(row.index, row);
         }
         for (const [index, row] of rows) if (row === null) rows.delete(index);
-        finish({ rows, turns, scanToken: data.scanToken });
+        finish({ rows, turns, scanToken: data.scanToken, diagnostics });
       };
       window.addEventListener('message', onMessage);
       setTimeout(() => finish(null), FIBER_TIMEOUT_MS);
@@ -3768,6 +3783,7 @@
         // definitive success/failure for repair_fiber.
         if (repair && (repair.ok === true || repair.error !== 'unknown_message')) {
           fiberPresent = false;
+          fiberDiagnostics = null;
           fiberRows = new Map();
           fiberTurns = new Map();
           fiberScanToken = null;
@@ -3879,6 +3895,7 @@
       traceStage(call.requestId, 'tool', call.tool);
     }
     fiberPresent = true;
+    fiberDiagnostics = answer.diagnostics || null;
     fiberRows = answer.rows;
     fiberScanToken = answer.scanToken;
     const previousFiberTurns = [...fiberTurns.values()];
@@ -6115,7 +6132,20 @@
         conversationId,
         since,
         // Initial/loading state is unknown; only a completed scan or repair can report health.
-        fiber: fiberPresent === null ? undefined : !fiberPresent ? 'absent' : fiberTurns.size === 0 ? 'empty' : 'ok'
+        fiber: fiberPresent === null ? undefined : !fiberPresent ? 'absent' : fiberTurns.size === 0 ? 'empty' : 'ok',
+        ...(fiberPresent && fiberTurns.size === 0 && fiberDiagnostics ? {
+          fiberDiag: [
+            fiberDiagnostics.shells,
+            fiberDiagnostics.roleNodes,
+            fiberDiagnostics.turnAttrs,
+            fiberDiagnostics.turnIds,
+            fiberDiagnostics.markdown,
+            fiberDiagnostics.fibers,
+            fiberDiagnostics.models,
+            fiberDiagnostics.modelMessages,
+            fiberDiagnostics.minModelDepth
+          ].join(',')
+        } : {})
       });
       if (!reply || reply.ok !== true || !reply.data) {
         // Keep waiting only for failures that can genuinely mean "the local app/worker is

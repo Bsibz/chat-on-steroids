@@ -3433,7 +3433,10 @@ const HANDLERS = {
       `&since=${Number(message.since) || 0}` +
       `&goalClient=${encodeURIComponent(String(source.tab))}` +
       // Forward only the helper states this document may report; these are diagnostics.
-      (['absent', 'empty', 'ok'].includes(message.fiber) ? `&fiber=${message.fiber}` : '');
+      (['absent', 'empty', 'ok'].includes(message.fiber) ? `&fiber=${message.fiber}` : '') +
+      (typeof message.fiberDiag === 'string' && /^\d{1,4}(?:,\d{1,4}){7},-?\d{1,4}$/.test(message.fiberDiag)
+        ? `&fiberDiag=${encodeURIComponent(message.fiberDiag)}`
+        : '');
     const result = await call(`/activity${query}`);
     if (ownsDocument(source) && result.ok && result.data && await acceptBrowserRevival(result.data.revival)) {
       await recoverDeferredRevivals();

@@ -2514,6 +2514,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const goalClient = (url.searchParams.get('goalClient') ?? '').slice(0, 100);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     noteFiberHealth(id, url.searchParams.get('fiber'));
+    noteFiberDiagnostics(id, url.searchParams.get('fiberDiag'));
     const retiredWorker = retiredWorkerForConversation(id);
     const superseded = await conversationWasSuperseded(id);
     /**
@@ -6896,6 +6897,7 @@ const FIBER_HEALTH_GRACE_MS = 15_000;
 const fiberHealth = new Map<string, {
   state: 'absent' | 'empty'; since: number; announced: 'absent' | 'empty' | null;
 }>();
+const fiberDiagnostics = new Map<string, string>();
 
 function noteFiberHealth(conversationId: string, raw: string | null, now = Date.now()): void {
   if (raw !== 'absent' && raw !== 'empty' && raw !== 'ok') return;
@@ -6921,6 +6923,22 @@ function noteFiberHealth(conversationId: string, raw: string | null, now = Date.
   const message = `bridge: ${conversationId} reports its page-model helper as ${raw}: ${detail}`;
   if (raw === 'absent') logWarn(message);
   else logInfo(message);
+}
+
+function noteFiberDiagnostics(conversationId: string, raw: string | null): void {
+  if (!raw || !/^\d{1,4}(?:,\d{1,4}){7},-?\d{1,4}$/.test(raw)) return;
+  if (fiberDiagnostics.get(conversationId) === raw) return;
+  fiberDiagnostics.set(conversationId, raw);
+  if (fiberDiagnostics.size > 200) {
+    for (const old of [...fiberDiagnostics.keys()].slice(0, 50)) fiberDiagnostics.delete(old);
+  }
+  const values = raw.split(',').map(Number);
+  const [shells, roleNodes, turnAttrs, turnIds, markdown, fibers, models, modelMessages, minModelDepth] = values;
+  logInfo(
+    `bridge: ${conversationId} page-model structure ` +
+    `shells=${shells} role_nodes=${roleNodes} turn_attrs=${turnAttrs} turn_ids=${turnIds} ` +
+    `markdown=${markdown} fibers=${fibers} models=${models} model_messages=${modelMessages} min_model_depth=${minModelDepth}`
+  );
 }
 
 /** Bound repeated explanations by chat and cause without changing the recovery decision. */

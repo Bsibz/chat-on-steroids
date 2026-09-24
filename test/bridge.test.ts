@@ -6526,6 +6526,30 @@ describe('unattributed activity recovery', () => {
     } finally { clock.mockRestore(); }
   });
 
+  it('logs only bounded count-only page-model structure changes', async () => {
+    await pair();
+    const conversationId = randomUUID();
+    const lines = () => getLog().filter(entry =>
+      entry.message.includes(`bridge: ${conversationId} page-model structure`)
+    );
+
+    await request('GET', `/activity?conversationId=${conversationId}&fiber=empty&fiberDiag=0,14,0,0,11,0,0,0,-1`);
+    expect(lines()).toHaveLength(1);
+    expect(lines()[0]!.message).toContain(
+      'shells=0 role_nodes=14 turn_attrs=0 turn_ids=0 markdown=11 fibers=0 models=0 model_messages=0 min_model_depth=-1'
+    );
+
+    // An unchanged observation is quiet, and arbitrary page text is never accepted as diagnostics.
+    await request('GET', `/activity?conversationId=${conversationId}&fiber=empty&fiberDiag=0,14,0,0,11,0,0,0,-1`);
+    await request('GET', `/activity?conversationId=${conversationId}&fiber=empty&fiberDiag=private-text`);
+    expect(lines()).toHaveLength(1);
+
+    await request('GET', `/activity?conversationId=${conversationId}&fiber=empty&fiberDiag=12,14,12,12,11,12,10,24,6`);
+    expect(lines()).toHaveLength(2);
+    expect(lines()[1]!.message).toContain('shells=12');
+    expect(lines()[1]!.message).toContain('min_model_depth=6');
+  });
+
   it('restarts helper grace on state changes and clock rollback, and clears it on bridge reset', async () => {
     await pair();
     const conversationId = randomUUID();

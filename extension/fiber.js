@@ -96,6 +96,55 @@
   const MAX_RESPONSE_TEXT = MAX_TURNS * 512 * 1024;
   const MAX_TURN_TEXT = 512 * 1024;
 
+  /**
+   * Count-only structural diagnostics for page-model drift.
+   *
+   * No text, ids, attributes, props, URLs or model objects cross this boundary. These counts
+   * only distinguish "the turn selector found nothing" from "turn shells exist but their
+   * React branch no longer exposes the known turn model", so an empty Native Chat transcript
+   * can fail closed without leaving its structural cause opaque.
+   */
+  function structuralDiagnostics() {
+    const boundedCount = selector => {
+      try { return Math.min(9999, document.querySelectorAll(selector).length); } catch { return 0; }
+    };
+    let shells = [];
+    try { shells = [...document.querySelectorAll(TURN_SECTION)].slice(0, MAX_TURNS * 4); } catch { shells = []; }
+    let fibers = 0;
+    let models = 0;
+    let modelMessages = 0;
+    let minModelDepth = -1;
+    for (const shell of shells) {
+      const fiber = fiberOf(shell);
+      if (!fiber) continue;
+      fibers++;
+      let at = fiber;
+      for (let depth = 0; at && depth < MAX_CLIMB; depth++, at = at.return) {
+        const props = at.memoizedProps;
+        if (!props || typeof props !== 'object') continue;
+        const messages = props.turn && typeof props.turn === 'object' && Array.isArray(props.turn.messages)
+          ? props.turn.messages
+          : Array.isArray(props.allMessages) ? props.allMessages : null;
+        if (!messages) continue;
+        models++;
+        modelMessages = Math.min(9999, modelMessages + messages.length);
+        if (minModelDepth < 0 || depth < minModelDepth) minModelDepth = depth;
+        break;
+      }
+    }
+    return {
+      shells: Math.min(9999, shells.length),
+      roleNodes: boundedCount('[data-message-author-role]'),
+      turnAttrs: boundedCount('[data-turn]'),
+      turnIds: boundedCount('[data-turn-id]'),
+      markdown: boundedCount(MARKDOWN),
+      fibers: Math.min(9999, fibers),
+      models: Math.min(9999, models),
+      modelMessages,
+      minModelDepth
+    };
+  }
+
   function budgetedText(value, budget, perValueLimit) {
     if (typeof value !== 'string' || !value || !budget || budget.remaining <= 0) return '';
     const limit = Math.max(0, Math.min(perValueLimit, budget.remaining));
@@ -1610,6 +1659,7 @@
     const scanToken = nonce;
     const rows = [];
     let turns = [];
+    let diagnostics = null;
     let scanOk = true;
     let found;
     try {
@@ -1646,7 +1696,8 @@
       turns = [];
       scanOk = false;
     }
-    post({ source: REPLY, nonce, scanToken, v: VERSION, scanOk, rows, turns }, location.origin);
+    try { diagnostics = structuralDiagnostics(); } catch { diagnostics = null; }
+    post({ source: REPLY, nonce, scanToken, v: VERSION, scanOk, rows, turns, diagnostics }, location.origin);
   }
 
   /** Picker data is account-evaluated state, never a scraped English announcement.

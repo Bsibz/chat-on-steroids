@@ -3111,12 +3111,12 @@ describe('extension observation journal', () => {
     // page is the only thing that can see the MAIN-world helper, and the app is the only thing
     // that can say a handoff will never reconcile its marker without it.
     const conversationId = '22222222-3333-4444-5555-666666666666';
-    const seen: Array<string | null> = [];
+    const seen: Array<{ fiber: string | null; diag: string | null }> = [];
     const fetch = vi.fn(async (input: string) => {
       const url = new URL(input);
       if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
       if (url.pathname === '/activity') {
-        seen.push(url.searchParams.get('fiber'));
+        seen.push({ fiber: url.searchParams.get('fiber'), diag: url.searchParams.get('fiberDiag') });
         return response(200, { sessionId: 'session', entries: [], stream: [], nextSince: 0 });
       }
       return response(404, {});
@@ -3127,14 +3127,26 @@ describe('extension observation journal', () => {
       fetch
     });
 
-    for (const fiber of ['absent', 'empty', 'ok']) {
-      await worker.send({ type: 'activity', conversationId, since: 0, fiber }, 73);
-    }
+    await worker.send({ type: 'activity', conversationId, since: 0, fiber: 'absent' }, 73);
+    await worker.send({
+      type: 'activity',
+      conversationId,
+      since: 0,
+      fiber: 'empty',
+      fiberDiag: '0,14,0,0,11,0,0,0,-1'
+    }, 73);
+    await worker.send({ type: 'activity', conversationId, since: 0, fiber: 'ok' }, 73);
     // Anything else is dropped rather than passed on for the app to validate a second time.
-    await worker.send({ type: 'activity', conversationId, since: 0, fiber: 'maybe' }, 73);
+    await worker.send({ type: 'activity', conversationId, since: 0, fiber: 'maybe', fiberDiag: 'private text' }, 73);
     await worker.send({ type: 'activity', conversationId, since: 0 }, 73);
 
-    expect(seen).toEqual(['absent', 'empty', 'ok', null, null]);
+    expect(seen).toEqual([
+      { fiber: 'absent', diag: null },
+      { fiber: 'empty', diag: '0,14,0,0,11,0,0,0,-1' },
+      { fiber: 'ok', diag: null },
+      { fiber: null, diag: null },
+      { fiber: null, diag: null }
+    ]);
   });
 
   it('selects only the exact owned Goal tab without activating Chrome or opening a duplicate', async () => {

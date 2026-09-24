@@ -303,6 +303,17 @@ async function scan(
   imageStamps: Array<string | null>;
   repeatedStampMutations: number;
   turns: TurnEvidence[];
+  diagnostics: {
+    shells: number;
+    roleNodes: number;
+    turnAttrs: number;
+    turnIds: number;
+    markdown: number;
+    fibers: number;
+    models: number;
+    modelMessages: number;
+    minModelDepth: number;
+  } | null;
 }> {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     url: `https://chatgpt.com/c/${THREAD}`,
@@ -419,7 +430,8 @@ async function scan(
     thoughtStamps,
     imageStamps,
     repeatedStampMutations,
-    turns: (data.turns ?? []) as TurnEvidence[]
+    turns: (data.turns ?? []) as TurnEvidence[],
+    diagnostics: data.diagnostics ?? null
   };
 }
 
@@ -752,7 +764,7 @@ describe('the calls a turn says it made', () => {
     'reads canonical page-model turns when ChatGPT renders the turn shell as <%s>',
     async tag => {
       const publicText = 'Tag drift must not erase a populated conversation.';
-      const { turns } = await scan([], [{
+      const { turns, diagnostics } = await scan([], [{
         id: 'turn-tag-drift',
         tag,
         messages: [authored('assistant-tag-drift', publicText)],
@@ -765,6 +777,14 @@ describe('the calls a turn says it made', () => {
         rawMessageId: 'assistant-tag-drift',
         role: 'assistant',
         rawText: publicText
+      });
+      expect(diagnostics).toMatchObject({
+        shells: 1,
+        markdown: 1,
+        fibers: 1,
+        models: 1,
+        modelMessages: 1,
+        minModelDepth: 0
       });
     }
   );

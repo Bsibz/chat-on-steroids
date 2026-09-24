@@ -70,8 +70,15 @@
   const MAX_CALLS = 200;
   /** Public generated-image descriptors retained per turn. Pixels never cross this boundary. */
   const MAX_GENERATED_IMAGES = 200;
-  /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
-  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  /**
+   * ChatGPT's turn shells, where the page model hangs.
+   *
+   * Do not qualify this with section/article/div: ChatGPT has already moved the same
+   * data-testid="conversation-turn-N" shell between semantic tags while keeping the turn
+   * identity and inner message model intact. A tag-qualified selector turns that harmless
+   * presentation refactor into a completely empty canonical transcript.
+   */
+  const TURN_SECTION = '[data-testid^="conversation-turn"]';
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
   const MARKDOWN = '.markdown';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';

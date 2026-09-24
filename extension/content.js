@@ -2885,7 +2885,10 @@
     });
   }
 
-  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  // Keep turn ownership anchored to ChatGPT's stable turn test id, not whichever semantic
+  // wrapper tag the current renderer happens to use. The MAIN-world reader uses the same
+  // tag-agnostic contract in fiber.js.
+  const TURN_SECTION = '[data-testid^="conversation-turn"]';
   let seededPath = null;
 
   /**

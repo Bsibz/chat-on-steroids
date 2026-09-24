@@ -133,7 +133,7 @@ describe('extension release metadata', () => {
 
 // ---------------------------------------------------------------------- DOM
 
-const TURN_SELECTOR = 'section[data-testid^="conversation-turn"]';
+const TURN_SELECTOR = '[data-testid^="conversation-turn"]';
 const TOOL_SELECTOR = 'span[class*="tool-message"]';
 
 class FakeNode {

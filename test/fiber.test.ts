@@ -278,6 +278,7 @@ interface TurnEvidence {
 interface TurnFixture {
   id: string;
   messages: Message[];
+  tag?: 'section' | 'article' | 'div';
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
   rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string }>;
@@ -312,7 +313,7 @@ async function scan(
   const document = window.document;
 
   for (const turn of turnSections) {
-    const section = document.createElement('section');
+    const section = document.createElement(turn.tag ?? 'section');
     section.setAttribute('data-testid', 'conversation-turn-2');
     if (turn.id) section.setAttribute('data-turn-id', turn.id);
     if (turn.staleStamp !== undefined) section.setAttribute('data-clf-fiber-turn', turn.staleStamp);
@@ -746,6 +747,27 @@ describe('the calls a turn says it made', () => {
     expect(turns.map((turn) => turn.turnId)).toEqual(['turn-one', 'turn-two']);
     expect(turns[1]!.calls.map((call) => call.tool)).toEqual(['run_command']);
   });
+
+  it.each(['section', 'article', 'div'] as const)(
+    'reads canonical page-model turns when ChatGPT renders the turn shell as <%s>',
+    async tag => {
+      const publicText = 'Tag drift must not erase a populated conversation.';
+      const { turns } = await scan([], [{
+        id: 'turn-tag-drift',
+        tag,
+        messages: [authored('assistant-tag-drift', publicText)],
+        rendered: [publicText]
+      }]);
+
+      expect(turns).toHaveLength(1);
+      expect(turns[0]!.turnId).toBe('turn-tag-drift');
+      expect(turns[0]!.messages[0]!).toMatchObject({
+        rawMessageId: 'assistant-tag-drift',
+        role: 'assistant',
+        rawText: publicText
+      });
+    }
+  );
 
   it('takes canonical assistant identity and raw Markdown from the public text message model, not Markdown-node cardinality', async () => {
     const publicText = '**One** canonical update with `code`.';

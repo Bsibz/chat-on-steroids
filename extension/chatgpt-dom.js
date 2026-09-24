@@ -23,7 +23,12 @@
  */
 
 var CLF_DOM = (() => {
-  const TURN = 'section[data-testid^="conversation-turn"]';
+  // ChatGPT has changed the semantic tag around a conversation turn more than once
+  // (article -> section in June 2026, and account/layout buckets can drift
+  // independently). The data-testid is the durable page contract we actually consume;
+  // hard-qualifying the tag makes the entire recorder see an empty transcript whenever
+  // the wrapper tag changes while all message data is still present.
+  const TURN = '[data-testid^="conversation-turn"]';
   // ChatGPT has used both shapes in the live renderer: the older tool-message span
   // and, as of 2026-08-15, a display-contents row wrapping the visible tool label.
   // Keep both explicit structural anchors; hashed CSS-module names remain off limits.

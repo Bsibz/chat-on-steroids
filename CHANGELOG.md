@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.22] — ChatGPT turn-shell drift
+
+- Make ChatGPT conversation-turn discovery tag-agnostic. Native Chat recording now follows the stable `data-testid="conversation-turn-*"` contract instead of assuming the current renderer uses a `section` wrapper.
+- Apply the same turn-shell contract to DOM observation, Fiber/page-model capture, and local generation ownership so a harmless `section` / `article` / `div` renderer refactor cannot blank a populated Native Chat transcript.
+- Add regression coverage proving canonical page-model messages survive all three wrapper tags.
+
 ## [2.1.21] — Worker tab placement
 
 - Keep attributed worker openings with the browser profile that actually owns the prime chat instead of letting any connected Chrome profile win the placement race.

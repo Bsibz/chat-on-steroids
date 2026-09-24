@@ -86,6 +86,7 @@ let retryAlarmScheduled = false;
 let port = null;
 let token = null;
 let loaded = false;
+let browserPlacementId = null;
 /**
  * The one `load()` in flight, shared by everything that has to wait for it.
  *
@@ -286,8 +287,17 @@ async function loadOnce() {
     'commandAckOutbox',
     'recoveryMonitoring',
     'discardProtectedTabs',
-    'delivery'
+    'delivery',
+    'browserPlacementId'
   ]);
+  browserPlacementId = typeof live.browserPlacementId === 'string' && /^[a-zA-Z0-9_-]{16,128}$/.test(live.browserPlacementId)
+    ? live.browserPlacementId
+    : null;
+  if (!browserPlacementId) {
+    const uuid = globalThis.crypto?.randomUUID?.();
+    browserPlacementId = uuid || `browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    await chrome.storage.session.set({ browserPlacementId });
+  }
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
   tabConversations =
@@ -2584,7 +2594,7 @@ async function maintainOnce() {
     .filter((tab) => tab && (tab.discarded === true || tab.frozen === true))
     .map(conversationForTab)
     .filter(Boolean))];
-  const reply = await call('/status', { method: 'POST', body: JSON.stringify({ openConversations, stalledConversations }) });
+  const reply = await call('/status', { method: 'POST', body: JSON.stringify({ openConversations, stalledConversations, browserPlacementId }) });
   if (intent !== connectionEpoch || !token || disconnected) return;
   if (!reply.ok || !reply.data) { await activeTabs?.revoke(); return; }
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);

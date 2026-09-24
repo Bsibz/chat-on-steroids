@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.21] — Worker tab placement
+
+- Keep attributed worker openings with the browser profile that actually owns the prime chat instead of letting any connected Chrome profile win the placement race.
+- Pin unattributed worker openings to one live browser profile for a renewable lease so concurrent workers collect as tabs in one browser instead of scattering across multiple Chrome windows/profiles.
+- Give each companion browser session a bounded non-secret placement identity; it grants no command access and is used only to coordinate which already-authenticated companion receives fresh worker tabs.
+
+Reload the existing unpacked companion after updating so Chrome sends the new browser placement identity.
+
 ## [2.1.20] — UUID request attribution
 
 - Accept current ChatGPT UUID connector request IDs in the passive SSE/WebSocket ownership observer using the same bounded opaque-id contract as MCP ingress.

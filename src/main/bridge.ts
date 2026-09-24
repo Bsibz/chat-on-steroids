@@ -2037,8 +2037,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const live = liveConversations();
     let openConversations: string[] = [];
     let stalledConversations: string[] = [];
+    let browserPlacementId: string | null = null;
     if (req.method === 'POST') {
-      const body = await readBody(req) as { openConversations?: unknown; stalledConversations?: unknown };
+      const body = await readBody(req) as { openConversations?: unknown; stalledConversations?: unknown; browserPlacementId?: unknown };
       if (!Array.isArray(body?.openConversations) || body.openConversations.length > 10_000 || body.openConversations.some(id => !conversationId(id))) {
         return json(res, 400, { error: 'invalid_open_conversations' }, origin);
       }
@@ -2048,6 +2049,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 400, { error: 'invalid_stalled_conversations' }, origin);
       }
       stalledConversations = (body.stalledConversations ?? []) as string[];
+      if (body.browserPlacementId !== undefined) {
+        if (typeof body.browserPlacementId !== 'string' || !/^[a-zA-Z0-9_-]{16,128}$/.test(body.browserPlacementId)) {
+          return json(res, 400, { error: 'invalid_browser_placement_id' }, origin);
+        }
+        browserPlacementId = body.browserPlacementId;
+      }
     }
     const openSet = new Set(openConversations);
     const tabPolicy = await browserTabPolicy(openSet);
@@ -2097,7 +2104,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // Rendering custody follows the actual command ledger, including its retirement.
         commandIds: commands.map(command => command.id),
         revival,
-        placement: pendingBrowserPlacement(null),
+        placement: pendingBrowserPlacementForStatus(openSet, browserPlacementId),
         // A failure report closes this request. Reissuing the repair in the same response would
         // replace the visible failure with "Trying" before a renderer could ever observe it.
         repairs: repairFailed ? [] : await takePendingRepairs(),
@@ -5647,6 +5654,8 @@ function commandHomeConversation(spec: CommandSpec): string | null {
  * thirty seconds away — or, if the tab is gone, never.
  */
 let placementCollector: string | null = null;
+const WORKER_PLACEMENT_BROWSER_LEASE_MS = 60_000;
+let workerPlacementBrowser: { id: string; seenAt: number } | null = null;
 
 /** Transfer opening authority through the companion while it has a live wake connection. */
 function offerPlacement(command: Command): boolean {
@@ -5677,6 +5686,57 @@ function pendingBrowserPlacement(conversationId: string | null): {
     active: !worker, homeConversationId: placement.conversationId, project: commandProject(command),
     ...(placement.background ? { background: true as const } : {})
   };
+}
+
+/**
+ * Browser-maintenance handout for worker openings.
+ *
+ * Several Chrome profiles can run this companion at the same time. Before the browser reported
+ * an identity, every status poll raced for every background worker. Four workers could
+ * therefore become four tabs spread across several Chrome windows/profiles even though each
+ * individual extension correctly reused its own background window.
+ *
+ * A worker whose prime chat is known belongs to the browser that actually reports that prime
+ * open. An unattributed prime has no such anchor, so pin that run of handouts to the first live
+ * browser instance for a short renewable lease. The id is browser-session metadata only; it is
+ * not authentication and grants no access to command text.
+ */
+function pendingBrowserPlacementForStatus(
+  openConversations: Set<string>,
+  browserPlacementId: string | null
+): ReturnType<typeof pendingBrowserPlacement> {
+  // Backward-compatible read-only status probes have no browser identity or open-tab inventory.
+  // They keep the old handout behavior; current companions use POST and are fenced below.
+  if (!browserPlacementId && openConversations.size === 0) return pendingBrowserPlacement(null);
+
+  const targeted = commands.find(entry =>
+    entry.owner === null &&
+    entry.placement &&
+    entry.spec.type === 'worker' &&
+    !!entry.placement.conversationId &&
+    openConversations.has(entry.placement.conversationId)
+  );
+  if (targeted?.placement) return pendingBrowserPlacement(targeted.placement.conversationId);
+
+  const unattributed = commands.some(entry =>
+    entry.owner === null &&
+    entry.placement &&
+    entry.spec.type === 'worker' &&
+    entry.placement.conversationId === null
+  );
+  if (!unattributed) return null;
+
+  // GET is retained for old companion/tests. Current companions POST a browser id and therefore
+  // get the anti-scatter lease below.
+  if (!browserPlacementId) return pendingBrowserPlacement(null);
+
+  const now = Date.now();
+  if (!workerPlacementBrowser || now - workerPlacementBrowser.seenAt > WORKER_PLACEMENT_BROWSER_LEASE_MS) {
+    workerPlacementBrowser = { id: browserPlacementId, seenAt: now };
+  }
+  if (workerPlacementBrowser.id !== browserPlacementId) return null;
+  workerPlacementBrowser.seenAt = now;
+  return pendingBrowserPlacement(null);
 }
 
 // -------------------------------------------------------- exact browser recovery
@@ -9097,6 +9157,7 @@ export function resetBridgeForTests(): void {
   if (browserLaunchTimer) clearTimeout(browserLaunchTimer);
   browserLaunchTimer = null;
   lastBrowserLaunchAt = 0;
+  workerPlacementBrowser = null;
   lastSeenAt = null;
   extensionVersion = null;
   versionWarned = false;

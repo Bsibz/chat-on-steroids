@@ -5777,6 +5777,84 @@ describe('targeted open', () => {
 // ------------------------------------------------------- worker bootstrap failure
 
 describe('a worker chat that never opens', () => {
+  it('hands attributed workers only to the browser that reports the prime chat open', async () => {
+    await pair();
+    const prime = 'abababab-1111-4222-8333-555555555555';
+    const config = getConfig();
+    await saveConfig({ ...config, ui: { ...config.ui, backgroundChats: true } });
+    await request('GET', '/status');
+    const socket = new WebSocket(base.replace('http:', 'ws:') + '/wake', { origin: EXTENSION_ORIGIN });
+    await once(socket, 'open');
+    const authenticated = once(socket, 'message'); socket.send(token!); await authenticated;
+    try {
+      spawn({ workers: [{ task: 'stay with prime browser' }], caller: { conversationId: prime } });
+      await vi.waitFor(async () => {
+        const wrong = await request('POST', '/status', { body: {
+          openConversations: [],
+          stalledConversations: [],
+          browserPlacementId: 'browser-profile-wrong-0001'
+        } });
+        expect(wrong.body.placement).toBeNull();
+
+        const right = await request('POST', '/status', { body: {
+          openConversations: [prime],
+          stalledConversations: [],
+          browserPlacementId: 'browser-profile-prime-0001'
+        } });
+        expect(right.body.placement).toMatchObject({
+          homeConversationId: prime,
+          background: true
+        });
+      });
+    } finally { const closed = once(socket, 'close'); socket.close(); await closed; }
+  });
+
+  it('pins unattributed worker openings to one browser profile lease', async () => {
+    await pair();
+    const config = getConfig();
+    await saveConfig({ ...config, ui: { ...config.ui, backgroundChats: true } });
+    await request('GET', '/status');
+    const socket = new WebSocket(base.replace('http:', 'ws:') + '/wake', { origin: EXTENSION_ORIGIN });
+    await once(socket, 'open');
+    const authenticated = once(socket, 'message'); socket.send(token!); await authenticated;
+    try {
+      spawn({
+        workers: [{ task: 'unattributed one' }, { task: 'unattributed two' }],
+        caller: { requestId: 'wfr_unattributed_worker_profile_lease' }
+      });
+      let first!: Reply;
+      await vi.waitFor(async () => {
+        first = await request('POST', '/status', { body: {
+          openConversations: [],
+          stalledConversations: [],
+          browserPlacementId: 'browser-profile-owner-0001'
+        } });
+        expect(first.body.placement?.id).toBeTruthy();
+      });
+      expect(first.body.placement?.id).toBeTruthy();
+      expect(first.body.placement?.homeConversationId).toBeNull();
+
+      const other = await request('POST', '/status', { body: {
+        openConversations: [],
+        stalledConversations: [],
+        browserPlacementId: 'browser-profile-other-0001'
+      } });
+      expect(other.body.placement).toBeNull();
+
+      let second!: Reply;
+      await vi.waitFor(async () => {
+        second = await request('POST', '/status', { body: {
+          openConversations: [],
+          stalledConversations: [],
+          browserPlacementId: 'browser-profile-owner-0001'
+        } });
+        expect(second.body.placement?.id).toBeTruthy();
+      });
+      expect(second.body.placement?.id).toBeTruthy();
+      expect(second.body.placement.id).not.toBe(first.body.placement.id);
+    } finally { const closed = once(socket, 'close'); socket.close(); await closed; }
+  });
+
   it.each([true, false])('places two workers once through the companion with background window=%s', async (backgroundChats) => {
     await pair();
     const config = getConfig();

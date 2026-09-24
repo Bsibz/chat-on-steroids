@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.17] — Exact fresh-chat destination routing
+
+- After restoring the exact source conversation for Night Build New Chat, derive the fresh destination from that source URL instead of depending on ChatGPT's Project UI controls.
+- Project sources open one fresh tab at that exact Project-home route; ordinary sources open one root fresh tab. Unknown source routes remain queued rather than guessing.
+- Reserve destination-opening authority before Chrome creates the tab so a lost create reply cannot duplicate a fresh conversation.
+
+The stable unpacked extension path is unchanged; an existing install only needs the normal extension reload after the app refreshes it.
+
 ## [2.1.16] — Native Chat fresh-chat reliability
 
 - Let an explicit Night Build New Chat open exactly its recorded source conversation when that source is not already open, then derive Project placement from the provider-owned source route.

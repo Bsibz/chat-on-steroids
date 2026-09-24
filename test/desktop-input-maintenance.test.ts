@@ -192,29 +192,25 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
 }
 
 describe('one browser maintenance flight per desktop outbox publication', () => {
-  it('opens a fresh Project chat only through the exact source document and carries that Project into Send', async () => {
+  it('derives one exact Project-home fresh tab from the exact source route and carries that Project into Send', async () => {
     const project = 'g-p-11111111222233334444555555555555';
     const input = { id: firstId, conversationId: null, freshSourceConversationId: secondId };
     const h = await worker([input]);
     h.tabs.push({ id: 8, url: `https://chatgpt.com/g/${project}-night-build/c/${secondId}` });
     await h.authorizeDocument({ tab: { id: 8 }, documentId: 'project-source', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
-    h.sendMessage.mockImplementation(async (tabId, message): Promise<any> => {
-      if (message.type === 'clf-input-reuse-state') return { safe: true, navigationEpoch: 1 };
-      if (message.type === 'clf-prepare-desktop-input') {
-        expect(tabId).toBe(8);
-        expect(message).toMatchObject({
-          freshSourceConversationId: secondId,
-          freshProjectId: project
-        });
-        h.tabs[0]!.url = `https://chatgpt.com/g/${project}-night-build/project?cos-input=${firstId}#cos-input=${firstId}`;
-        return { ready: true };
-      }
-      return { ok: true };
-    });
     await h.maintain();
-    expect(h.create).not.toHaveBeenCalled();
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: `https://chatgpt.com/g/${project}-night-build/project?cos-input=${firstId}#cos-input=${firstId}`
+    }));
+    const destination = h.tabs.find(tab => tab.id !== 8)!;
+    destination.url = destination.pendingUrl;
+    delete destination.pendingUrl;
+    await h.authorizeDocument({ tab: { id: destination.id }, documentId: 'project-fresh', frameId: 0, url: destination.url }, { navigationEpoch: 1 });
+    h.sendMessage.mockClear();
+    await h.maintain();
     expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
-      [8, { type: 'clf-desktop-input', id: firstId, conversationId: null, freshProjectId: project }]
+      [destination.id, { type: 'clf-desktop-input', id: firstId, conversationId: null, freshProjectId: project }]
     ]);
   });
 

@@ -1956,65 +1956,43 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
         navigationEpoch: tabEpochs[String(sourceTab.id)]
       };
       if (!documentId || !ownsDocument(source)) continue;
-      const proof = await inputReuseProbe(sourceTab.id, documentId);
       const current = await chrome.tabs.get(sourceTab.id).catch(() => null);
-      if (proof?.safe !== true || proof.navigationEpoch !== source.navigationEpoch ||
-          !ownsDocument(source) || !current || current.pendingUrl ||
-          conversationForTab(current) !== freshSource) continue;
+      if (!ownsDocument(source) || !current || current.pendingUrl || conversationForTab(current) !== freshSource) continue;
       const freshProjectId = projectFromUrl(current.url);
-      if (!elected) {
-        await elect(input.id, {
-          tab: sourceTab.id,
-          stage: 'preparing',
-          sourceConversationId: freshSource,
-          ...(freshProjectId ? { freshProjectId } : {})
-        });
-        elected = elections[input.id];
-      }
-      const prepared = await prepareDesktopInputReceipt(
-        sourceTab.id,
-        input.id,
-        documentId,
-        freshSource,
-        freshProjectId
-      );
-      const latest = await chrome.tabs.get(sourceTab.id).catch(() => null);
-      if (!latest || latest.pendingUrl || tabDocuments[String(sourceTab.id)] !== documentId) continue;
-      if (prepared?.ready === true && matchesInput(input, latest)) {
-        await elect(input.id, {
-          tab: sourceTab.id,
-          stage: 'ready',
-          sourceConversationId: freshSource,
-          ...(freshProjectId ? { freshProjectId } : {})
-        });
-        offerDesktopInput(sourceTab.id, {
-          type: 'clf-desktop-input',
-          id: input.id,
-          conversationId: null,
-          ...(freshProjectId ? { freshProjectId } : {})
-        });
-        continue;
-      }
-      if (prepared?.fallback === true && prepared.preSend === true && !freshProjectId) {
-        // Root chat only: the existing one-shot fallback remains safe. A Project source never
-        // reaches this path, because losing Project placement is worse than waiting queued.
-        await elect(input.id, {
-          tab: null,
-          stage: 'opening',
-          sourceConversationId: freshSource,
-          fallbackUsed: true
-        });
-        const url = `https://chatgpt.com/?${marker}#${marker}`;
-        const replacement = await createChatTab(url, background);
-        await protectCreatedTab(replacement);
-        await elect(input.id, {
-          tab: replacement.id,
-          stage: 'ready',
-          sourceConversationId: freshSource,
-          fallbackUsed: true
-        });
-        tabs.push(replacement);
-      }
+      let destination = null;
+      try {
+        const sourceUrl = new URL(current.url);
+        const sourcePath = sourceUrl.pathname;
+        const root = /^\/c\/([0-9a-f-]{8,64})\/?$/i.exec(sourcePath);
+        const project = /^\/g\/((g-p-[0-9a-f]{32})(?:-[^/]*)?)\/c\/([0-9a-f-]{8,64})\/?$/i.exec(sourcePath);
+        if (root && cleanConversationId(root[1]) === freshSource) {
+          destination = new URL('/', sourceUrl.origin);
+        } else if (project && cleanConversationId(project[3]) === freshSource &&
+            project[2].toLowerCase() === freshProjectId) {
+          destination = new URL(`/g/${project[1]}/project`, sourceUrl.origin);
+        }
+      } catch { /* Exact source route remains queued until it can be proved. */ }
+      if (!destination) continue;
+      destination.searchParams.set('cos-input', input.id);
+      destination.hash = marker;
+      // Reserve the single destination-opening act before touching Chrome. A lost create reply,
+      // closed source, or service-worker restart therefore cannot multiply fresh chats.
+      if (elected?.stage === 'destination-opening') continue;
+      await elect(input.id, {
+        tab: null,
+        stage: 'destination-opening',
+        sourceConversationId: freshSource,
+        ...(freshProjectId ? { freshProjectId } : {})
+      });
+      const replacement = await createChatTab(destination.href, background);
+      await protectCreatedTab(replacement);
+      await elect(input.id, {
+        tab: replacement.id,
+        stage: 'ready',
+        sourceConversationId: freshSource,
+        ...(freshProjectId ? { freshProjectId } : {})
+      });
+      tabs.push(replacement);
       continue;
     }
     // A fresh app offer can follow a session rebind or the user's actual return.

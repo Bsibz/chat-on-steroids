@@ -78,9 +78,9 @@
    * identity and inner message model intact. A tag-qualified selector turns that harmless
    * presentation refactor into a completely empty canonical transcript.
    */
-  const TURN_SECTION = '[data-testid^="conversation-turn"]';
+  const TURN_SECTION = '[data-testid^="conversation-turn"], [data-content-search-turn-key]';
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
-  const MARKDOWN = '.markdown';
+  const MARKDOWN = '.markdown, [data-markdown-text-style="assistant-message"]';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
   const GENERATED_IMAGE = '[class~="group/imagegen-image"] img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
@@ -134,9 +134,9 @@
     }
     return {
       shells: Math.min(9999, shells.length),
-      roleNodes: boundedCount('[data-message-author-role]'),
-      turnAttrs: boundedCount('[data-turn]'),
-      turnIds: boundedCount('[data-turn-id]'),
+      roleNodes: boundedCount('[data-message-author-role], [data-chatgpt-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":assistant"]'),
+      turnAttrs: boundedCount('[data-turn], [data-content-search-turn-key]'),
+      turnIds: boundedCount('[data-turn-id], [data-chatgpt-search-unit-key]'),
       markdown: boundedCount(MARKDOWN),
       fibers: Math.min(9999, fibers),
       models: Math.min(9999, models),
@@ -841,8 +841,8 @@
       let id = null;
       let rowMessage = null;
       try {
-        const holder = block.closest && block.closest('[data-message-id]');
-        id = holder ? str(holder.getAttribute('data-message-id')) : null;
+        const holder = block.closest && block.closest('[data-message-id], [data-chatgpt-selection-message-id]');
+        id = holder ? str(holder.getAttribute('data-message-id') || holder.getAttribute('data-chatgpt-selection-message-id')) : null;
       } catch {
         id = null;
       }
@@ -1499,7 +1499,7 @@
     const groups = [];
     for (let at = 0; at < sections.length; at++) {
       const section = sections[at];
-      const id = str(section.getAttribute('data-turn-id'));
+      const id = str(section.getAttribute('data-turn-id') || section.getAttribute('data-content-search-turn-key'));
       const previous = groups[groups.length - 1];
       if (id && previous && previous.turnId === id) previous.sections.push(section);
       else groups.push({ turnId: id, sections: [section] });
@@ -1579,7 +1579,14 @@
         // it after the scan, so a stable scan produces no attribute mutation at all.
         for (let sectionAt = 0; sectionAt < group.sections.length; sectionAt++) {
           const stamped = group.sections[sectionAt];
-          if (stamped) desiredTurnStamps.set(stamped, `${scanToken}:${index}`);
+          if (!stamped) continue;
+          desiredTurnStamps.set(stamped, `${scanToken}:${index}`);
+          // The September 2026 renderer nests separate user/assistant authored units under
+          // one content-search turn root. The isolated-world lifecycle addresses those units,
+          // so stamp them with the same canonical turn descriptor as their shared root.
+          for (const unit of stamped.querySelectorAll?.('[data-chatgpt-search-unit-key]') || []) {
+            desiredTurnStamps.set(unit, `${scanToken}:${index}`);
+          }
         }
         if (!conversation.conflict) for (const [node, id] of exactAnchors) {
           desiredMessageStamps.set(node, `${scanToken}:${index}:${encodeURIComponent(id)}`);
@@ -1606,7 +1613,7 @@
       const section = sections[at];
       try {
         if (!section || !section.getAttribute) continue;
-        for (const node of section.querySelectorAll('[data-clf-fiber-message], .markdown')) {
+        for (const node of section.querySelectorAll(`[data-clf-fiber-message], ${MARKDOWN}`)) {
           const wantedMessage = desiredMessageStamps.get(node);
           const currentMessage = node.getAttribute('data-clf-fiber-message');
           if (wantedMessage === undefined) {
@@ -1627,12 +1634,18 @@
             if (currentImage !== null) node.removeAttribute('data-clf-fiber-image');
           } else if (currentImage !== wantedImage) node.setAttribute('data-clf-fiber-image', wantedImage);
         }
-        const wanted = desiredTurnStamps.get(section);
-        const current = section.getAttribute('data-clf-fiber-turn');
-        if (wanted === undefined) {
-          if (current !== null && section.removeAttribute) section.removeAttribute('data-clf-fiber-turn');
-        } else if (current !== wanted && section.setAttribute) {
-          section.setAttribute('data-clf-fiber-turn', wanted);
+        const stampNodes = [section, ...section.querySelectorAll('[data-chatgpt-search-unit-key], [data-clf-fiber-turn]')];
+        const seenStampNodes = new Set();
+        for (const stamped of stampNodes) {
+          if (!stamped || seenStampNodes.has(stamped)) continue;
+          seenStampNodes.add(stamped);
+          const wanted = desiredTurnStamps.get(stamped);
+          const current = stamped.getAttribute('data-clf-fiber-turn');
+          if (wanted === undefined) {
+            if (current !== null && stamped.removeAttribute) stamped.removeAttribute('data-clf-fiber-turn');
+          } else if (current !== wanted && stamped.setAttribute) {
+            stamped.setAttribute('data-clf-fiber-turn', wanted);
+          }
         }
       } catch {
         // One hostile/stale DOM node must not cost the remaining turns their evidence.

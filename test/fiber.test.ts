@@ -279,6 +279,7 @@ interface TurnFixture {
   id: string;
   messages: Message[];
   tag?: 'section' | 'article' | 'div';
+  searchRenderer?: boolean;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
   rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string }>;
@@ -324,9 +325,13 @@ async function scan(
   const document = window.document;
 
   for (const turn of turnSections) {
-    const section = document.createElement(turn.tag ?? 'section');
-    section.setAttribute('data-testid', 'conversation-turn-2');
-    if (turn.id) section.setAttribute('data-turn-id', turn.id);
+    const section = document.createElement(turn.searchRenderer ? 'div' : (turn.tag ?? 'section'));
+    if (turn.searchRenderer) {
+      section.setAttribute('data-content-search-turn-key', turn.id);
+    } else {
+      section.setAttribute('data-testid', 'conversation-turn-2');
+      if (turn.id) section.setAttribute('data-turn-id', turn.id);
+    }
     if (turn.staleStamp !== undefined) section.setAttribute('data-clf-fiber-turn', turn.staleStamp);
     if (turn.rect) section.getBoundingClientRect = () => {
       if (turn.rect === 'throw') throw new Error('unavailable geometry');
@@ -336,9 +341,24 @@ async function scan(
       turn.messages,
       turn.conversationProps
     );
+    let renderedHost: Element = section;
+    if (turn.searchRenderer) {
+      const assistantIds = turn.messages
+        .filter(message => message?.author?.role === 'assistant' && typeof message.id === 'string')
+        .map(message => message.id as string);
+      const unit = document.createElement('div');
+      unit.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:2:assistant`);
+      if (assistantIds.length) unit.setAttribute('data-chatgpt-search-message-ids', assistantIds.join(' '));
+      const selection = document.createElement('div');
+      if (assistantIds.length === 1) selection.setAttribute('data-chatgpt-selection-message-id', assistantIds[0]!);
+      unit.append(selection);
+      section.append(unit);
+      renderedHost = selection;
+    }
     for (const entry of turn.rendered ?? []) {
       const block = document.createElement('div');
-      block.className = 'markdown';
+      if (turn.searchRenderer) block.setAttribute('data-markdown-text-style', 'assistant-message');
+      else block.className = 'markdown';
       if (typeof entry === 'string') block.textContent = entry;
       else {
         block.innerHTML = entry.html;
@@ -347,7 +367,7 @@ async function scan(
         if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
         if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
       }
-      section.append(block);
+      renderedHost.append(block);
     }
     for (const entry of turn.activities ?? []) {
       const row = document.createElement('span');
@@ -410,13 +430,16 @@ async function scan(
     observer.disconnect();
   }
   const stamps = elements.map((row) => row.getAttribute('data-clf-fiber'));
-  const messageStamps = [...document.querySelectorAll('.markdown')].map(node => node.getAttribute('data-clf-fiber-message'));
+  const messageStamps = [...document.querySelectorAll('.markdown, [data-markdown-text-style="assistant-message"]')]
+    .map(node => node.getAttribute('data-clf-fiber-message'));
   const thoughtStamps = [...document.querySelectorAll('[data-clf-fiber-thought], .group\\/tool-message')]
-    .filter(node => node.closest('[data-testid^="conversation-turn-"]'))
+    .filter(node => node.closest('[data-testid^="conversation-turn-"], [data-content-search-turn-key]'))
     .map(node => node.getAttribute('data-clf-fiber-thought'));
   const imageStamps = [...document.querySelectorAll('.group\\/imagegen-image img')]
     .map(node => node.getAttribute('data-clf-fiber-image'));
-  const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
+  const turnStamps = [...document.querySelectorAll(
+    '[data-testid^="conversation-turn-"], [data-content-search-turn-key], [data-chatgpt-search-unit-key]'
+  )].map((section) =>
     section.getAttribute('data-clf-fiber-turn')
   );
   dom.window.close();
@@ -788,6 +811,41 @@ describe('the calls a turn says it made', () => {
       });
     }
   );
+
+  it('reads the September content-search turn root and authored assistant block', async () => {
+    const publicText = 'The current renderer still exposes canonical page-model prose.';
+    const { turns, diagnostics, turnStamps, messageStamps } = await scan([], [{
+      id: 'fallback-turn-7',
+      searchRenderer: true,
+      messages: [authored('assistant-search-message', publicText)],
+      rendered: [publicText]
+    }]);
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      turnId: 'fallback-turn-7',
+      messages: [
+        expect.objectContaining({
+          rawMessageId: 'assistant-search-message',
+          role: 'assistant',
+          rawText: publicText
+        })
+      ]
+    });
+    expect(diagnostics).toMatchObject({
+      shells: 1,
+      roleNodes: 1,
+      turnAttrs: 1,
+      turnIds: 1,
+      markdown: 1,
+      fibers: 1,
+      models: 1,
+      modelMessages: 1,
+      minModelDepth: 0
+    });
+    expect(turnStamps).toEqual(['test-nonce:0', 'test-nonce:0']);
+    expect(messageStamps).toEqual(['test-nonce:0:assistant-search-message']);
+  });
 
   it('takes canonical assistant identity and raw Markdown from the public text message model, not Markdown-node cardinality', async () => {
     const publicText = '**One** canonical update with `code`.';

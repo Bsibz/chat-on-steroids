@@ -133,7 +133,7 @@ describe('extension release metadata', () => {
 
 // ---------------------------------------------------------------------- DOM
 
-const TURN_SELECTOR = '[data-testid^="conversation-turn"]';
+const TURN_SELECTOR = '[data-testid^="conversation-turn"], [data-chatgpt-search-unit-key]';
 const TOOL_SELECTOR = 'span[class*="tool-message"]';
 
 class FakeNode {
@@ -229,6 +229,21 @@ function turn(role: 'user' | 'assistant', id: string): FakeNode {
   return new FakeNode({ 'data-testid': 'conversation-turn-1', 'data-turn': role, 'data-turn-id': id });
 }
 
+function searchUnit(role: 'user' | 'assistant', turnIndex: number, messageId: string, value: string): FakeNode {
+  const unitIndex = role === 'user' ? 0 : 2;
+  const unit = new FakeNode({
+    'data-chatgpt-search-unit-key': `fallback-turn-${turnIndex}:${unitIndex}:${role}`,
+    'data-chatgpt-search-message-ids': messageId
+  });
+  const authored = new FakeNode({}, value);
+  return unit.with(
+    role === 'user'
+      ? '[data-markdown-text-tone="user-message"]'
+      : '[data-markdown-text-style="assistant-message"]',
+    [authored]
+  );
+}
+
 describe('ChatGPT DOM adapter', () => {
   const CONVERSATION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
@@ -282,6 +297,21 @@ describe('ChatGPT DOM adapter', () => {
     expect(assistant.id).toBe('request-1');
     expect(assistant.nodes).toEqual([a1, a2]);
     expect(dom.toolBlocks(assistant)).toHaveLength(5);
+  });
+
+  it('reads the September search-unit renderer when legacy turn/message attributes are absent', () => {
+    const user = searchUnit('user', 7, 'user-search-message', 'Ship the fix.');
+    const assistant = searchUnit('assistant', 7, 'assistant-search-message', 'Locked in.');
+    const dom = loadDom([user, assistant]);
+
+    expect(dom.turns()).toMatchObject([
+      { id: 'fallback-turn-7:0:user', role: 'user', node: user, nodes: [user] },
+      { id: 'fallback-turn-7:2:assistant', role: 'assistant', node: assistant, nodes: [assistant] }
+    ]);
+    expect(dom.messages()).toMatchObject([
+      { id: 'user-search-message', role: 'user', text: 'Ship the fix.', turnId: 'fallback-turn-7:0:user' },
+      { id: 'assistant-search-message', role: 'assistant', text: 'Locked in.', turnId: 'fallback-turn-7:2:assistant' }
+    ]);
   });
 
   /**

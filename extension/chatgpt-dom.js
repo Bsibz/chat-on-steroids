@@ -28,7 +28,26 @@ var CLF_DOM = (() => {
   // independently). The data-testid is the durable page contract we actually consume;
   // hard-qualifying the tag makes the entire recorder see an empty transcript whenever
   // the wrapper tag changes while all message data is still present.
-  const TURN = '[data-testid^="conversation-turn"]';
+  const LEGACY_TURN = '[data-testid^="conversation-turn"]';
+  // September 2026 renderer: one authored unit per role, nested under
+  // [data-content-search-turn-key]. The old conversation-turn/data-message-* surface can be
+  // absent wholesale while these exact page-owned ids remain mounted.
+  const SEARCH_UNIT = '[data-chatgpt-search-unit-key]';
+  const TURN = `${LEGACY_TURN}, ${SEARCH_UNIT}`;
+  const ASSISTANT_AUTHORED = '.markdown, [data-markdown-text-style="assistant-message"]';
+  const USER_AUTHORED = '[data-markdown-text-tone="user-message"]';
+  function assistantAuthoredNodes(node) {
+    const out = [];
+    const seen = new Set();
+    for (const selector of ['.markdown', '[data-markdown-text-style="assistant-message"]']) {
+      for (const part of node.querySelectorAll(selector)) {
+        if (seen.has(part)) continue;
+        seen.add(part);
+        out.push(part);
+      }
+    }
+    return out;
+  }
   // ChatGPT has used both shapes in the live renderer: the older tool-message span
   // and, as of 2026-08-15, a display-contents row wrapping the visible tool label.
   // Keep both explicit structural anchors; hashed CSS-module names remain off limits.
@@ -74,12 +93,22 @@ var CLF_DOM = (() => {
   }
   function presentUserPrompts(readUserText) {
     return safe(() => {
-      for (const raw of document.querySelectorAll('[data-message-author-role="user"] :is(.whitespace-pre-wrap, .markdown):not([data-clf-user-text])')) {
+      for (const raw of document.querySelectorAll(
+        '[data-message-author-role="user"] :is(.whitespace-pre-wrap, .markdown):not([data-clf-user-text]), ' +
+        '[data-chatgpt-search-unit-key$=":user"] [data-markdown-text-tone="user-message"]:not([data-clf-user-text])'
+      )) {
         // Both native renderers can consume Markdown bytes. Parse the same
         // exact-id source used by receipts/recording, never reconstructed HTML.
-        const holder = raw.closest('[data-message-author-role="user"]');
-        const source = readUserText ? readUserText({ role: 'user', id: holder?.getAttribute('data-message-id'),
-          node: raw.closest(TURN), text: messageText(holder, 'user') }) : raw.textContent;
+        const holder = raw.closest('[data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"]');
+        const searchIds = holder?.getAttribute('data-chatgpt-search-message-ids')?.trim().split(/\s+/).filter(Boolean) || [];
+        const uniqueSearchIds = [...new Set(searchIds)];
+        const searchId = uniqueSearchIds.length === 1 ? uniqueSearchIds[0] : null;
+        const source = readUserText ? readUserText({
+          role: 'user',
+          id: holder?.getAttribute('data-message-id') || searchId,
+          node: raw.closest(TURN),
+          text: messageText(holder, 'user')
+        }) : raw.textContent;
         // The native editor can prepend a blank paragraph to the exact provider
         // source. Ignore that outer whitespace only for display; the frame's
         // internal length/boundary and all receipt/recording bytes stay exact.
@@ -179,6 +208,15 @@ var CLF_DOM = (() => {
     return safe(() => {
       if (!node) return '';
       if (role === 'user') {
+        const authored = [...node.querySelectorAll(USER_AUTHORED)]
+          .filter((part) => {
+            const outer = part.parentElement && part.parentElement.closest && part.parentElement.closest(USER_AUTHORED);
+            return !outer || outer === node || !(node.contains && node.contains(outer));
+          })
+          .filter(part => !part.hasAttribute?.('data-clf-user-text'))
+          .map((part) => text(part))
+          .filter(Boolean);
+        if (authored.length > 0) return authored.join('\n');
         // Only blocks that nothing else here already contains. `querySelectorAll` also
         // returns a match nested inside an earlier match, and `text()` reads a whole
         // subtree, so an inner block was read twice: once as part of its container and
@@ -198,9 +236,13 @@ var CLF_DOM = (() => {
         if (parts.length > 0) return parts.join('\n');
       }
       if (role === 'assistant') {
-        const parts = [...node.querySelectorAll('.markdown')]
+        const parts = assistantAuthoredNodes(node)
           .filter((part) => !(part.closest && part.closest('[data-interrupted]')))
           .filter((part) => !(part.closest && part.closest(TOOL)))
+          .filter((part) => {
+            const outer = part.parentElement && part.parentElement.closest && part.parentElement.closest(ASSISTANT_AUTHORED);
+            return !outer || outer === node || !(node.contains && node.contains(outer));
+          })
           .map((part) => text(part))
           .filter(Boolean);
         if (parts.length > 0) return parts.join('\n\n');
@@ -277,7 +319,7 @@ var CLF_DOM = (() => {
         for (const row of clone.querySelectorAll(TOOL)) row.remove();
         authored = text(clone);
       } else {
-        authored = [...node.querySelectorAll('.markdown')]
+        authored = assistantAuthoredNodes(node)
           .filter((part) => !(part.closest && (part.closest(TOOL) || part.closest(OWN_SURFACES))))
           .map((part) => text(part))
           .join('\n');
@@ -392,6 +434,11 @@ var CLF_DOM = (() => {
     'data-turn',
     'data-turn-id',
     'data-testid',
+    'data-chatgpt-search-unit-key',
+    'data-chatgpt-search-message-ids',
+    'data-content-search-unit-key',
+    'data-markdown-text-style',
+    'data-markdown-text-tone',
     'aria-label'
   ];
 
@@ -450,6 +497,15 @@ var CLF_DOM = (() => {
       const readable = roleAttr === 'user' || roleAttr === 'assistant';
       rows.push({ id, roleAttr, text: readable ? messageText(node, roleAttr) : null, node });
     }
+    if (rows.length === 0) {
+      const key = section.getAttribute?.('data-chatgpt-search-unit-key') || '';
+      const role = /:(user|assistant)$/.exec(key)?.[1] || '';
+      const ids = (section.getAttribute?.('data-chatgpt-search-message-ids') || '').trim().split(/\s+/).filter(Boolean);
+      const unique = [...new Set(ids)].filter(id => id.length <= 200);
+      if ((role === 'user' || role === 'assistant') && unique.length === 1) {
+        rows.push({ id: unique[0], roleAttr: role, text: messageText(section, role), node: section });
+      }
+    }
     if (memo) memo.rows = rows;
     return rows;
   }
@@ -459,7 +515,7 @@ var CLF_DOM = (() => {
     const memo = memoOf(section);
     if (memo && memo.parts) return memo.parts;
     const parts = [];
-    for (const markdown of section.querySelectorAll('.markdown')) {
+    for (const markdown of assistantAuthoredNodes(section)) {
       if (markdown.closest && markdown.closest('[data-interrupted]')) continue;
       if (markdown.closest && markdown.closest(TOOL)) continue;
       if (markdown.closest && markdown.closest(OWN_SURFACES)) continue;
@@ -475,8 +531,13 @@ var CLF_DOM = (() => {
       const out = [];
       let previous = null;
       for (const node of document.querySelectorAll(TURN)) {
-        const id = node.getAttribute('data-turn-id');
-        const role = node.getAttribute('data-turn');
+        const searchKey = node.getAttribute('data-chatgpt-search-unit-key');
+        const id = node.getAttribute('data-turn-id') || searchKey;
+        const role = node.getAttribute('data-turn') || (/:(user|assistant)$/.exec(searchKey || '')?.[1] ?? null);
+        // Legacy turn shells can be role-less while their explicit message rows carry the
+        // authored role. Current search units encode it in their own key, so an unfamiliar
+        // search-unit suffix is not a turn we can safely classify.
+        if (searchKey && role !== 'user' && role !== 'assistant') continue;
         if (previous && id && previous.id === id && previous.role === role) {
           previous.nodes.push(node);
           continue;

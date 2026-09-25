@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.24] — ChatGPT virtualized turn model
+
+- Recover the canonical turn model from ChatGPT's provider-owned outer `data-turn-key` Fiber when the nested search-unit renderer has its own Fiber branch with no turn messages.
+- Preserve the legacy inner-branch path whenever it still exposes the model, so older renderer buckets keep their existing trust and attribution behavior.
+- Add bounded inner-vs-outer Fiber diagnostics for future renderer drift without crossing message text, ids, props, URLs or model objects.
+
+Reload the existing unpacked companion after updating so Chrome runs the new Fiber fallback.
+
 ## [2.1.23] — ChatGPT search-unit renderer
 
 - Follow ChatGPT's September search-unit renderer when the legacy `conversation-turn`, `data-message-*`, and `.markdown` anchors are absent.

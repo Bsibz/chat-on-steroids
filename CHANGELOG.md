@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.26] — Fiber diagnostic continuity
+
+- Preserve the bounded inner-vs-outer page-model diagnostic when the outer wrapper has no readable model and therefore correctly reports `outerMinModelDepth=-1`.
+- Fix the diagnostic validator so the empty outer-model case reaches the app instead of collapsing the entire structure report to `null`.
+- Keep recorder and Fiber helper protocols unchanged; this release only repairs the diagnostic path needed to finish the current ChatGPT renderer migration safely.
+
+Reload the existing unpacked companion after updating so current tabs run the corrected content script.
+
 ## [2.1.25] — Fiber helper protocol refresh
 
 - Move the private MAIN-world Fiber helper protocol from v13 to v14 so a renderer-fix build cannot be silently shadowed by an already-mounted older helper that intentionally deduplicates same-version listeners.

@@ -3543,7 +3543,7 @@
           let valid = true;
           for (const key of keys) {
             const value = data.diagnostics[key];
-            const minimum = key === 'minModelDepth' ? -1 : 0;
+            const minimum = key === 'minModelDepth' || key === 'outerMinModelDepth' ? -1 : 0;
             if (!Number.isInteger(value) || value < minimum || value > 9999) { valid = false; break; }
             candidate[key] = value;
           }

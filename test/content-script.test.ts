@@ -10958,9 +10958,9 @@ describe('evidence from the page context', () => {
       minModelDepth: -1,
       outerShells: 7,
       outerFibers: 7,
-      outerModels: 3,
-      outerModelMessages: 21,
-      outerMinModelDepth: 2
+      outerModels: 0,
+      outerModelMessages: 0,
+      outerMinModelDepth: -1
     };
 
     await replyFiber([], [], null, true, null, false, diagnostics);
@@ -10970,7 +10970,7 @@ describe('evidence from the page context', () => {
     expect(live.sent.filter((message) => message.type === 'activity').at(-1)).toMatchObject({
       fiber: 'empty',
       fiberDiag: '7,7,7,6,5,7,0,0,-1',
-      fiberOuterDiag: '7,7,3,21,2'
+      fiberOuterDiag: '7,7,0,0,-1'
     });
   });
 

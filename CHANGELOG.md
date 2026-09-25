@@ -9,6 +9,16 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.23] — ChatGPT search-unit renderer
+
+- Follow ChatGPT's September search-unit renderer when the legacy `conversation-turn`, `data-message-*`, and `.markdown` anchors are absent.
+- Recover provider-owned user/assistant roles and message ids from the new search-unit surface while keeping canonical message text and request identity in the MAIN-world page model.
+- Stamp the new authored units with their exact page-model turn descriptor so Native Chat lifecycle, Stop, transcript recording, and attribution keep using the same fail-closed DOM↔Fiber join.
+- Preserve bounded page-model structural diagnostics through conversation filtering, so future renderer drift reports the actual missing layer instead of a generic empty helper.
+- Fail closed on an invalid explicitly configured tunnel binary path instead of silently substituting another binary.
+
+Reload the existing unpacked companion after updating so Chrome runs the new renderer adapter.
+
 ## [2.1.22] — ChatGPT turn-shell drift
 
 - Make ChatGPT conversation-turn discovery tag-agnostic. Native Chat recording now follows the stable `data-testid="conversation-turn-*"` contract instead of assuming the current renderer uses a `section` wrapper.

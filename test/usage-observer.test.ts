@@ -136,6 +136,18 @@ describe('MAIN-world usage projection', () => {
       { type: 'cos-request-origin', conversationId: conversation_id, requestIds: [request_id], observedAt: expect.any(Number) }
     ]);
   });
+  it('accepts a native-stream envelope whose outer payload owns the conversation while the inner event carries only metadata', () => {
+    const h = harness(), socket = h.socket();
+    const conversation_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const request_id = 'f00d06c4-a735-4c02-8dba-9f2f50e4f82d';
+    const frame = `data: ${JSON.stringify({ type: 'delta', payload: { message: { metadata: { request_id } } } })}\n\n`;
+    socket.receive([{ type: 'message', payload: { type: 'conversation-turn-stream', payload: {
+      type: 'stream-item', conversation_id, encoded_item: frame
+    } } }]);
+    expect(h.posts).toEqual([
+      { type: 'cos-request-origin', conversationId: conversation_id, requestIds: [request_id], observedAt: expect.any(Number) }
+    ]);
+  });
   it('rejects foreign sockets, contradictory envelopes and request IDs hidden in model text', () => {
     const h = harness(), socket = h.socket();
     const conversation_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -300,6 +312,21 @@ describe('MAIN-world usage projection', () => {
     expect(h.posts).toEqual([
       { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: expect.any(Number) }
     ]);
+  });
+
+  it('reads nested server envelope ownership and a moved conversation stream endpoint without inspecting authored payloads', async () => {
+    const h = harness();
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feedSse([
+      `data: ${JSON.stringify({ type: 'stream-item', payload: {
+        conversation_id: conversationId,
+        message: { metadata: { request_id: 'wfr_nested_server_event' }, content: { parts: ['private answer'] } }
+      } })}\n\n`
+    ], { method: 'POST' }, 'https://chatgpt.com/backend-api/v2/conversation/stream');
+    expect(h.posts).toEqual([
+      { type: 'cos-request-origin', conversationId, requestIds: ['wfr_nested_server_event'], observedAt: expect.any(Number) }
+    ]);
+    expect(JSON.stringify(h.posts)).not.toContain('private answer');
   });
 
   it('reattaches after the page runtime replaces fetch during startup', async () => {

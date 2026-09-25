@@ -280,6 +280,7 @@ interface TurnFixture {
   messages: Message[];
   tag?: 'section' | 'article' | 'div';
   searchRenderer?: boolean;
+  modelMissing?: boolean;
   outerTurnWrapper?: boolean;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
   rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
@@ -357,6 +358,11 @@ async function scan(
       };
       outer.append(section);
       mount = outer;
+    } else if (turn.modelMissing) {
+      (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+        memoizedProps: { className: 'content-search-inner' },
+        return: null
+      };
     } else {
       (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(
         turn.messages,
@@ -543,8 +549,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(14);
-    expect(rows[0]!.v).toBe(14);
+    expect(version).toBe(15);
+    expect(rows[0]!.v).toBe(15);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -902,6 +908,35 @@ describe('the calls a turn says it made', () => {
     });
     expect(turnStamps).toEqual(['test-nonce:0', 'test-nonce:0']);
     expect(messageStamps).toEqual(['test-nonce:0:assistant-outer-message']);
+  });
+
+  it('keeps exact-id assistant prose when the September renderer exposes no reachable turn model', async () => {
+    const { turns, diagnostics, messageStamps } = await scan([], [{
+      id: 'fallback-dom-exact',
+      searchRenderer: true,
+      modelMissing: true,
+      messages: [authored('assistant-dom-exact', 'Model source is intentionally unavailable.')],
+      rendered: [{ html: '<p>Visible <strong>provider answer</strong>.</p>' }]
+    }]);
+
+    expect(diagnostics).toMatchObject({ shells: 1, fibers: 1, models: 0, modelMessages: 0, minModelDepth: -1 });
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      turnId: 'fallback-dom-exact',
+      domExact: true,
+      calls: [],
+      requests: [],
+      endMessageId: null,
+      messages: [expect.objectContaining({
+        messageId: 'assistant-dom-exact',
+        rawMessageId: 'assistant-dom-exact',
+        role: 'assistant',
+        stable: true,
+        rawText: 'Visible provider answer.',
+        renderedHtml: '<p>Visible <strong>provider answer</strong>.</p>'
+      })]
+    });
+    expect(messageStamps).toEqual(['test-nonce:0:assistant-dom-exact']);
   });
 
   it('takes canonical assistant identity and raw Markdown from the public text message model, not Markdown-node cardinality', async () => {

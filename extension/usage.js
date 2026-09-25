@@ -20,7 +20,6 @@
   // This remains an opaque bounded join key: it is accepted only from structured server
   // metadata in an event that independently proves exactly one conversation id.
   const REQUEST = /^[a-zA-Z0-9_-]{1,100}$/;
-  const CONVERSATION_FIELD = /(?:^|[,{\s])\"conversation_id\"\s*:\s*\"([0-9a-f-]{36})\"/gi;
   // Passive evidence only: no polling, and no full response survives a scan. Retain a
   // small replay window for document_start -> content-script readiness and deduplicate
   // repeated provider observations across responses as well as inside one stream.
@@ -93,34 +92,67 @@
    * Reads bounded complete SSE events from a clone without changing the page's response.
    * Only a conversation id and server request metadata from the same event are projected.
    */
-  function readOrigin(frame) {
-      if (!frame || frame.length > 512 * 1024) return;
-      const conversations = new Set();
-      CONVERSATION_FIELD.lastIndex = 0;
-      for (let match; (match = CONVERSATION_FIELD.exec(frame));) {
-        if (CONVERSATION.test(match[1])) conversations.add(match[1]);
+  /**
+   * Exact conversation/request ownership from one structured server event.
+   *
+   * The September renderer/transport no longer guarantees that `conversation_id` lives at
+   * the event root. Keep the proof structural instead of falling back to a raw text search:
+   * walk only JSON objects, ignore authored/tool payload containers completely, accept request
+   * ids only from a `metadata` object, and require one non-contradictory conversation id.
+   * An outer native-stream envelope may supply that conversation id independently; in that
+   * case an inner event is allowed to omit it but may never contradict it.
+   */
+  function structuredOrigin(event, expectedConversationId = null) {
+    if (!event || typeof event !== 'object') return null;
+    if (expectedConversationId !== null &&
+        (typeof expectedConversationId !== 'string' || !CONVERSATION.test(expectedConversationId))) return null;
+    const conversations = new Set();
+    const requestIds = new Set();
+    const skipped = new Set(['content', 'tool_arguments', 'args', 'arguments', 'result', 'text', 'parts']);
+    let visited = 0;
+    const walk = (value, parentKey = '', depth = 0) => {
+      if (!value || typeof value !== 'object' || depth > 8 || visited++ > 256) return;
+      if (Array.isArray(value)) {
+        for (let at = 0; at < Math.min(value.length, 32); at++) walk(value[at], parentKey, depth + 1);
+        return;
       }
-      // One complete server event must carry both sides of the join. Retaining an id from a
-      // prior frame would turn response order into authority; a contradictory frame abstains.
-      if (conversations.size !== 1) return;
-      const conversationId = conversations.values().next().value;
-      // Only server metadata in a complete JSON event owns a request id. A key in
-      // quoted model text, tool arguments or an unrelated nested object is not proof.
+      let entries;
+      try { entries = Object.entries(value).slice(0, 64); } catch { return; }
+      for (const [key, child] of entries) {
+        if ((key === 'conversation_id' || key === 'conversationId') &&
+            typeof child === 'string' && CONVERSATION.test(child)) conversations.add(child);
+        if ((key === 'request_id' || key === 'requestId') && parentKey === 'metadata' &&
+            typeof child === 'string' && REQUEST.test(child)) requestIds.add(child);
+        if (skipped.has(key) || !child || typeof child !== 'object') continue;
+        walk(child, key, depth + 1);
+      }
+    };
+    walk(event);
+    let conversationId = expectedConversationId;
+    if (conversationId) {
+      if (conversations.size > 1 || (conversations.size === 1 && !conversations.has(conversationId))) return null;
+    } else {
+      if (conversations.size !== 1) return null;
+      conversationId = conversations.values().next().value;
+    }
+    return conversationId && requestIds.size
+      ? { conversationId, requestIds: [...requestIds].slice(0, 16) }
+      : null;
+  }
+  function readOrigin(frame, expectedConversationId = null) {
+      if (!frame || frame.length > 512 * 1024) return;
       let event;
       try {
         const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:'))
           .map(line => line.slice(5).trimStart()).join('\n');
         event = JSON.parse(data);
       } catch { return; }
-      if (event?.conversation_id !== conversationId) return;
-      const requestIds = new Set([event.metadata?.request_id, event.message?.metadata?.request_id]
-        .filter(id => typeof id === 'string' && REQUEST.test(id)));
-      return requestIds.size ? { conversationId, requestIds: [...requestIds] } : null;
+      return structuredOrigin(event, expectedConversationId);
   }
   async function inspectRequestOrigins(response, observedAt) {
     let url;
     try { url = new URL(response.url); } catch { return; }
-    if (url.origin !== location.origin || !/^\/backend-api\/(?:f\/)?conversation$/.test(url.pathname)) return;
+    if (url.origin !== location.origin || !/^\/backend-api\/(?:[^/]+\/)*conversation(?:\/[^/?]+)*$/.test(url.pathname)) return;
     if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream')) return;
     if (originReaders.size >= 2) return;
     const copy = response.clone(), reader = copy.body?.getReader();
@@ -179,7 +211,7 @@
       const frames = payload.encoded_item.split(/\r?\n\r?\n/);
       if (frames.length > 16) continue;
       for (const frame of frames) {
-        const origin = readOrigin(frame);
+        const origin = readOrigin(frame, payload.conversation_id);
         if (origin?.conversationId === payload.conversation_id)
           publishOrigin(origin.conversationId, origin.requestIds, Date.now());
       }

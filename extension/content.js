@@ -2177,7 +2177,8 @@
       void refreshFiber({
         pageTurnId: ended?.id || null,
         localTurnId: endedTurnId,
-        pageTurn: ended || null
+        pageTurn: ended || null,
+        completed: true
       });
     }
     if (endedTurnId) emit({ kind: 'turn_end', turnId: endedTurnId, ...result });
@@ -3019,7 +3020,9 @@
   // 11: adds exact typed thought-notification ids and ephemeral DOM stamps for selective
   //     presentation suppression. Caption text and per-call adjacency remain non-authority.
   // 12: adds exact provider-message/sediment generated-image descriptors and DOM pixel stamps.
-  const FIBER_VERSION = 14;
+  // 15: marks exact-provider-DOM transcript recovery explicitly so model-less turns may be
+  //     recorded only when this document already owns that exact live/settled section.
+  const FIBER_VERSION = 15;
   const FIBER_TIMEOUT_MS = 1500;
   const FIBER_MAX_ROWS = 400;
   /** Assistant turns whose per-call evidence is accepted from one scan. */
@@ -3336,6 +3339,7 @@
       turnId,
       conversationId: cap(raw.conversationId, 200),
       conversationConflict: raw.conversationConflict === true,
+      domExact: raw.domExact === true,
       endMessageId,
       calls: kept,
       codeModeCalls,
@@ -4112,6 +4116,11 @@
     }
     for (let index = 0; index < answer.turns.length; index++) {
       const turn = answer.turns[index];
+      // Exact DOM ids recover public prose but, unlike a page-model conversation id, do not
+      // prove which chat a historical mounted section belongs to. Only this document's exact
+      // live/settled node binding may make such a descriptor durable. This keeps navigation
+      // leftovers from chat A out of chat B while still recovering the response being written.
+      if (turn.domExact && turn !== ownedPageTurn) continue;
       // The live generation owns the turn it is writing; a settled one is claimed only by
       // ChatGPT's own request id. See settledTurnOwner().
       const localOwner = index === activeTurnIndex ? activeLocalTurnId : settledOwners.get(turn) || null;
@@ -4229,7 +4238,18 @@
         // upgrading every message in a completed turn to `final:true` made interim prose look
         // like a sequence of finished answers and could let recovery treat the wrong one as
         // completion evidence.
-        const terminalMessageId = turn.endMessageId;
+        // Provider `end_turn` remains the strongest terminal proof. The current September
+        // renderer can expose no reachable turn model at all, however, while still publishing
+        // an exact provider message id in the authored DOM. finishGeneration calls this scan
+        // only after the existing settle/lifecycle proof has already classified this exact
+        // locally-owned turn as completed. In that one case, promote only its last exact-id
+        // assistant message; historical and still-generating turns never gain this fallback.
+        const settledTerminalMessageId =
+          settled?.completed === true && index === activeTurnIndex
+            ? [...(turn.messages || [])].reverse().find(candidate =>
+                candidate?.role === 'assistant' && candidate.rawMessageId)?.rawMessageId || null
+            : null;
+        const terminalMessageId = turn.endMessageId || settledTerminalMessageId;
         const exactTerminal = Boolean(
           terminalMessageId &&
             (message.rawMessageId === terminalMessageId || message.messageId === terminalMessageId)

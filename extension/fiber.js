@@ -41,7 +41,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 14;
+  const VERSION = 15;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Keep at most one listener for this protocol version; content.js rejects older
@@ -1016,6 +1016,97 @@
   }
 
   /**
+   * Public assistant prose from the September search renderer when its React turn model is no
+   * longer reachable from the mounted Fiber branch.
+   *
+   * This is deliberately narrower than the page-model path above. It accepts only prose that
+   * ChatGPT itself places under an exact provider message id (`data-message-id`,
+   * `data-chatgpt-selection-message-id`, or one unambiguous assistant search-unit id). No text,
+   * position or cardinality is allowed to mint identity. The visible text is therefore a
+   * truthful degraded source — it is not claimed to be raw Markdown — while the rendered HTML
+   * remains optional decoration. A provider id appearing in more than one turn section is
+   * ambiguous and is dropped rather than merged across virtualized copies.
+   */
+  function explicitDomAssistantMessagesOf(sections, budget, exactAnchors) {
+    const byId = new Map();
+    const conflicted = new Set();
+    let ordinal = 0;
+    for (let sectionAt = 0; sectionAt < sections.length; sectionAt++) {
+      const section = sections[sectionAt];
+      let blocks;
+      try { blocks = section.querySelectorAll(MARKDOWN); } catch { continue; }
+      for (let at = 0; at < blocks.length; at++) {
+        const block = blocks[at];
+        if (block.closest && (block.closest(TOOL) || block.closest(OWN_SURFACES))) continue;
+        const parent = block.parentElement && block.parentElement.closest ? block.parentElement.closest(MARKDOWN) : null;
+        if (parent && section.contains(parent)) continue;
+        let holder = null, unit = null, id = null;
+        try {
+          holder = block.closest && block.closest('[data-message-id], [data-chatgpt-selection-message-id]');
+          unit = block.closest && block.closest('[data-chatgpt-search-unit-key$=":assistant"]');
+          id = holder ? str(holder.getAttribute('data-message-id') || holder.getAttribute('data-chatgpt-selection-message-id')) : null;
+          if (!id && unit) {
+            const ids = (unit.getAttribute('data-chatgpt-search-message-ids') || '').trim().split(/\s+/).filter(Boolean);
+            const unique = [...new Set(ids.map(value => str(value)).filter(Boolean))];
+            if (unique.length === 1) id = unique[0];
+          }
+        } catch {
+          id = null;
+        }
+        if (!id) continue;
+        // A legacy explicit row must itself say assistant. A selection id is accepted only
+        // under the search renderer's assistant unit.
+        const explicitRole = holder && holder.getAttribute ? holder.getAttribute('data-message-author-role') : null;
+        if (explicitRole && explicitRole !== 'assistant') continue;
+        if (!explicitRole && !unit) continue;
+        let text = '';
+        try { text = String(block.textContent || '').replace(/\u00a0/g, ' ').trim(); } catch { text = ''; }
+        if (!text) continue;
+        const existing = byId.get(id);
+        if (existing && existing.sectionIndex !== sectionAt) {
+          conflicted.add(id);
+          continue;
+        }
+        if (!existing) {
+          byId.set(id, { id, sectionIndex: sectionAt, order: ordinal++, pieces: [text], blocks: [block] });
+        } else {
+          existing.pieces.push(text);
+          existing.blocks.push(block);
+        }
+      }
+    }
+    const out = [];
+    for (const [id, entry] of byId) {
+      if (conflicted.has(id)) continue;
+      const rawText = budgetedText(entry.pieces.join('\n'), budget, MAX_RENDERED_TEXT);
+      if (!rawText) continue;
+      let renderedHtml = '';
+      if (entry.blocks.length === 1) {
+        try {
+          const markup = entry.blocks[0].innerHTML;
+          renderedHtml = markup.length <= Math.min(MAX_RENDERED_HTML, budget.remaining)
+            ? budgetedText(markup, budget, MAX_RENDERED_HTML)
+            : '';
+        } catch { renderedHtml = ''; }
+      }
+      for (const block of entry.blocks) exactAnchors.set(block, id);
+      out.push({
+        messageId: id,
+        rawMessageId: id,
+        role: 'assistant',
+        stable: true,
+        order: entry.order,
+        createTime: null,
+        rawText,
+        renderedHtml,
+        sectionIndex: entry.sectionIndex
+      });
+    }
+    out.sort((left, right) => left.order - right.order);
+    return out;
+  }
+
+  /**
    * Visible ChatGPT-native activity, keyed by the thought object that owns the rendered row.
    *
    * The label is display data only. React may replace the DOM row or rewrite its text from
@@ -1565,25 +1656,28 @@
             }
           }
         }
-        const codeReceipts = codeModeReceipts(messages || []);
-        const codeModeCalls = (messages || []).filter(message => message && message.author &&
+        const modelMessages = messages || [];
+        const codeReceipts = codeModeReceipts(modelMessages);
+        const codeModeCalls = modelMessages.filter(message => message && message.author &&
           message.author.role === 'assistant' && message.recipient === 'functions.exec').slice(0, MAX_CALLS)
           .map(message => ({ messageId: str(message.id), requestId: str(message.metadata && message.metadata.request_id),
             answered: codeReceipts.get(message.id) === true }));
-        const calls = callsOf(messages, codeReceipts);
-        const requests = requestIdsOf(messages);
+        const calls = callsOf(modelMessages, codeReceipts);
+        const requests = requestIdsOf(modelMessages);
         const conversation = conversationEvidenceOf(fiber);
         const exactAnchors = new Map();
         const exactThoughtRows = new Map();
         const exactImageNodes = new Map();
         const turnBudget = { remaining: Math.min(MAX_TURN_TEXT, responseBudget.remaining) };
         const before = turnBudget.remaining;
-        const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget, exactAnchors, conversation.conversationId);
+        const renderedMessages = modelMessages.length
+          ? renderedMessagesOf(group.sections, modelMessages, turnBudget, exactAnchors, conversation.conversationId)
+          : explicitDomAssistantMessagesOf(group.sections, turnBudget, exactAnchors);
         responseBudget.remaining -= before - turnBudget.remaining;
-        const nativeActivities = nativeActivitiesOf(group.sections, messages, exactThoughtRows);
-        const generatedImages = generatedImagesOf(group.sections, messages, exactImageNodes);
+        const nativeActivities = nativeActivitiesOf(group.sections, modelMessages, exactThoughtRows);
+        const generatedImages = generatedImagesOf(group.sections, modelMessages, exactImageNodes);
         const activities = nativeActivities.events;
-        const endMessageId = turnEndMessageId(messages);
+        const endMessageId = turnEndMessageId(modelMessages);
         if (
           codeModeCalls.length === 0 && calls.length === 0 &&
           requests.length === 0 &&
@@ -1596,6 +1690,10 @@
           turnId: group.turnId,
           conversationId: conversation.conversationId,
           conversationConflict: conversation.conflict,
+          // Exact provider DOM identity can recover the current public answer after the
+          // September renderer stopped exposing a reachable turn model. The isolated world
+          // treats this as live-owner-only evidence; it is never historical backfill.
+          domExact: modelMessages.length === 0 && renderedMessages.length > 0,
           endMessageId,
           calls,
           codeModeCalls,

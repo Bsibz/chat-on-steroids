@@ -9,6 +9,14 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.25] — Fiber helper protocol refresh
+
+- Move the private MAIN-world Fiber helper protocol from v13 to v14 so a renderer-fix build cannot be silently shadowed by an already-mounted older helper that intentionally deduplicates same-version listeners.
+- Keep the recorder protocol unchanged: this bump is only for the page-model helper handshake between `content.js` and `fiber.js`.
+- Ship the 2.1.24 virtualized-turn fallback through the unambiguous v14 helper so current ChatGPT search-unit pages can recover their canonical outer turn model.
+
+Reload the existing unpacked companion after updating so current tabs use Fiber helper v14.
+
 ## [2.1.24] — ChatGPT virtualized turn model
 
 - Recover the canonical turn model from ChatGPT's provider-owned outer `data-turn-key` Fiber when the nested search-unit renderer has its own Fiber branch with no turn messages.

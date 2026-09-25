@@ -280,6 +280,7 @@ interface TurnFixture {
   messages: Message[];
   tag?: 'section' | 'article' | 'div';
   searchRenderer?: boolean;
+  outerTurnWrapper?: boolean;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
   rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string }>;
@@ -331,6 +332,7 @@ async function scan(
 
   for (const turn of turnSections) {
     const section = document.createElement(turn.searchRenderer ? 'div' : (turn.tag ?? 'section'));
+    let mount: Element = section;
     if (turn.searchRenderer) {
       section.setAttribute('data-content-search-turn-key', turn.id);
     } else {
@@ -342,10 +344,25 @@ async function scan(
       if (turn.rect === 'throw') throw new Error('unavailable geometry');
       return turn.rect as DOMRect;
     };
-    (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(
-      turn.messages,
-      turn.conversationProps
-    );
+    if (turn.outerTurnWrapper) {
+      const outer = document.createElement('div');
+      outer.setAttribute('data-turn-key', 'provider-' + turn.id);
+      (outer as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(
+        turn.messages,
+        turn.conversationProps
+      );
+      (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+        memoizedProps: { className: 'content-search-inner' },
+        return: null
+      };
+      outer.append(section);
+      mount = outer;
+    } else {
+      (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(
+        turn.messages,
+        turn.conversationProps
+      );
+    }
     let renderedHost: Element = section;
     if (turn.searchRenderer) {
       const assistantIds = turn.messages
@@ -393,7 +410,7 @@ async function scan(
       };
       for (let clone = 0; clone < Math.max(1, entry.clones ?? 1); clone++) add();
     }
-    document.body.append(section);
+    document.body.append(mount);
   }
 
   const elements = fibers.map((fiber) => {
@@ -850,6 +867,41 @@ describe('the calls a turn says it made', () => {
     });
     expect(turnStamps).toEqual(['test-nonce:0', 'test-nonce:0']);
     expect(messageStamps).toEqual(['test-nonce:0:assistant-search-message']);
+  });
+
+  it('falls back to the provider-owned outer turn Fiber when the search renderer branch has no turn model', async () => {
+    const publicText = 'The outer virtualized turn owns the canonical model.';
+    const { turns, diagnostics, turnStamps, messageStamps } = await scan([], [{
+      id: 'fallback-turn-outer',
+      searchRenderer: true,
+      outerTurnWrapper: true,
+      messages: [authored('assistant-outer-message', publicText)],
+      rendered: [publicText]
+    }]);
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      turnId: 'fallback-turn-outer',
+      messages: [
+        expect.objectContaining({
+          rawMessageId: 'assistant-outer-message',
+          role: 'assistant',
+          rawText: publicText
+        })
+      ]
+    });
+    expect(diagnostics).toMatchObject({
+      shells: 1,
+      fibers: 1,
+      models: 0,
+      outerShells: 1,
+      outerFibers: 1,
+      outerModels: 1,
+      outerModelMessages: 1,
+      outerMinModelDepth: 0
+    });
+    expect(turnStamps).toEqual(['test-nonce:0', 'test-nonce:0']);
+    expect(messageStamps).toEqual(['test-nonce:0:assistant-outer-message']);
   });
 
   it('takes canonical assistant identity and raw Markdown from the public text message model, not Markdown-node cardinality', async () => {

@@ -1547,9 +1547,24 @@
       const section = group.sections[0];
       let entry = null;
       try {
-        const fiber = fiberOf(section);
+        let fiber = fiberOf(section);
         if (!fiber) continue;
-        const messages = turnMessagesOf(fiber);
+        let messages = turnMessagesOf(fiber);
+        // September 2026 virtualization can hang the canonical turn model from the
+        // provider-owned outer turn wrapper while the nested content-search renderer has
+        // its own independent Fiber branch. Preserve the legacy branch whenever it still
+        // carries a model; fall back outward only when that exact model is absent.
+        if (!messages && section.closest) {
+          const outer = section.closest('[data-turn-key]');
+          if (outer && outer !== section) {
+            const outerFiber = fiberOf(outer);
+            const outerMessages = outerFiber ? turnMessagesOf(outerFiber) : null;
+            if (outerFiber && outerMessages) {
+              fiber = outerFiber;
+              messages = outerMessages;
+            }
+          }
+        }
         const codeReceipts = codeModeReceipts(messages || []);
         const codeModeCalls = (messages || []).filter(message => message && message.author &&
           message.author.role === 'assistant' && message.recipient === 'functions.exec').slice(0, MAX_CALLS)

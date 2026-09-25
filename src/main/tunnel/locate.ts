@@ -118,6 +118,11 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
       locateCache.set(key, sibling);
       return sibling;
     }
+    // A configured path is an owner choice, not a search hint we may silently ignore.
+    // If it cannot resolve to the requested executable, fail closed instead of substituting
+    // the bundled/PATH copy. The fallback search below is only for an absent configuration.
+    locateCache.set(key, null);
+    return null;
   }
 
   const bundled = bundledDir();

@@ -9,6 +9,15 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.27] — Current ChatGPT renderer recovery
+
+- Recover public assistant transcript revisions from ChatGPT's exact provider-owned DOM message ids when the September renderer no longer exposes `turn.messages` / `allMessages` on either the inner or outer mounted Fiber branch.
+- Keep that degraded DOM source live-owner-only: model-less historical sections never backfill across navigation, and only an already-proven completed local turn may promote its last exact provider message to final when provider `end_turn` is unavailable.
+- Move the private MAIN-world Fiber helper protocol to v15 so an older helper cannot silently omit the new trust marker after an unpacked extension reload.
+- Harden passive request ownership recovery for nested server envelopes, native stream handoffs where the outer envelope owns the conversation id, and moved conversation stream paths without reading authored text, tool arguments, or result payloads.
+
+Reload the existing unpacked companion after updating so current tabs run Fiber helper v15 and the updated response observer.
+
 ## [2.1.26] — Fiber diagnostic continuity
 
 - Preserve the bounded inner-vs-outer page-model diagnostic when the outer wrapper has no readable model and therefore correctly reports `outerMinModelDepth=-1`.

@@ -314,6 +314,11 @@ async function scan(
     models: number;
     modelMessages: number;
     minModelDepth: number;
+    outerShells: number;
+    outerFibers: number;
+    outerModels: number;
+    outerModelMessages: number;
+    outerMinModelDepth: number;
   } | null;
 }> {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {

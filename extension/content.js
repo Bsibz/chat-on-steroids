@@ -3535,7 +3535,10 @@
         if (data.scanOk !== true) return finish(null);
         let diagnostics = null;
         if (data.diagnostics && typeof data.diagnostics === 'object') {
-          const keys = ['shells', 'roleNodes', 'turnAttrs', 'turnIds', 'markdown', 'fibers', 'models', 'modelMessages', 'minModelDepth'];
+          const keys = [
+            'shells', 'roleNodes', 'turnAttrs', 'turnIds', 'markdown', 'fibers', 'models', 'modelMessages', 'minModelDepth',
+            'outerShells', 'outerFibers', 'outerModels', 'outerModelMessages', 'outerMinModelDepth'
+          ];
           const candidate = {};
           let valid = true;
           for (const key of keys) {
@@ -6145,6 +6148,13 @@
             fiberDiagnostics.models,
             fiberDiagnostics.modelMessages,
             fiberDiagnostics.minModelDepth
+          ].join(','),
+          fiberOuterDiag: [
+            fiberDiagnostics.outerShells,
+            fiberDiagnostics.outerFibers,
+            fiberDiagnostics.outerModels,
+            fiberDiagnostics.outerModelMessages,
+            fiberDiagnostics.outerMinModelDepth
           ].join(',')
         } : {})
       });

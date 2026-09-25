@@ -2515,6 +2515,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     noteFiberHealth(id, url.searchParams.get('fiber'));
     noteFiberDiagnostics(id, url.searchParams.get('fiberDiag'));
+    noteOuterFiberDiagnostics(id, url.searchParams.get('fiberOuterDiag'));
     const retiredWorker = retiredWorkerForConversation(id);
     const superseded = await conversationWasSuperseded(id);
     /**
@@ -6898,6 +6899,7 @@ const fiberHealth = new Map<string, {
   state: 'absent' | 'empty'; since: number; announced: 'absent' | 'empty' | null;
 }>();
 const fiberDiagnostics = new Map<string, string>();
+const outerFiberDiagnostics = new Map<string, string>();
 
 function noteFiberHealth(conversationId: string, raw: string | null, now = Date.now()): void {
   if (raw !== 'absent' && raw !== 'empty' && raw !== 'ok') return;
@@ -6938,6 +6940,20 @@ function noteFiberDiagnostics(conversationId: string, raw: string | null): void 
     `bridge: ${conversationId} page-model structure ` +
     `shells=${shells} role_nodes=${roleNodes} turn_attrs=${turnAttrs} turn_ids=${turnIds} ` +
     `markdown=${markdown} fibers=${fibers} models=${models} model_messages=${modelMessages} min_model_depth=${minModelDepth}`
+  );
+}
+
+function noteOuterFiberDiagnostics(conversationId: string, raw: string | null): void {
+  if (!raw || !/^\d{1,4}(?:,\d{1,4}){3},-?\d{1,4}$/.test(raw)) return;
+  if (outerFiberDiagnostics.get(conversationId) === raw) return;
+  outerFiberDiagnostics.set(conversationId, raw);
+  if (outerFiberDiagnostics.size > 200) {
+    for (const old of [...outerFiberDiagnostics.keys()].slice(0, 50)) outerFiberDiagnostics.delete(old);
+  }
+  const [shells, fibers, models, modelMessages, minModelDepth] = raw.split(',').map(Number);
+  logInfo(
+    `bridge: ${conversationId} outer-turn page-model structure ` +
+    `shells=${shells} fibers=${fibers} models=${models} model_messages=${modelMessages} min_model_depth=${minModelDepth}`
   );
 }
 

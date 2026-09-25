@@ -108,40 +108,56 @@
     const boundedCount = selector => {
       try { return Math.min(9999, document.querySelectorAll(selector).length); } catch { return 0; }
     };
-    let shells = [];
-    try { shells = [...document.querySelectorAll(TURN_SECTION)].slice(0, MAX_TURNS * 4); } catch { shells = []; }
-    let fibers = 0;
-    let models = 0;
-    let modelMessages = 0;
-    let minModelDepth = -1;
-    for (const shell of shells) {
-      const fiber = fiberOf(shell);
-      if (!fiber) continue;
-      fibers++;
-      let at = fiber;
-      for (let depth = 0; at && depth < MAX_CLIMB; depth++, at = at.return) {
-        const props = at.memoizedProps;
-        if (!props || typeof props !== 'object') continue;
-        const messages = props.turn && typeof props.turn === 'object' && Array.isArray(props.turn.messages)
-          ? props.turn.messages
-          : Array.isArray(props.allMessages) ? props.allMessages : null;
-        if (!messages) continue;
-        models++;
-        modelMessages = Math.min(9999, modelMessages + messages.length);
-        if (minModelDepth < 0 || depth < minModelDepth) minModelDepth = depth;
-        break;
+    const modelStats = selector => {
+      let shells = [];
+      try { shells = [...document.querySelectorAll(selector)].slice(0, MAX_TURNS * 4); } catch { shells = []; }
+      let fibers = 0;
+      let models = 0;
+      let modelMessages = 0;
+      let minModelDepth = -1;
+      for (const shell of shells) {
+        const fiber = fiberOf(shell);
+        if (!fiber) continue;
+        fibers++;
+        let at = fiber;
+        for (let depth = 0; at && depth < MAX_CLIMB; depth++, at = at.return) {
+          const props = at.memoizedProps;
+          if (!props || typeof props !== 'object') continue;
+          const messages = props.turn && typeof props.turn === 'object' && Array.isArray(props.turn.messages)
+            ? props.turn.messages
+            : Array.isArray(props.allMessages) ? props.allMessages : null;
+          if (!messages) continue;
+          models++;
+          modelMessages = Math.min(9999, modelMessages + messages.length);
+          if (minModelDepth < 0 || depth < minModelDepth) minModelDepth = depth;
+          break;
+        }
       }
-    }
+      return {
+        shells: Math.min(9999, shells.length),
+        fibers: Math.min(9999, fibers),
+        models: Math.min(9999, models),
+        modelMessages,
+        minModelDepth
+      };
+    };
+    const current = modelStats(TURN_SECTION);
+    const outer = modelStats('[data-turn-key]');
     return {
-      shells: Math.min(9999, shells.length),
+      shells: current.shells,
       roleNodes: boundedCount('[data-message-author-role], [data-chatgpt-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":assistant"]'),
       turnAttrs: boundedCount('[data-turn], [data-content-search-turn-key]'),
       turnIds: boundedCount('[data-turn-id], [data-chatgpt-search-unit-key]'),
       markdown: boundedCount(MARKDOWN),
-      fibers: Math.min(9999, fibers),
-      models: Math.min(9999, models),
-      modelMessages,
-      minModelDepth
+      fibers: current.fibers,
+      models: current.models,
+      modelMessages: current.modelMessages,
+      minModelDepth: current.minModelDepth,
+      outerShells: outer.shells,
+      outerFibers: outer.fibers,
+      outerModels: outer.models,
+      outerModelMessages: outer.modelMessages,
+      outerMinModelDepth: outer.minModelDepth
     };
   }
 

@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.51] - Resumed Native Chat continuity
+
+- Native Chat transcript projection now accepts the exact presentation artifact seen after a real Compact & Resume: ChatGPT may render matched Markdown code delimiters away from the recorded resume user bubble while preserving every other byte. Changed words, unmatched/literal backticks, and ambiguous boundaries still fail closed.
+- The current ChatGPT shell's model-less live commentary is captured again when visible assistant Markdown is mounted without the older `data-interrupted` wrapper, restoring Night Build's interim/pre-response text without treating it as a final answer.
+- Attachment Send readiness diagnostics from 2.1.50 remain enabled for the next isolated dogfood attempt; native Send ownership and acceptance gates are unchanged.
+
 ## [2.1.50] - Native attachment Send readiness diagnostics
 
 - Native Chat attachment delivery now emits a bounded, privacy-safe readiness breadcrumb when an exact claimed attachment send remains stalled before native Send authorization.

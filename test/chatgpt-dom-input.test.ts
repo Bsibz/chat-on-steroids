@@ -636,16 +636,12 @@ describe('native image readiness', () => {
     expect(await draft.clear()).toBe(false);
     expect(removed).not.toHaveBeenCalled(); expect(box.textContent).not.toBe(''); draft.dispose();
   });
-  it.each(['Remove file:', 'Remove file 1:'])('waits for matching %s attachment and upload completion before Send', async (label) => {
+  it.each(['Remove file:', 'Remove file 1:'])('uses native Send readiness for matching %s attachment even if stale progress semantics remain', async (label) => {
     const input = upload();
     const tile = document.createElement('button'); tile.type = 'button';
     tile.setAttribute('aria-label', `${label} example.webp`); tile.setAttribute('aria-busy', 'true');
     input.addEventListener('change', () => document.querySelector('form')!.append(tile));
     const result = api.uploadImages([{ name: 'example.webp', dataUrl: 'data:image/webp;base64,YQ==' }]);
-    let settled = false; void result.then(() => { settled = true; });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(settled).toBe(false);
-    tile.removeAttribute('aria-busy');
     await vi.advanceTimersByTimeAsync(0);
     expect(await result).toBe(true);
   });

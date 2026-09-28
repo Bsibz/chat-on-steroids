@@ -2347,7 +2347,15 @@ var CLF_DOM = (() => {
         // The provider can rename report.md to report(1).md during processing.
         // Bind once by exact original names, then retain those exact remove controls.
         if (tiles.length !== ownedTiles.length || tiles.some(node => !ownedTiles.includes(node))) return finish(false);
-        if (!host.querySelector('[aria-busy="true"], [role="progressbar"], [data-inline-file-uploading]') && sendButtonEnabled(sendButton())) {
+        // ChatGPT's native Send control is the final upload-readiness authority.
+        // The composer can retain stale/hidden progress semantics after the exact
+        // attachment tile is already ready to send (observed live on the current
+        // attachment UI). Treating any composer-wide progress marker as a second
+        // veto can strand a fully prepared draft for the whole 10-minute file
+        // timeout even while the owner can click Send successfully. Exact tile
+        // ownership above still proves that every requested file is present, and
+        // Send must still be the one unambiguous native enabled control.
+        if (sendButtonEnabled(sendButton())) {
           draft?.attachments(ownedTiles);
           finish(true);
         }

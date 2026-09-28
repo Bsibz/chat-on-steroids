@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.50] - Native attachment Send readiness diagnostics
+
+- Native Chat attachment delivery now emits a bounded, privacy-safe readiness breadcrumb when an exact claimed attachment send remains stalled before native Send authorization.
+- The breadcrumb records only enums, counts, and booleans for attachment tiles, current native Send/Stop controls, composer state, and generation state; it never records prompt text, filenames, attachment bytes, or page prose.
+- Send ownership, exact draft/model checks, authorization timing, upload timeouts, and native acceptance receipts are unchanged; this release is diagnostic-only so the remaining live blocker can be fixed from evidence rather than relaxed heuristics.
+
 ## [2.1.49] - Native attachment Send readiness
 
 - Native Chat attachment delivery now treats ChatGPT's exact enabled native Send control as the final upload-readiness authority once every requested attachment tile has been matched and owned.

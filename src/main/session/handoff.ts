@@ -61,6 +61,36 @@ export function resumeBootstrapText(summary: string, token = ''): string {
 export function resumeBootstrapMatches(recorded: string, summary: string): boolean {
   const canonical = (value: string): string =>
     value.replace(/\u00c2\u00a0/g, ' ').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+  const renderedCodeDelimiters = (value: string): string => {
+    let out = '';
+    for (let at = 0; at < value.length;) {
+      if (value[at] !== '`' || (at > 0 && value[at - 1] === '\\')) {
+        out += value[at++]!;
+        continue;
+      }
+      let runEnd = at;
+      while (value[runEnd] === '`') runEnd++;
+      const run = value.slice(at, runEnd);
+      let close = runEnd;
+      let found = -1;
+      while ((close = value.indexOf(run, close)) !== -1) {
+        if (close === 0 || value[close - 1] !== '\\') {
+          const before = value[close - 1] === '`';
+          const after = value[close + run.length] === '`';
+          if (!before && !after) { found = close; break; }
+        }
+        close += run.length;
+      }
+      if (found === -1) {
+        out += run;
+        at = runEnd;
+        continue;
+      }
+      out += value.slice(runEnd, found);
+      at = found + run.length;
+    }
+    return out;
+  };
   const strip = (value: string): string => {
     const prompt = userPromptText(value) ?? value;
     const marker = continuationMarkerOf(prompt);
@@ -72,7 +102,11 @@ export function resumeBootstrapMatches(recorded: string, summary: string): boole
   };
   const expected = canonical(resumeBootstrapText(summary));
   const normalized = canonical(recorded);
-  return strip(normalized) === expected || strip(unescapeMarkdown(normalized)) === expected;
+  const visible = strip(normalized);
+  const unescaped = strip(unescapeMarkdown(normalized));
+  if (visible === expected || unescaped === expected) return true;
+  const renderedExpected = renderedCodeDelimiters(expected);
+  return visible === renderedExpected || unescaped === renderedExpected;
 }
 
 /**

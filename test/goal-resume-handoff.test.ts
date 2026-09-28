@@ -367,6 +367,17 @@ it('accepts the resume bootstrap after ChatGPT escaped it as Markdown', () => {
   expect(resumeBootstrapMatches(literalBootstrap.replace(/([!-/:-@[-`{-~])/g, '\\$1'), literal)).toBe(true);
 });
 
+it('accepts only matched Markdown code delimiters disappearing from rendered resume text', () => {
+  const handoff = 'Keep `Waiting for the handoff response` exact, then run ```npm test``` and continue.';
+  const bootstrap = resumeBootstrapText(handoff, 'renderedCodeTicks012345');
+  const rendered = bootstrap.replace(/`/g, '');
+  expect(resumeBootstrapMatches(rendered, handoff)).toBe(true);
+  expect(resumeBootstrapMatches(rendered.replace('npm test', 'npm deploy'), handoff)).toBe(false);
+
+  const unmatched = 'Keep this literal unmatched ` character exactly.';
+  expect(resumeBootstrapMatches(resumeBootstrapText(unmatched).replace('`', ''), unmatched)).toBe(false);
+});
+
 it('does not publish committed-resume provenance when the durable rebind write fails', async () => {
   const from = 'eeeeeeee-5555-4555-8555-555555555555';
   const to = 'ffffffff-6666-4666-8666-666666666666';

@@ -591,6 +591,46 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     expect(transcript.items.map((item) => item.text)).toEqual([bootstrap, 'Current chat answer']);
   });
 
+  it('proves the durable RESUME boundary when ChatGPT rendered away matched code delimiters', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root, {
+      chatIds: ['conversation-old1', 'conversation-0001'],
+      resume: true,
+      historySeq: 12
+    });
+    const summary = 'Keep `Waiting for the handoff response` exact and run ```npm test``` before continuing.';
+    const bootstrap =
+      '[[CLF-RESUME:abcdefghijklmnop]]\n\n' +
+      'Continuing a Chat On Steroids session that was compacted. This is the brief the previous chat wrote about its own work; carry on from it rather than starting again.\n\n' +
+      summary;
+    const rendered = bootstrap.replace(/`/g, '');
+    await writeCanonical(fixture.dir, {
+      seq: 10, time: 1_000, source: 'extension', kind: 'user_message',
+      messageId: 'message-resume-0001', message: stored(rendered)
+    });
+    await writeCanonical(fixture.dir, {
+      seq: 12, origin: 11, time: 1_100, source: 'extension', kind: 'assistant_message',
+      messageId: 'message-assistant-0002', message: stored('Current chat answer'), state: 'final', final: true, finalContentSeq: 12
+    });
+    await fs.mkdir(path.join(fixture.dir, 'handoffs'), { recursive: true });
+    await fs.writeFile(path.join(fixture.dir, 'handoffs', 'handoff-0001.json'), JSON.stringify({
+      id: 'handoff-0001', sessionId: 'session-0001', createdAt: 900, text: summary,
+      sourceEvents: 9, sourceTokens: 100, notes: []
+    }));
+    await writeJournal(fixture.dir, [
+      { seq: 2, time: 200, source: 'extension', kind: 'turn_start', turnId: 'turn-0000001' },
+      { seq: 9, time: 900, source: 'app', kind: 'handoff', handoffId: 'handoff-0001' }
+    ]);
+    fixture.meta['updatedAt'] = 1_200;
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.projection.lowerBoundOrigin).toBe(10);
+    expect(transcript.items.map((item) => item.text)).toEqual([rendered, 'Current chat answer']);
+  });
+
   it('uses highest journal sequence for corrected terminal outcome instead of assistant-final state', async () => {
     const root = await tempRoot();
     const fixture = await writeFixture(root, { active: false, historySeq: 11 });

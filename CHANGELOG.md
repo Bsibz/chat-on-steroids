@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.54] - Native Chat concrete document custody
+
+- Pinned Night Build Native Chat sends now elect only one current ChatGPT document whose concrete URL contains the exact target conversation, with no pending navigation. Remembered conversation identity remains recovery context but can no longer grant authored-send custody.
+- Fixes another pre-claim ambiguity class involving transient root/helper tabs and plugin-refresh navigation while preserving fail-closed behavior for duplicate real conversation documents and same-tab reloads.
+- Adds focused coverage for Project conversations, one/two PNG attachments, plugin/settings/helper tabs, same-tab reload, failed-row non-replay, multi-PNG `File` upload routing, and QuickTime-file routing through ChatGPT's unrestricted file input.
+
 ## [2.1.53] - Native Chat exact-tab identity after Settings
 
 - Stable ChatGPT non-conversation pages such as `/settings/plugins-settings` no longer inherit a remembered conversation identity from the tab registry. That registry fallback is now reserved for transient root/no-URL reload states.

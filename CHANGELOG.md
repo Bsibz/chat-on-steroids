@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.53] - Native Chat exact-tab identity after Settings
+
+- Stable ChatGPT non-conversation pages such as `/settings/plugins-settings` no longer inherit a remembered conversation identity from the tab registry. That registry fallback is now reserved for transient root/no-URL reload states.
+- Fixes a live Native Chat failure where one real Project conversation plus two Plugins Settings tabs were miscounted as three copies of the same conversation, so pinned sends stayed queued for 60 seconds and failed before browser claim.
+- Adds regression coverage for same-tab reload recovery, stale Settings-tab identities, Project conversation URLs, and the transient-root fallback that reload recovery still needs.
+
 ## [2.1.52] - Native image tile ownership
 
 - Restores the exact ChatGPT composer image-tile detector that recognizes a native attachment under `data-composer-attachments` only when the tile's accessible filename matches its image alt text and it has one unique remove action.

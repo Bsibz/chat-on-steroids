@@ -1608,6 +1608,32 @@ describe('activity feed', () => {
       input.resetInputForTests();
     }
   });
+  it('logs only bounded readiness diagnostics for the exact claimed browser input', async () => {
+    await pair();
+    const input = await import('../src/main/session/input.js');
+    input.resetInputForTests();
+    await writeDurableNow('session-input', []);
+    const id = randomUUID();
+    const owner = '31:readiness-document:0';
+    try {
+      await input.enqueueInput({ id, sessionId: null, text: 'Bounded readiness probe', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null });
+      expect((await request('POST', '/input/claim', { body: { id, owner, conversationId: null, requiresAuthorization: true } })).body.input)
+        .toMatchObject({ id, owner });
+      expect((await request('POST', '/input/diagnostic', { body: { id, owner, conversationId: null, diagnostic: {
+        stage: 'send-count', requested: 1, tiles: 1, ownedTiles: 1, sendCandidates: 2, sendEnabled: 2,
+        stopCandidates: 0, composerConnected: true, composerEditable: true, composerDisabled: false, generating: false
+      } } })).body).toEqual({ ok: true });
+      expect(getLog().some(entry => entry.message.includes(`input ${id}: browser readiness stage=send-count`) &&
+        entry.message.includes('send_candidates=2') && entry.message.includes('send_enabled=2'))).toBe(true);
+      expect((await request('POST', '/input/diagnostic', { body: { id, owner, conversationId: null, diagnostic: {
+        stage: 'send-count', requested: 1, tiles: 1, ownedTiles: 1, sendCandidates: 99, sendEnabled: 2,
+        stopCandidates: 0, composerConnected: true, composerEditable: true, composerDisabled: false, generating: false
+      } } })).status).toBe(409);
+    } finally {
+      await writeDurableNow('session-input', []);
+      input.resetInputForTests();
+    }
+  });
   it('registers a request id the page could not yet name a tool for', async () => {
     await pair();
     const conversationId = '16161616-3838-6060-8282-949494949494';

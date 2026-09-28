@@ -18,7 +18,7 @@ interface DomApi {
   inspectModelSettings(current?: () => boolean, failure?: (reason: string) => void): Promise<Array<{id: string; label: string; efforts: string[]}> | null>;
   send(options?: { acceptanceTimeoutMs?: number; stillCurrent?: () => boolean; beforeSend?: () => Promise<boolean> }): Promise<boolean>;
   selectModelSettings(model: string | null, effort: string | null, current?: () => boolean): Promise<boolean>;
-  uploadImages(images: Array<{ name: string; dataUrl: string }>, current?: () => boolean, draft?: ReturnType<DomApi['captureComposerDraft']>, files?: File[]): Promise<boolean>;
+  uploadImages(images: Array<{ name: string; dataUrl: string }>, current?: () => boolean, draft?: ReturnType<DomApi['captureComposerDraft']>, files?: File[], onWait?: (diagnostic: Record<string, unknown>) => void): Promise<boolean>;
   messages(): Array<{ id: string; role: 'user' | 'assistant'; text: string; turnId: string | null }>;
 }
 let dom: JSDOM;
@@ -589,6 +589,26 @@ describe('native image readiness', () => {
     expect(button.disabled).toBe(false);
     expect(ready).toBe(false);
     button.setAttribute('aria-disabled', 'false');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await uploaded).toBe(true);
+  });
+  it('reports bounded readiness when exact attachment tiles are waiting on an ambiguous Send control', async () => {
+    const input = upload();
+    const diagnostic = vi.fn();
+    input.addEventListener('change', () => {
+      const tile = document.createElement('button');
+      tile.setAttribute('aria-label', 'Remove file 1: app.webp');
+      document.querySelector('form')!.append(tile);
+      button.parentElement!.append(button.cloneNode(true));
+    });
+    const uploaded = api.uploadImages([{ name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' }], () => true, undefined, [], diagnostic);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({
+      stage: 'send-count', requested: 1, tiles: 1, ownedTiles: 1, sendCandidates: 2, sendEnabled: 2,
+      composerConnected: true, composerEditable: true, composerDisabled: false, generating: false
+    }));
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('app.webp');
+    button.parentElement!.lastElementChild!.remove();
     await vi.advanceTimersByTimeAsync(0);
     expect(await uploaded).toBe(true);
   });

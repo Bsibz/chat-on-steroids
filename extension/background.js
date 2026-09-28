@@ -3277,6 +3277,26 @@ const HANDLERS = {
       const result = await call('/input/attachment', { method: 'POST', body: JSON.stringify({ id, owner, conversationId, attachmentId: message.attachmentId, offset: message.offset }) });
       return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
     }
+    if (message.diagnostic && typeof message.diagnostic === 'object' && !Array.isArray(message.diagnostic)) {
+      if (message.owner !== owner || !ownsDocument(source)) return { ok: false };
+      const row = message.diagnostic;
+      const bounded = {
+        stage: ['tiles', 'send-count', 'send-disabled', 'ready'].includes(row.stage) ? row.stage : null,
+        requested: Number.isInteger(row.requested) && row.requested >= 0 && row.requested <= 20 ? row.requested : null,
+        tiles: Number.isInteger(row.tiles) && row.tiles >= 0 && row.tiles <= 20 ? row.tiles : null,
+        ownedTiles: Number.isInteger(row.ownedTiles) && row.ownedTiles >= 0 && row.ownedTiles <= 20 ? row.ownedTiles : null,
+        sendCandidates: Number.isInteger(row.sendCandidates) && row.sendCandidates >= 0 && row.sendCandidates <= 8 ? row.sendCandidates : null,
+        sendEnabled: Number.isInteger(row.sendEnabled) && row.sendEnabled >= 0 && row.sendEnabled <= 8 ? row.sendEnabled : null,
+        stopCandidates: Number.isInteger(row.stopCandidates) && row.stopCandidates >= 0 && row.stopCandidates <= 8 ? row.stopCandidates : null,
+        composerConnected: row.composerConnected === true,
+        composerEditable: row.composerEditable === true,
+        composerDisabled: row.composerDisabled === true,
+        generating: row.generating === true
+      };
+      if (Object.values(bounded).some(value => value === null)) return { ok: false };
+      const result = await call('/input/diagnostic', { method: 'POST', body: JSON.stringify({ id, owner, conversationId, diagnostic: bounded }) });
+      return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+    }
     if (message.recoveryAction && message.owner !== owner) return { ok: false };
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
       method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })

@@ -11576,7 +11576,9 @@
         }
         files.push(new File(parts, attachment.name, { type: attachment.mimeType }));
       }
-      if (!(await CLF_DOM.uploadImages(input.images, onTarget, draft, files))) return fail('Attachment upload was not confirmed. Check the unsent draft and any file error in ChatGPT before trying again.');
+      if (!(await CLF_DOM.uploadImages(input.images, onTarget, draft, files, diagnostic => {
+        void ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, diagnostic }).catch(() => undefined);
+      }))) return fail('Attachment upload was not confirmed. Check the unsent draft and any file error in ChatGPT before trying again.');
       await Promise.resolve();
       if (!onTarget() || !draft.current() || sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) return fail('The composer changed; your draft was preserved');
       const previousUserId = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id;

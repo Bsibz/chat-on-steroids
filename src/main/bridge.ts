@@ -2471,7 +2471,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch { return json(res, 400, { error: 'invalid_usage' }, origin); }
   }
 
-  if (['/input/claim', '/input/bind', '/input/ack', '/input/fail', '/input/answer', '/input/progress', '/input/attachment'].includes(route) && req.method === 'POST') {
+  if (['/input/claim', '/input/bind', '/input/ack', '/input/fail', '/input/answer', '/input/progress', '/input/attachment', '/input/diagnostic'].includes(route) && req.method === 'POST') {
     const body = await readBody(req) as Record<string, unknown>;
     if (!body || typeof body.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.id) || typeof body.owner !== 'string' || body.owner.length > 160) {
       return json(res, 400, { error: 'invalid_input_claim' }, origin);
@@ -2486,6 +2486,28 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (!attachment || entry?.conversationId !== body.conversationId || typeof body.offset !== 'number') return json(res, 409, { error: 'attachment_not_owned' }, origin);
       const { readInputAttachmentChunk } = await import('./session/input-attachments.js');
       return json(res, 200, { chunk: await readInputAttachmentChunk(attachment, body.offset) }, origin);
+    }
+    if (route === '/input/diagnostic') {
+      const entry = (await listInputs()).find(row => row.id === body.id && row.owner === body.owner &&
+        row.state === 'browser' && row.sendAuthorizedAt === undefined && row.conversationId === body.conversationId);
+      const diagnostic = body.diagnostic && typeof body.diagnostic === 'object' && !Array.isArray(body.diagnostic)
+        ? body.diagnostic as Record<string, unknown> : null;
+      const stage = diagnostic?.stage;
+      const count = (key: string, max: number) => Number.isInteger(diagnostic?.[key]) && Number(diagnostic?.[key]) >= 0 && Number(diagnostic?.[key]) <= max
+        ? Number(diagnostic?.[key]) : null;
+      const requested = count('requested', 20), tiles = count('tiles', 20), ownedTiles = count('ownedTiles', 20);
+      const sendCandidates = count('sendCandidates', 8), sendEnabled = count('sendEnabled', 8), stopCandidates = count('stopCandidates', 8);
+      if (!entry || !['tiles', 'send-count', 'send-disabled', 'ready'].includes(String(stage)) ||
+          requested === null || tiles === null || ownedTiles === null || sendCandidates === null || sendEnabled === null || stopCandidates === null ||
+          typeof diagnostic?.composerConnected !== 'boolean' || typeof diagnostic?.composerEditable !== 'boolean' ||
+          typeof diagnostic?.composerDisabled !== 'boolean' || typeof diagnostic?.generating !== 'boolean') {
+        return json(res, 409, { error: 'input_diagnostic_rejected' }, origin);
+      }
+      logInfo(`input ${body.id}: browser readiness stage=${stage} requested=${requested} tiles=${tiles} owned=${ownedTiles} ` +
+        `send_candidates=${sendCandidates} send_enabled=${sendEnabled} stop_candidates=${stopCandidates} ` +
+        `composer_connected=${diagnostic.composerConnected} composer_editable=${diagnostic.composerEditable} ` +
+        `composer_disabled=${diagnostic.composerDisabled} generating=${diagnostic.generating}`);
+      return json(res, 200, { ok: true }, origin);
     }
     if (route === '/input/fail') {
       const ok = await failBrowserInput(body.id, body.owner, typeof body.error === 'string' ? body.error : 'Unable to prepare ChatGPT');

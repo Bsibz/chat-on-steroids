@@ -2301,7 +2301,7 @@ var CLF_DOM = (() => {
   function pluginManagementIdle() {
     return safe(() => ![...document.querySelectorAll('textarea,input:not([type="hidden"]),[contenteditable="true"]')].some(node => node.getClientRects().length > 0 && String(node.value || node.textContent || '').trim()), false);
   }
-  async function uploadImages(images, stillCurrent = () => true, draft = null, files = []) {
+  async function uploadImages(images, stillCurrent = () => true, draft = null, files = [], onWait = null) {
     if (files.length) images = [...(images || []), ...files];
     if (!images?.length) return true;
     if (!Array.isArray(images) || images.length > 20 || !stillCurrent() || hasComposerAttachments()) return false;
@@ -2322,8 +2322,41 @@ var CLF_DOM = (() => {
     } catch { return false; }
     return new Promise((resolve) => {
       let observer, timer;
+      const diagnosticTimers = [];
       let ownedTiles = null;
-      const finish = (ok) => { observer?.disconnect(); clearTimeout(timer); resolve(ok); };
+      let lastDiagnostic = '';
+      const finish = (ok) => {
+        observer?.disconnect(); clearTimeout(timer);
+        for (const pending of diagnosticTimers) clearTimeout(pending);
+        resolve(ok);
+      };
+      const readinessDiagnostic = () => {
+        if (typeof onWait !== 'function') return;
+        const host = composerBox() || composerActions()?.host;
+        const box = composer();
+        const tiles = host ? [...host.querySelectorAll('button[aria-label]')].filter(composerFileName) : [];
+        const sends = nativeComposerControls(SEND);
+        const enabled = sends.filter(sendButtonEnabled);
+        const stops = nativeComposerControls(STOP);
+        const stage = !ownedTiles ? 'tiles' : sends.length !== 1 ? 'send-count' : enabled.length !== 1 ? 'send-disabled' : 'ready';
+        const diagnostic = {
+          stage,
+          requested: Math.min(images.length, 20),
+          tiles: Math.min(tiles.length, 20),
+          ownedTiles: Math.min(ownedTiles?.length || 0, 20),
+          sendCandidates: Math.min(sends.length, 8),
+          sendEnabled: Math.min(enabled.length, 8),
+          stopCandidates: Math.min(stops.length, 8),
+          composerConnected: !!box?.isConnected,
+          composerEditable: !!box && box.getAttribute('contenteditable') !== 'false',
+          composerDisabled: box?.getAttribute('aria-disabled') === 'true',
+          generating: generating()
+        };
+        const signature = JSON.stringify(diagnostic);
+        if (signature === lastDiagnostic) return;
+        lastDiagnostic = signature;
+        try { onWait(diagnostic); } catch { /* Diagnostics never affect upload custody. */ }
+      };
       const check = () => {
         if (!stillCurrent()) return finish(false);
         const host = composerBox() || composerActions()?.host;
@@ -2363,6 +2396,7 @@ var CLF_DOM = (() => {
       observer = new MutationObserver(check);
       observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
       timer = setTimeout(() => finish(false), files.length ? 600000 : 60000);
+      diagnosticTimers.push(setTimeout(readinessDiagnostic, 2000), setTimeout(readinessDiagnostic, 5000));
       check();
     });
   }

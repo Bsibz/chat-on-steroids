@@ -2248,6 +2248,13 @@ var CLF_DOM = (() => {
 
   /** Native ChatGPT photo input, observed as #upload-photos. Sending waits for every tile. */
   function composerFileName(button) {
+    const tile = button.closest('[data-composer-attachments] [role="button"][aria-label]');
+    if (tile && tile !== button) {
+      const name = tile.getAttribute('aria-label');
+      const actions = [...tile.querySelectorAll('button')];
+      if (name && actions.length === 1 && actions[0] === button &&
+          [...tile.querySelectorAll('img[alt]')].some(image => image.getAttribute('alt') === name)) return name;
+    }
     const group = button.closest('[role="group"][aria-label]');
     if (group?.querySelector('[data-default-action="true"] button')) {
       const actions = [...group.querySelectorAll('button')].filter(node => !node.closest('[data-default-action="true"]'));

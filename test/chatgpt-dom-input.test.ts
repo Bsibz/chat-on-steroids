@@ -484,6 +484,32 @@ function upload() {
   return input;
 }
 describe('native image readiness', () => {
+  it.each(['wrong filename', 'multiple actions', 'outside attachments'])('rejects a shell attachment lookalike: %s', variant => {
+    const holder = document.createElement('div'); holder.setAttribute('data-composer-attachments', '');
+    holder.innerHTML = '<div role="button" aria-label="app.webp"><img alt="app.webp"><button aria-label="Remover app.webp"></button></div>';
+    if (variant === 'wrong filename') holder.querySelector('img')!.alt = 'other.webp';
+    if (variant === 'multiple actions') holder.firstElementChild!.append(document.createElement('button'));
+    if (variant === 'outside attachments') holder.removeAttribute('data-composer-attachments');
+    document.querySelector('form')!.append(holder);
+    expect(api.hasComposerAttachments()).toBe(false);
+  });
+
+  it('recognizes the shell image tile by filename and its unique localized remove action', async () => {
+    const input = upload(); input.id = '_r_image_';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    document.execCommand = command => { if (command === 'delete') box.replaceChildren(); return true; };
+    input.addEventListener('change', () => {
+      const holder = document.createElement('div'); holder.setAttribute('data-composer-attachments', '');
+      holder.innerHTML = '<div role="button" aria-label="app.webp"><img alt="app.webp"><button aria-label="Remover app.webp"></button></div>';
+      holder.querySelector('button')!.addEventListener('click', () => holder.remove());
+      document.querySelector('form')!.append(holder);
+    });
+    expect(await api.uploadImages([{ name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' }], () => true, draft)).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(true);
+    expect(await draft.clear()).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(false); draft.dispose();
+  });
+
   it('selects current generated-id composer inputs by exact upload capability', async () => {
     const form = document.querySelector('form')!;
     const broad = document.createElement('input'); broad.type = 'file'; broad.id = '_r_js_'; broad.accept = 'image/*,video/*';

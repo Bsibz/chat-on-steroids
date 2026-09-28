@@ -8961,6 +8961,17 @@
     if (barrier) {
       pressedAt = 0;
       nativeBusy = false;
+      if (barrier === 'turn_still_generating_after_stop') {
+        // Stop is best-effort. Current ChatGPT builds can leave the turn generating even after
+        // the visible Stop control is pressed. Keep this exact durable ticket instead of
+        // abandoning it or repeatedly filing new ones. Activity polling will resume the same
+        // ticket at the next safe turn boundary.
+        nativePhase = 'waiting';
+        localError = '';
+        renderControl();
+        void pullActivity();
+        return;
+      }
       nativePhase = '';
       localError = barrier;
       if (!automatic) await retireUnsentCompaction(forId, String(filed.data.token || ''), barrier, current);
@@ -9017,6 +9028,12 @@
     if (!source || nativeBusy || localError) return;
     if (source.state !== 'not-attempted' && source.state !== 'attempted-unresolved') return;
     if (!alive || conversationId !== forId || epoch !== forEpoch || CLF_DOM.conversationId() !== forId) return;
+    // If ChatGPT ignored the first Stop request, do not hammer Stop on every activity pull.
+    // Keep the durable ticket armed and continue it once the exact source chat becomes idle.
+    if (nativePhase === 'waiting' && CLF_DOM.generating()) {
+      renderControl();
+      return;
+    }
     const automatic = job.automatic === true;
     // An automatic ticket is the app's decision about a chat nobody is necessarily looking at,
     // and a hidden tab is a throttled one: on 2026-09-03 the source page froze solid while the
@@ -9118,7 +9135,7 @@
       userStopped = true;
       const stopped = await waitUntil(() => !current() || !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
       if (!current()) return 'This chat changed while compaction was stopping the turn.';
-      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+      if (!stopped) return 'turn_still_generating_after_stop';
     }
 
     // SETTLING — bounded and fail-closed. A call that is still running at the deadline is

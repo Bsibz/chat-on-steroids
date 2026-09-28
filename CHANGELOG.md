@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.45] - Compaction waits instead of dying when ChatGPT ignores Stop
+
+- Compact & Resume no longer abandons a durable ticket just because the current ChatGPT UI ignores its first Stop request.
+- The exact ticket stays armed and visibly waiting; activity polling resumes that same transaction when the source turn naturally reaches idle, so manual and automatic compaction can continue into the existing handoff/fresh-chat flow without duplicate tickets or repeated Stop spam.
+- Existing conversation, native-receipt, local-tool, send-checkpoint and cancellation fences remain unchanged.
+
 ## [2.1.44] - Night Build owner controls and daily-driver hardening
 
 - Add a separate authenticated `night-build-chat-owner-control-v1` loopback lane so Night Build can read and change exact-chat Auto Compaction, Off/Goal/Loop and Compact & Resume state without changing the frozen Native Chat v3 contract.

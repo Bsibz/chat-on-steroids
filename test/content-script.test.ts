@@ -12643,22 +12643,36 @@ describe('the Compact & resume control', () => {
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('Could not verify');
   });
 
-  it('closes the exact manual ticket without sending when the turn will not stop', async () => {
+  it('keeps the exact manual ticket armed when Stop is ignored, then resumes it at the natural turn boundary', async () => {
+    let ticketFiled = false;
+    const pendingJob = {
+      sessionId: 's1',
+      stage: 'handoff-pending',
+      busy: true,
+      handoffId: null,
+      error: null,
+      automatic: false,
+      sourceSend: { state: 'not-attempted', messageId: null }
+    };
     live = await harness(undefined, {
       // Positively prove this is an ordinary chat first; the test is about ChatGPT refusing the
       // later Stop, not about the separate unknown-role authority fence.
-      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
-      compact: (message) => ({
+      activity: () => ({
         ok: true,
-        data: message.sourceLost
-          ? { aborted: true }
-          : {
-              started: true,
-              token: 'manual-stop-refused',
-              prompt: 'write the brief and call save_handoff',
-              job: { sessionId: 's1', stage: 'handoff-pending', busy: true, handoffId: null, error: null }
-            }
-      })
+        data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: ticketFiled ? pendingJob : null }
+      }),
+      compact: (message) => {
+        if (message.ticket) ticketFiled = true;
+        return {
+          ok: true,
+          data: {
+            started: true,
+            token: 'manual-stop-refused',
+            prompt: 'write the brief and call save_handoff',
+            job: pendingJob
+          }
+        };
+      }
     });
     live.hook.injectControl();
     startGenerating(live.document); // and nothing ever clears it
@@ -12667,14 +12681,23 @@ describe('the Compact & resume control', () => {
 
     await live.hook.startCompact();
 
-    // The failed manual action has no invisible asking pickup left behind.
+    // ChatGPT ignored Stop. The exact ticket stays visible/armed; no handoff prompt is sent
+    // into the still-running turn and no sourceLost abort is written.
     expect(composerText(live.document)).toBe('');
     expect(sends()).toBe(0);
-    expect(live.sent.filter((message) => message.type === 'compact')).toEqual([
-      expect.objectContaining({ ticket: true, automatic: false }),
-      expect.objectContaining({ token: 'manual-stop-refused', sourceLost: true, sourceError: expect.stringContaining('would not stop') })
-    ]);
-    expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('would not stop');
+    expect(live.sent.some((message) => message.type === 'compact' && message.sourceLost === true)).toBe(false);
+    expect(live.sent.filter((message) => message.type === 'compact' && message.ticket)).toHaveLength(1);
+    expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('Waiting');
+
+    // Once the same source turn naturally reaches idle, the normal activity pull continues
+    // the already-durable transaction and submits exactly one marked handoff request.
+    await settle(5);
+    await settleTurn(live);
+    await live.hook.pullActivity();
+
+    expect(sends()).toBe(1);
+    expect(live.sent.some((message) => message.type === 'compact' && message.resume === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.sourceLost === true)).toBe(false);
   });
 
   it('never overwrites a draft the user is writing', async () => {

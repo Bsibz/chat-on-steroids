@@ -832,8 +832,13 @@ var CLF_DOM = (() => {
     const ownsAttachments = () => {
       if (!same() || !host) return false;
       const current = [...host.querySelectorAll('button[aria-label]')].filter(node => composerFileName(node));
-      return current.length === files.length && current.every(node => files.includes(node)) &&
-        !host.querySelector('[aria-busy="true"], [role="progressbar"], [data-inline-file-uploading]');
+      // Once uploadImages has bound the exact native attachment controls, those
+      // controls plus native Send readiness are the ownership/readiness proof.
+      // ChatGPT can leave stale progress semantics mounted after the file is fully
+      // ready (the same live condition uploadImages intentionally stopped vetoing
+      // in 2.1.49). Re-introducing that veto here makes uploadImages succeed and
+      // then immediately revokes the unchanged draft lease before authorization.
+      return current.length === files.length && current.every(node => files.includes(node));
     };
     return {
       attachments(nodes) { if (same()) files = [...nodes]; },
@@ -841,8 +846,7 @@ var CLF_DOM = (() => {
       async clear() {
         if (!ownsAttachments() || !host) return false;
         const current = [...host.querySelectorAll('button[aria-label]')].filter(node => composerFileName(node));
-        if (current.length !== files.length || current.some(node => !files.includes(node)) ||
-            host.querySelector('[aria-busy="true"], [role="progressbar"], [data-inline-file-uploading]')) return false;
+        if (current.length !== files.length || current.some(node => !files.includes(node))) return false;
         for (const node of current) {
           if (!same() || !node.isConnected) return false;
           node.click();

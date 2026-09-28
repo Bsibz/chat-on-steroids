@@ -679,6 +679,22 @@ describe('native image readiness', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(await uploaded).toBe(true);
   });
+  it('keeps the exact draft lease when native Send is ready but stale upload progress semantics remain', async () => {
+    const input = upload(); input.id = 'upload-files'; input.accept = '';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    input.addEventListener('change', () => {
+      const holder = document.createElement('div'); holder.setAttribute('data-composer-attachments', '');
+      holder.setAttribute('aria-busy', 'true');
+      holder.innerHTML = '<div role="button" aria-label="app.png"><img alt="app.png"><button aria-label="Remove file"></button></div>';
+      document.querySelector('form')!.append(holder);
+    });
+    const file = new dom.window.File([new Uint8Array(8)], 'app.png', { type: 'image/png' });
+
+    expect(await api.uploadImages([], () => true, draft, [file])).toBe(true);
+    expect(api.sendButton()).toBe(button);
+    expect(draft.current()).toBe(true);
+    draft.dispose();
+  });
   it('reports bounded readiness when exact attachment tiles are waiting on an ambiguous Send control', async () => {
     const input = upload();
     const diagnostic = vi.fn();

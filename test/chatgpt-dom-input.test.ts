@@ -564,6 +564,65 @@ describe('native image readiness', () => {
     expect(imageChanged).not.toHaveBeenCalled();
   });
 
+  it('uploads multiple PNG File attachments through the unrestricted composer input', async () => {
+    const form = document.querySelector('form')!;
+    const image = document.createElement('input'); image.type = 'file'; image.accept = 'image/*';
+    const general = document.createElement('input'); general.type = 'file';
+    for (const input of [image, general]) {
+      Object.defineProperty(input, 'files', { writable: true, value: [] });
+      form.append(input);
+    }
+    class Transfer {
+      files: File[] = [];
+      items = { add: (file: File) => { this.files.push(file); } };
+    }
+    Object.defineProperty(dom.window, 'DataTransfer', { value: Transfer });
+    const imageChanged = vi.fn(); image.addEventListener('change', imageChanged);
+    general.addEventListener('change', () => {
+      const holder = document.createElement('div'); holder.setAttribute('data-composer-attachments', '');
+      for (const file of general.files as unknown as File[]) {
+        const tile = document.createElement('div'); tile.setAttribute('role', 'button'); tile.setAttribute('aria-label', file.name);
+        tile.innerHTML = `<img alt="${file.name}"><button aria-label="Remove file"></button>`;
+        holder.append(tile);
+      }
+      form.append(holder);
+    });
+    const files = [
+      new dom.window.File([new Uint8Array(8)], 'benchmark.png', { type: 'image/png' }),
+      new dom.window.File([new Uint8Array(8)], 'result.png', { type: 'image/png' })
+    ];
+
+    expect(await api.uploadImages([], () => true, undefined, files)).toBe(true);
+    expect((general.files as unknown as File[])).toHaveLength(2);
+    expect(imageChanged).not.toHaveBeenCalled();
+  });
+
+  it('routes a QuickTime File through the unrestricted composer input rather than image upload', async () => {
+    const form = document.querySelector('form')!;
+    const image = document.createElement('input'); image.type = 'file'; image.accept = 'image/*';
+    const general = document.createElement('input'); general.type = 'file';
+    for (const input of [image, general]) {
+      Object.defineProperty(input, 'files', { writable: true, value: [] });
+      form.append(input);
+    }
+    class Transfer {
+      files: File[] = [];
+      items = { add: (file: File) => { this.files.push(file); } };
+    }
+    Object.defineProperty(dom.window, 'DataTransfer', { value: Transfer });
+    const imageChanged = vi.fn(); image.addEventListener('change', imageChanged);
+    general.addEventListener('change', () => {
+      const tile = document.createElement('div'); tile.setAttribute('role', 'group'); tile.setAttribute('aria-label', 'clip.mov');
+      tile.innerHTML = '<div data-default-action="true"><button aria-label="clip.mov"></button></div><button aria-label="Remove"></button>';
+      form.append(tile);
+    });
+    const file = new dom.window.File([new Uint8Array(8)], 'clip.mov', { type: 'video/quicktime' });
+
+    expect(await api.uploadImages([], () => true, undefined, [file])).toBe(true);
+    expect((general.files as unknown as File[])[0]).toBe(file);
+    expect(imageChanged).not.toHaveBeenCalled();
+  });
+
   it('fails closed when the current composer exposes ambiguous exact image inputs', async () => {
     const form = document.querySelector('form')!;
     const first = document.createElement('input'); first.type = 'file'; first.accept = 'image/*';

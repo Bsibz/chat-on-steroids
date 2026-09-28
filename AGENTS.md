@@ -862,6 +862,8 @@ show its pending delivery and Cancel control, never a task editor that main woul
 Browser delivery elects one exact tab/document/epoch and checks the right existing conversation
 or fresh-chat ownership. New-chat reuse requires a visible composer before election and after
 native preparation; unavailable surfaces are skipped so the first send can open one clean chat.
+A pinned Native Chat input elects only one existing document with a concrete matching `/c/` URL;
+remembered conversation identity on a transient root tab is recovery context, not input custody.
 A failed native preparation can grant the existing pre-send fallback, before marking readiness.
 Before claiming an input it waits for a visible composer; a mounted
 editor hidden behind a dialog leaves the input queued in its elected tab. It confirms

@@ -160,6 +160,28 @@ describe('durable user input ownership', () => {
     expect(vi.mocked(readRecentEvents)).not.toHaveBeenCalled();
   });
 
+  it.each([0, 1, 2])('publishes a pinned native browser offer with %s PNG attachments and never replays a failed row', async count => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const attachments = [];
+    for (const [index, size] of [520694, 502537].slice(0, count).entries()) {
+      attachments.push(await stageInputAttachment({ name: `screenshot-${index + 1}.png`, bytes: Buffer.alloc(size) }, new Set()));
+    }
+    const id = randomUUID();
+    const row = await enqueueNativeChatInput({ id, sessionId, conversationId: binding.conversationId,
+      text: 'Inspect these screenshots', ...(attachments.length ? { attachments } : {}) });
+    expect(row).toMatchObject({ id, state: 'queued', transportIntent: 'browser' });
+    expect(await pendingBrowserInputs()).toEqual([{ id, conversationId: binding.conversationId, nativePinned: true }]);
+    const claim = await claimBrowserInput(id, 'project-document:epoch-1', binding.conversationId, true);
+    expect(claim?.attachments ?? []).toEqual(attachments);
+    expect((await listInputs()).find(entry => entry.id === id)?.offeredAt).toBeDefined();
+    await writeDurableNow('session-input', [{ ...row, state: 'failed',
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' }]);
+    resetInputForTests();
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect(await claimBrowserInput(id, 'project-document:epoch-2', binding.conversationId, true)).toBeNull();
+  });
+
   it('never retargets or replays a native Chat intent after its pinned conversation changes', async () => {
     binding.activeTurnId = null;
     binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };

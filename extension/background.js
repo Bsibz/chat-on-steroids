@@ -1989,6 +1989,10 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
   const matchesInput = (input, tab) => {
     if (!input || !/^[a-f0-9-]{36}$/i.test(input.id)) return false;
     const target = cleanConversationId(input.conversationId);
+    // Native Chat has no opening or retarget authority. Registry memory on a
+    // transient root tab can protect recovery, but it cannot elect a document
+    // to receive an authored message or make the concrete Project tab ambiguous.
+    if (input.nativePinned === true) return !!target && !tab.pendingUrl && conversationFromUrl(tab.url) === target;
     if (target) return conversationForTab(tab) === target;
     try {
       const url = new URL(tab.pendingUrl || tab.url || '');
@@ -2012,7 +2016,7 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       if (!target || candidates.length !== 1 || !tab || !Number.isInteger(tab.id) || tab.pendingUrl) continue;
       const documentId = tabDocuments[String(tab.id)];
       const source = { tab: tab.id, documentId, navigationEpoch: tabEpochs[String(tab.id)] };
-      if (!documentId || !ownsDocument(source) || conversationForTab(tab) !== target) continue;
+      if (!documentId || !ownsDocument(source) || conversationFromUrl(tab.url) !== target) continue;
       if (elected) {
         if (elected.tab !== tab.id || (elected.conversationId && elected.conversationId !== target)) continue;
       } else {
@@ -2022,7 +2026,7 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       // Re-read after the durable election. Navigation cannot turn that election
       // into authority over whatever replaced this document.
       const current = await chrome.tabs.get(tab.id).catch(() => null);
-      if (!current || current.pendingUrl || !ownsDocument(source) || conversationForTab(current) !== target) continue;
+      if (!current || current.pendingUrl || !ownsDocument(source) || conversationFromUrl(current.url) !== target) continue;
       offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target });
       continue;
     }

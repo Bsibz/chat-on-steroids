@@ -142,7 +142,7 @@ it('carries the direct-turn offer only to the elected existing conversation', as
 });
 
 type Tab = { id: number; url?: string; pendingUrl?: string; windowId?: number; active?: boolean; pinned?: boolean };
-async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; nativePinned?: true; freshSourceConversationId?: string }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}) {
+async function worker(inputs: Array<{ id: string; conversationId: string | null; directTurn?: { id: string; startedAt: number }; supersededConversationId?: string; nativePinned?: true; freshSourceConversationId?: string; attachments?: Array<{ name: string; size: number; mimeType: string }> }>, modelCatalogRequest?: { nonce: string; expiresAt: number }, priorLocal: Record<string, unknown> = {}, priorSession: Record<string, unknown> = {}) {
   const tabs: Tab[] = [];
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
@@ -429,7 +429,64 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect(h.create).not.toHaveBeenCalled();
   });
 
-  it('keeps remembered conversation fallback for a transient ChatGPT root during reload', async () => {
+  it('offers two PNGs to the exact Project document while plugin tabs still remember that conversation', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const,
+      attachments: [
+        { name: 'benchmark.png', size: 520694, mimeType: 'image/png' },
+        { name: 'result.png', size: 502537, mimeType: 'image/png' }
+      ] };
+    const h = await worker([input], undefined, {}, {
+      tabConversations: { '6': secondId, '7': secondId, '8': secondId, '9': secondId }
+    });
+    h.tabs.push(
+      { id: 6, url: 'https://chatgpt.com/' },
+      { id: 7, url: `https://chatgpt.com/g/g-p-11111111222233334444555555555555-night-build/c/${secondId}` },
+      { id: 8, url: 'https://chatgpt.com/settings/plugins-settings?cos-plugin-refresh=one' },
+      { id: 9, url: 'https://chatgpt.com/settings/plugins-settings?cos-plugin-refresh=two' }
+    );
+    for (const tab of h.tabs) await h.authorizeDocument({ tab: { id: tab.id }, documentId: `doc-${tab.id}`, frameId: 0, url: tab.url }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
+      [7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId }]
+    ]);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it('ignores a plugin tab with a pending chat URL when offering one PNG to the Project document', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const,
+      attachments: [{ name: 'benchmark.png', size: 520694, mimeType: 'image/png' }] };
+    const h = await worker([input], undefined, {}, { tabConversations: { '7': secondId, '8': secondId } });
+    h.tabs.push(
+      { id: 7, url: `https://chatgpt.com/g/g-p-11111111222233334444555555555555-night-build/c/${secondId}` },
+      { id: 8, url: 'https://chatgpt.com/settings/plugins-settings', pendingUrl: `https://chatgpt.com/c/${secondId}` }
+    );
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'project-doc', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    await h.authorizeDocument({ tab: { id: 8 }, documentId: 'plugin-doc', frameId: 0, url: h.tabs[1]!.url }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
+      [7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId }]
+    ]);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it('ignores a plugin-refresh helper root tab that remembers the conversation', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const,
+      attachments: [{ name: 'benchmark.png', size: 520694, mimeType: 'image/png' }] };
+    const h = await worker([input], undefined, {}, { tabConversations: { '7': secondId, '8': secondId } });
+    h.tabs.push(
+      { id: 7, url: `https://chatgpt.com/g/g-p-11111111222233334444555555555555-night-build/c/${secondId}` },
+      { id: 8, url: 'https://chatgpt.com/?cos-plugin-refresh=abc#settings/Plugins' }
+    );
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'project-doc', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    await h.authorizeDocument({ tab: { id: 8 }, documentId: 'plugin-helper-doc', frameId: 0, url: h.tabs[1]!.url }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
+      [7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId }]
+    ]);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it('waits for a concrete conversation URL after a same-tab reload', async () => {
     const input = { id: firstId, conversationId: secondId, nativePinned: true as const };
     const h = await worker([input], undefined, {}, {
       tabConversations: { '7': secondId },
@@ -438,9 +495,12 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     });
     h.tabs.push({ id: 7, url: 'https://chatgpt.com/' });
     await h.maintain();
-    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
-      [7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId }]
-    ]);
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+    h.tabs[0]!.url = `https://chatgpt.com/g/g-p-11111111222233334444555555555555-night-build/c/${secondId}`;
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'project-after-reload', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 3 });
+    await h.maintain();
+    expect(h.sendMessage).toHaveBeenCalledWith(7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId });
+    expect(h.create).not.toHaveBeenCalled();
   });
 
   it('refuses duplicate or replacement documents for one native Chat intent', async () => {

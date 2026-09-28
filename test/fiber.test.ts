@@ -302,7 +302,8 @@ interface TurnFixture {
 async function scan(
   fibers: Fiber[],
   turnSections: TurnFixture[] = [],
-  repeatStableScan = false
+  repeatStableScan = false,
+  probe?: { queries: Array<{ turnId: string; selector: string }> }
 ): Promise<{
   rows: Descriptor[];
   version: number;
@@ -508,6 +509,16 @@ async function scan(
       resolve(event.data);
     });
   });
+
+  if (probe) {
+    const original = window.Element.prototype.querySelectorAll;
+    window.Element.prototype.querySelectorAll = function (this: Element, selector: string) {
+      const owner = this.closest('[data-turn-id^="historical-"]');
+      const turnId = owner?.getAttribute('data-turn-id');
+      if (turnId) probe.queries.push({ turnId, selector: String(selector) });
+      return original.call(this, selector);
+    } as typeof window.Element.prototype.querySelectorAll;
+  }
 
   // Dispatched rather than posted: jsdom's own postMessage does not set `source`, and the
   // helper refuses any message that did not come from this window.
@@ -1560,6 +1571,37 @@ describe('the calls a turn says it made', () => {
     expect(result.turns.map(turn => turn.turnId)).toEqual(selected.map(at => `turn-${at}`));
     expect(result.turns.find(turn => turn.turnId === 'turn-8')!.endMessageId).toBe('message-8');
     expect(result.turnStamps).toEqual(fixtures.map((_, at) => selected.includes(at) ? `${result.scanToken}:${selected.indexOf(at)}` : null));
+  });
+
+  it('reconciles live fiber stamps without scanning unmarked historical turn trees', async () => {
+    const offscreen = { top: -100, bottom: -10, left: 0, right: 300 };
+    const historical: TurnFixture[] = Array.from({ length: 8 }, (_, index) => ({
+      id: `historical-${index}`,
+      messages: [],
+      staleStamp: 'old-scan:0',
+      rect: offscreen,
+      rendered: Array.from({ length: 4 }, (_, block) => block === 0
+        ? { html: `Historical prose ${index}`, staleMessageStamp: 'old-scan:0:stale' }
+        : `Historical prose ${index}-${block}`),
+      ...(index === 0 ? {
+        activities: [{ label: 'old tool', fiber: chain({}), staleThoughtStamp: 'old-scan:0:stale' }]
+      } : {})
+    }));
+    const live: TurnFixture[] = Array.from({ length: 6 }, (_, index) => ({
+      id: `live-${index}`,
+      messages: [authored(`live-msg-${index}`, `Live ${index}`, { endTurn: true, status: 'finished_successfully' })]
+    }));
+    const probe = { queries: [] as Array<{ turnId: string; selector: string }> };
+    const result = await scan([], [...historical, ...live], false, probe);
+
+    expect(probe.queries).toEqual([]);
+    expect(result.turnStamps.slice(0, historical.length)).toEqual(historical.map(() => null));
+    expect(result.turnStamps.slice(historical.length)).toEqual(
+      live.map((_, index) => `${result.scanToken}:${index}`)
+    );
+    expect(result.messageStamps).toEqual(historical.flatMap(turn => turn.rendered!.map(() => null)));
+    expect(result.thoughtStamps).toEqual([null]);
+    expect(result.turns.map(turn => turn.turnId)).toEqual(live.map(turn => turn.id));
   });
 
   it('counts split visible groups once, preserves latest text budget and stable stamps', async () => {

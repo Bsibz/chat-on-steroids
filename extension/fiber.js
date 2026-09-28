@@ -1991,6 +1991,60 @@
     return { entry, messages, calls, slots, callSources, executionIds, images,
       endMessageId: imageAnswer ? imageEnd : turnEndMessageId(messages) };
   }
+  /**
+   * Apply this scan's desired stamps, then drop stamps the scan did not claim.
+   *
+   * Desired nodes are already known. Stale stamps are the elements that still carry
+   * the attribute. A long chat re-enters this path throughout generation; querying
+   * every historical markdown block, tool row and generated image only to learn it
+   * has no stamp is renderer work with no new evidence. Unchanged values are left
+   * untouched so a stable scan does not wake the isolated-world observer.
+   */
+  function reconcileStamps(attribute, desired, sections, groups) {
+    for (const [node, wanted] of desired) {
+      try {
+        if (!node || typeof node.getAttribute !== 'function' || typeof node.setAttribute !== 'function') continue;
+        if (node.getAttribute(attribute) !== wanted) node.setAttribute(attribute, wanted);
+      } catch {
+        // One hostile node must not cost the remaining stamps.
+      }
+    }
+    let stamped;
+    try {
+      stamped = document.querySelectorAll(`[${attribute}]`);
+    } catch {
+      stamped = [];
+      const seen = new Set();
+      const consider = (node) => {
+        if (!node || seen.has(node)) return;
+        seen.add(node);
+        try {
+          if (typeof node.matches === 'function' && node.matches(`[${attribute}]`)) stamped.push(node);
+          if (typeof node.querySelectorAll !== 'function') return;
+          for (const child of node.querySelectorAll(`[${attribute}]`)) {
+            if (!seen.has(child)) {
+              seen.add(child);
+              stamped.push(child);
+            }
+          }
+        } catch {
+          // A detached or hostile shell is skipped; its siblings still reconcile.
+        }
+      };
+      for (const section of sections) consider(section);
+      for (const group of groups) for (const section of group.sections) consider(section);
+    }
+    for (const node of stamped) {
+      if (desired.has(node)) continue;
+      try {
+        if (typeof node.getAttribute === 'function' && node.getAttribute(attribute) !== null &&
+            typeof node.removeAttribute === 'function') node.removeAttribute(attribute);
+      } catch {
+        // One hostile node must not cost the remaining stamps.
+      }
+    }
+  }
+
   function turnsOf(scanToken) {
     const out = [];
     let sections;
@@ -2222,54 +2276,10 @@
       // content.js will simply leave local turn ownership unset when the page turn id is null.
       if (entry) out.push(entry);
     }
-    const cleanupSections = new Set();
-    try {
-      for (const section of document.querySelectorAll(
-        `${LEGACY_TURN_SECTION}, ${SHELL_TURN}, ${CONTENT_SEARCH_TURN}, ${SEARCH_TURN_UNIT}, [data-clf-fiber-turn]`
-      )) cleanupSections.add(section);
-    } catch { for (const section of sections) cleanupSections.add(section); }
-    for (const group of groups) for (const section of group.sections) cleanupSections.add(section);
-    for (const section of cleanupSections) {
-      try {
-        if (!section || !section.getAttribute) continue;
-        for (const node of section.querySelectorAll(`[data-clf-fiber-message], ${MARKDOWN}`)) {
-          const wantedMessage = desiredMessageStamps.get(node);
-          const currentMessage = node.getAttribute('data-clf-fiber-message');
-          if (wantedMessage === undefined) {
-            if (currentMessage !== null) node.removeAttribute('data-clf-fiber-message');
-          } else if (currentMessage !== wantedMessage) node.setAttribute('data-clf-fiber-message', wantedMessage);
-        }
-        for (const node of section.querySelectorAll(`${TOOL}, [data-clf-fiber-thought]`)) {
-          const wantedThought = desiredThoughtStamps.get(node);
-          const currentThought = node.getAttribute('data-clf-fiber-thought');
-          if (wantedThought === undefined) {
-            if (currentThought !== null) node.removeAttribute('data-clf-fiber-thought');
-          } else if (currentThought !== wantedThought) node.setAttribute('data-clf-fiber-thought', wantedThought);
-        }
-        for (const node of section.querySelectorAll(`${GENERATED_IMAGE}, [data-clf-fiber-image]`)) {
-          const wantedImage = desiredImageStamps.get(node);
-          const currentImage = node.getAttribute('data-clf-fiber-image');
-          if (wantedImage === undefined) {
-            if (currentImage !== null) node.removeAttribute('data-clf-fiber-image');
-          } else if (currentImage !== wantedImage) node.setAttribute('data-clf-fiber-image', wantedImage);
-        }
-        const stampNodes = [section, ...section.querySelectorAll('[data-chatgpt-search-unit-key], [data-clf-fiber-turn]')];
-        const seenStampNodes = new Set();
-        for (const stamped of stampNodes) {
-          if (!stamped || seenStampNodes.has(stamped)) continue;
-          seenStampNodes.add(stamped);
-          const wanted = desiredTurnStamps.get(stamped);
-          const current = stamped.getAttribute('data-clf-fiber-turn');
-          if (wanted === undefined) {
-            if (current !== null && stamped.removeAttribute) stamped.removeAttribute('data-clf-fiber-turn');
-          } else if (current !== wanted && stamped.setAttribute) {
-            stamped.setAttribute('data-clf-fiber-turn', wanted);
-          }
-        }
-      } catch {
-        // One hostile/stale DOM node must not cost the remaining turns their evidence.
-      }
-    }
+    reconcileStamps('data-clf-fiber-message', desiredMessageStamps, sections, groups);
+    reconcileStamps('data-clf-fiber-thought', desiredThoughtStamps, sections, groups);
+    reconcileStamps('data-clf-fiber-image', desiredImageStamps, sections, groups);
+    reconcileStamps('data-clf-fiber-turn', desiredTurnStamps, sections, groups);
     return out;
   }
 

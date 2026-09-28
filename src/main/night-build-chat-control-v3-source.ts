@@ -11,9 +11,8 @@ import type { NightBuildChatSendIntentV2 } from '../shared/night-build-chat-tran
 import { getChatModels, startChatModelDiscovery } from './chat-models.js';
 import { getConfig } from './config.js';
 import type { NightBuildChatTransportV2DataSource } from './night-build-chat-transport-v2-source.js';
+import { createInProcessNightBuildChatResolver } from './night-build-chat-in-process-resolver.js';
 import {
-  nightBuildChatHandleForIdentity,
-  resolveNightBuildChatConversation,
   resolveNightBuildChatNativeSendProofByIdentity
 } from './night-build-chat-transport-source.js';
 import { stageInputAttachment } from './session/input-attachments.js';
@@ -83,13 +82,14 @@ export function createInProcessNightBuildChatControlV3Source(
   salt: string,
   writable: NightBuildChatTransportV2DataSource
 ): NightBuildChatControlV3DataSource {
+  const conversations = createInProcessNightBuildChatResolver(salt);
   const freshStatus = async (id: string): Promise<BareFreshSendIntent | null> => {
     const row = (await listInputs()).find((entry) =>
       entry.id === id && !!entry.freshSourceConversationId && !!entry.freshSourceHandle
     );
     if (!row?.sessionId) return null;
     const destinationConversation = row.conversationId
-      ? await nightBuildChatHandleForIdentity(userData, salt, row.sessionId, row.conversationId)
+      ? await conversations.handleForIdentity(row.sessionId, row.conversationId)
       : null;
     let proof = null;
     if (destinationConversation && row.messageId && row.deliveredAt !== undefined && row.conversationId) {
@@ -132,7 +132,7 @@ export function createInProcessNightBuildChatControlV3Source(
 
   return {
     async state(conversation) {
-      const resolved = await resolveNightBuildChatConversation(userData, salt, conversation);
+      const resolved = await conversations.resolve(conversation);
       if (!resolved) throw new Error('native_chat_conversation_unavailable');
       const session = await getSession(resolved.sessionId);
       if (!session || session.conversationId !== resolved.conversationId) {
@@ -214,7 +214,7 @@ export function createInProcessNightBuildChatControlV3Source(
         return status;
       }
       if (getConfig().sessions.record !== true) throw new Error('native_chat_recording_required');
-      const source = await resolveNightBuildChatConversation(userData, salt, input.sourceConversation);
+      const source = await conversations.resolve(input.sourceConversation);
       if (!source) throw new Error('native_chat_conversation_unavailable');
       const session = await getSession(source.sessionId);
       if (!session || session.conversationId !== source.conversationId ||

@@ -10,6 +10,7 @@ import type {
 import type { NightBuildChatConfiguredSendCreateV3 } from '../shared/night-build-chat-control-v3.js';
 import type { TurnOutcome } from '../shared/session.js';
 import { getConfig } from './config.js';
+import { createInProcessNightBuildChatResolver } from './night-build-chat-in-process-resolver.js';
 import { nativeChatStopPending, requestNativeChatStop, startBridge, STOP_COMMAND_TIMEOUT_MS } from './bridge.js';
 import { readDurable, writeDurableNow } from './durable.js';
 import { continuationForSession } from './session/continuation.js';
@@ -24,9 +25,7 @@ import {
 } from './session/input.js';
 import { getSession, readTurnEnd, withSessionMutationAdmission } from './session/store.js';
 import {
-  createNightBuildChatTransportSource,
-  nightBuildChatHandleForIdentity,
-  resolveNightBuildChatConversation,
+  readNightBuildChatTranscriptByIdentity,
   resolveNightBuildChatNativeSendProofByIdentity,
   type NightBuildChatTranscriptQuery
 } from './night-build-chat-transport-source.js';
@@ -111,14 +110,12 @@ export function createInProcessNightBuildChatTransportV2Source(
   userData: string,
   salt: string
 ): NightBuildChatTransportV2DataSource {
-  const read = createNightBuildChatTransportSource(userData, salt);
+  const conversations = createInProcessNightBuildChatResolver(salt);
 
   const sendStatus = async (id: string) => {
     const row = (await listInputs()).find((entry) => entry.id === id && entry.nativeChat);
     if (!row?.nativeChat || !row.sessionId) return null;
-    const currentConversation = await nightBuildChatHandleForIdentity(
-      userData,
-      salt,
+    const currentConversation = await conversations.handleForIdentity(
       row.nativeChat.sessionId,
       row.nativeChat.conversationId
     );
@@ -202,8 +199,27 @@ export function createInProcessNightBuildChatTransportV2Source(
   };
 
   return {
-    list: () => read.list(),
-    transcript: (query) => read.transcript(query),
+    list: () => conversations.list(),
+    async transcript(query) {
+      const resolved = await conversations.resolve(query.conversation);
+      if (!resolved) throw new Error('chat_transport_conversation_not_found');
+      const transcript = await readNightBuildChatTranscriptByIdentity(
+        userData,
+        salt,
+        resolved.sessionId,
+        resolved.conversationId,
+        query
+      );
+      // Compact & Resume can move a session while the durable projection is
+      // being read. The memory index is the process authority for current
+      // attachment, so re-check it after the awaited read before returning.
+      const current = await conversations.resolve(query.conversation);
+      if (!current || current.sessionId !== resolved.sessionId ||
+          current.conversationId !== resolved.conversationId) {
+        throw new Error('chat_transport_projection_changed');
+      }
+      return transcript;
+    },
     async createSend(input) {
       const configured = 'model' in input;
       const requestedModel = configured ? input.model : null;
@@ -231,7 +247,7 @@ export function createInProcessNightBuildChatTransportV2Source(
         return status;
       }
       if (getConfig().sessions.record !== true) throw new Error('native_chat_recording_required');
-      const resolved = await resolveNightBuildChatConversation(userData, salt, input.conversation);
+      const resolved = await conversations.resolve(input.conversation);
       if (!resolved) throw new Error('native_chat_conversation_unavailable');
       // Starting the existing authenticated browser bridge grants no new external
       // authority; it only lets the extension collect the already-durable pinned input.
@@ -249,7 +265,7 @@ export function createInProcessNightBuildChatTransportV2Source(
       // final exact ownership is rechecked again while the session queue is owned.
       await assertNativeChatInputReady(nativeInput);
       const admitted = await withSessionMutationAdmission(resolved.sessionId, 'native chat send admission', async () => {
-        const current = await resolveNightBuildChatConversation(userData, salt, input.conversation);
+        const current = await conversations.resolve(input.conversation);
         if (!current || current.sessionId !== resolved.sessionId ||
             current.conversationId !== resolved.conversationId ||
             continuationForSession(resolved.sessionId)) {

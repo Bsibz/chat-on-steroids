@@ -59,6 +59,7 @@ const {
   continuationForSession
 } = await import('../src/main/session/continuation.js');
 const { nightBuildChatHandleForIdentity } = await import('../src/main/night-build-chat-transport-source.js');
+const { createInProcessNightBuildChatResolver } = await import('../src/main/night-build-chat-in-process-resolver.js');
 const { createInProcessNightBuildChatOwnerControlV1Source } = await import(
   '../src/main/night-build-chat-owner-control-v1-source.js'
 );
@@ -427,6 +428,28 @@ describe('Night Build Chat owner control v1 in-process owners', () => {
   }
 
   const ownerSource = () => createInProcessNightBuildChatOwnerControlV1Source(dir, SALT);
+
+  it('tracks current handles through the live session index without reviving a stale handle', async () => {
+    const sourceChat = chatId('resolver-source');
+    const movedChat = chatId('resolver-moved');
+    const current = await ownerSession(sourceChat);
+    const resolver = createInProcessNightBuildChatResolver(SALT);
+
+    expect(await resolver.resolve(current.handle)).toMatchObject({
+      sessionId: current.sessionId,
+      conversationId: sourceChat
+    });
+    expect((await resolver.list()).some((row) => row.handle === current.handle)).toBe(true);
+
+    expect(await rebindSession(current.sessionId, sourceChat, movedChat)).toBe(true);
+    expect(await resolver.resolve(current.handle)).toBeNull();
+    const movedHandle = await resolver.handleForIdentity(current.sessionId, movedChat);
+    expect(movedHandle).toBeTypeOf('string');
+    expect(await resolver.resolve(movedHandle!)).toMatchObject({
+      sessionId: current.sessionId,
+      conversationId: movedChat
+    });
+  });
 
   it('distinguishes configured global auto-compaction from the effective per-chat answer', async () => {
     const conversationId = chatId('auto');

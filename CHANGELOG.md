@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.47] - Native Chat in-process metadata reuse
+
+- Night Build Native Chat now resolves its repeated in-process conversation list, control and owner-control reads from CoS's existing process-lifetime session metadata index instead of reparsing every retained `meta.json` on every poll.
+- Transcript reads still reread and fence the selected session's durable metadata/canonical history before returning; Compact & Resume and stale-handle mutations continue to revalidate exact current ownership.
+- The standalone read-only sidecar keeps its independent file-backed catalog path unchanged.
+
 ## [2.1.46] - Current ChatGPT attachment input compatibility
 
 - Native Chat attachment upload no longer depends on ChatGPT's retired `#upload-photos` / `#upload-files` ids.

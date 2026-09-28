@@ -14,7 +14,10 @@ import {
 } from './bridge.js';
 import { getConfig } from './config.js';
 import {
-  resolveNightBuildChatConversation,
+  createInProcessNightBuildChatResolver,
+  type NightBuildChatInProcessResolver
+} from './night-build-chat-in-process-resolver.js';
+import {
   type NightBuildChatResolvedConversation
 } from './night-build-chat-transport-source.js';
 import { isChatBlocked } from './session/blocked-chats.js';
@@ -54,11 +57,10 @@ export interface NightBuildChatOwnerControlV1DataSource {
  * automation or compaction authority through a stale handle.
  */
 async function currentConversation(
-  userData: string,
-  salt: string,
+  conversations: NightBuildChatInProcessResolver,
   conversation: string
 ): Promise<NightBuildChatResolvedConversation> {
-  const resolved = await resolveNightBuildChatConversation(userData, salt, conversation);
+  const resolved = await conversations.resolve(conversation);
   if (!resolved) throw new Error('native_chat_conversation_unavailable');
   const session = await getSession(resolved.sessionId);
   if (!session || session.conversationId !== resolved.conversationId) {
@@ -72,12 +74,11 @@ async function currentConversation(
 
 /** Revalidate around every awaited owner call; a moved handle never inherits the result. */
 async function assertUnchanged(
-  userData: string,
-  salt: string,
+  conversations: NightBuildChatInProcessResolver,
   conversation: string,
   resolved: NightBuildChatResolvedConversation
 ): Promise<void> {
-  const current = await resolveNightBuildChatConversation(userData, salt, conversation);
+  const current = await conversations.resolve(conversation);
   if (!current || current.sessionId !== resolved.sessionId || current.conversationId !== resolved.conversationId) {
     throw new Error('native_chat_conversation_changed');
   }
@@ -126,50 +127,51 @@ async function projectOwnerState(
 }
 
 export function createInProcessNightBuildChatOwnerControlV1Source(
-  userData: string,
+  _userData: string,
   salt: string
 ): NightBuildChatOwnerControlV1DataSource {
+  const conversations = createInProcessNightBuildChatResolver(salt);
   return {
     async state(conversation) {
-      const resolved = await currentConversation(userData, salt, conversation);
+      const resolved = await currentConversation(conversations, conversation);
       const state = await projectOwnerState(conversation, resolved);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      await assertUnchanged(conversations, conversation, resolved);
       return state;
     },
 
     async setAutoCompaction(conversation, enabled) {
-      const resolved = await currentConversation(userData, salt, conversation);
+      const resolved = await currentConversation(conversations, conversation);
       // Same fences as the browser sheet: a worker chat never changes the app-wide switch,
       // and a blocked chat may only turn it off.
       if (goalWorkerChat(resolved.conversationId)) throw new Error('worker_compaction_disabled');
       if (enabled && isChatBlocked(resolved.conversationId)) throw new Error('chat_blocked');
-      await assertUnchanged(userData, salt, conversation, resolved);
+      await assertUnchanged(conversations, conversation, resolved);
       const cancelledAutomatic = await setAutomaticCompactionNow(enabled);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      await assertUnchanged(conversations, conversation, resolved);
       return { ...(await projectOwnerState(conversation, resolved)), cancelledAutomatic };
     },
 
     async setMode(conversation, mode) {
-      const resolved = await currentConversation(userData, salt, conversation);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      const resolved = await currentConversation(conversations, conversation);
+      await assertUnchanged(conversations, conversation, resolved);
       await setSessionAutomation(resolved.sessionId, mode);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      await assertUnchanged(conversations, conversation, resolved);
       return projectOwnerState(conversation, resolved);
     },
 
     async compact(conversation) {
-      const resolved = await currentConversation(userData, salt, conversation);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      const resolved = await currentConversation(conversations, conversation);
+      await assertUnchanged(conversations, conversation, resolved);
       await compactSession(resolved.sessionId);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      await assertUnchanged(conversations, conversation, resolved);
       return projectOwnerState(conversation, resolved);
     },
 
     async cancelCompaction(conversation) {
-      const resolved = await currentConversation(userData, salt, conversation);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      const resolved = await currentConversation(conversations, conversation);
+      await assertUnchanged(conversations, conversation, resolved);
       const cancelled = await cancelSessionCompactionNow(resolved.sessionId);
-      await assertUnchanged(userData, salt, conversation, resolved);
+      await assertUnchanged(conversations, conversation, resolved);
       return { ...(await projectOwnerState(conversation, resolved)), cancelled };
     }
   };

@@ -1024,8 +1024,20 @@ async function catalogRows(userData: string): Promise<CatalogRow[]> {
   return rows.filter((row) => ownership.get(row.meta.conversationId) === 1);
 }
 
+export function nightBuildChatConversationHandle(
+  salt: string,
+  sessionId: string,
+  conversationId: string
+): string {
+  if (!salt) throw new Error('chat_transport_salt_missing');
+  if (!SESSION_ID.test(sessionId) || !CHAT_ID.test(conversationId)) {
+    throw new Error('chat_transport_conversation_invalid');
+  }
+  return opaque(salt, 'conversation', sessionId + '\0' + conversationId);
+}
+
 function conversationHandle(row: CatalogRow, salt: string): string {
-  return opaque(salt, 'conversation', row.directoryId + '\0' + row.meta.conversationId);
+  return nightBuildChatConversationHandle(salt, row.directoryId, row.meta.conversationId);
 }
 
 function publicConversation(row: CatalogRow, salt: string): NightBuildChatConversationV1 {
@@ -1035,6 +1047,26 @@ function publicConversation(row: CatalogRow, salt: string): NightBuildChatConver
 async function catalogRowForHandle(userData: string, salt: string, handle: string): Promise<CatalogRow | null> {
   const matches = (await catalogRows(userData)).filter((row) => conversationHandle(row, salt) === handle);
   return matches.length === 1 ? matches[0]! : null;
+}
+
+async function catalogRowForIdentity(
+  userData: string,
+  sessionId: string,
+  conversationId: string
+): Promise<CatalogRow | null> {
+  if (!SESSION_ID.test(sessionId) || !CHAT_ID.test(conversationId)) return null;
+  let meta: SessionMeta | null;
+  try {
+    meta = parseMeta(
+      await readJson(path.join(userData, 'sessions', sessionId, 'meta.json'), MAX_META_BYTES),
+      sessionId
+    );
+  } catch (error) {
+    if ((error as Error).message === 'chat_transport_projection_unsupported') return null;
+    throw error;
+  }
+  if (!meta || meta.conversationId !== conversationId) return null;
+  return { directoryId: sessionId, meta };
 }
 
 export async function resolveNightBuildChatConversation(
@@ -1299,6 +1331,117 @@ async function selectedProjection(userData: string, row: CatalogRow): Promise<Se
   };
 }
 
+async function transcriptForRow(
+  userData: string,
+  salt: string,
+  row: CatalogRow,
+  query: NightBuildChatTranscriptQuery
+): Promise<Omit<NightBuildChatTranscriptV1, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>> {
+  const projection = await selectedProjection(userData, row);
+  const activity = projectNightBuildToolActivity(
+    projection.toolActivity,
+    {
+      conversationId: projection.row.meta.conversationId,
+      lowerBoundOrigin: projection.lowerBoundOrigin,
+      turnOrigin: (turnId) => projectedTurnOrigin(projection.identity, turnId),
+      requestTurn: (requestId) => {
+        if (!Object.hasOwn(projection.identity.requestTurns, requestId)) return undefined;
+        const owner = projection.identity.requestTurns[requestId];
+        return owner && owner.conversationId === projection.row.meta.conversationId ? owner : null;
+      }
+    },
+    salt,
+    os.homedir()
+  );
+  const messages = projection.messages.filter((message) => message.origin >= projection.lowerBoundOrigin);
+  const progress = projection.journal.progress
+    .map((entry) => publicProgress(entry, projection, salt))
+    .filter((entry): entry is NightBuildChatTranscriptItemV1 => entry !== null);
+  type PageRow = {
+    origin: number;
+    revision: number;
+    item?: NightBuildChatTranscriptItemV1;
+    activity?: NightBuildChatActivityItemV1;
+  };
+  const timeline: PageRow[] = [
+    ...messages.map((message) => {
+      const item = publicItem(message, projection, salt);
+      return { origin: item.originSeq, revision: item.revisionSeq, item };
+    }),
+    ...progress.map((item) => ({ origin: item.originSeq, revision: item.revisionSeq, item })),
+    ...activity.map((entry) => ({ origin: entry.originSeq, revision: entry.revisionSeq, activity: entry }))
+  ];
+  let selected: PageRow[];
+  let mode: NightBuildChatTranscriptV1['page']['mode'];
+  let hasEarlier = false;
+  let hasMore = false;
+  if (query.afterRevision !== undefined) {
+    mode = 'incremental';
+    const changed = timeline.filter((entry) => entry.revision > query.afterRevision!)
+      .sort((a, b) => a.revision - b.revision || a.origin - b.origin);
+    selected = changed.slice(0, query.limit);
+    hasMore = changed.length > selected.length;
+  } else if (query.beforeOrigin !== undefined) {
+    mode = 'backfill';
+    const earlier = timeline.filter((entry) => entry.origin < query.beforeOrigin!)
+      .sort((a, b) => a.origin - b.origin || a.revision - b.revision);
+    selected = earlier.slice(-query.limit);
+    hasEarlier = earlier.length > selected.length;
+  } else {
+    mode = 'recent';
+    const ordered = [...timeline].sort((a, b) => a.origin - b.origin || a.revision - b.revision);
+    selected = ordered.slice(-query.limit);
+    hasEarlier = ordered.length > selected.length;
+  }
+  const items = selected.flatMap((entry) => entry.item ? [entry.item] : []);
+  const pageActivity = selected.flatMap((entry) => entry.activity ? [entry.activity] : []);
+  const origins = selected.map((entry) => entry.origin);
+  return {
+    conversation: {
+      handle: query.conversation,
+      title: projection.row.meta.title,
+      updatedAt: projection.row.meta.updatedAt
+    },
+    projection: {
+      current: true,
+      identitySource: projection.identitySource,
+      lowerBoundOrigin: projection.lowerBoundOrigin,
+      observedHighWaterSeq: projection.highWaterSeq,
+      metadataHighWaterSeq: projection.row.meta.historySeq
+    },
+    page: {
+      mode,
+      hasEarlier,
+      hasMore,
+      earliestOrigin: origins.length ? Math.min(...origins) : null,
+      latestRevision: selected.reduce((max, entry) => Math.max(max, entry.revision), query.afterRevision ?? 0)
+    },
+    currentTurn: currentTurn(projection),
+    items,
+    activity: pageActivity
+  };
+}
+
+/**
+ * In-process fast path after the session store has already resolved the opaque
+ * handle to one exact current session + conversation.  The selected session's
+ * durable metadata is still reread here and selectedProjection keeps its full
+ * before/after/final fences, so this skips only the unrelated all-session scan.
+ */
+export async function readNightBuildChatTranscriptByIdentity(
+  userData: string,
+  salt: string,
+  sessionId: string,
+  conversationId: string,
+  query: NightBuildChatTranscriptQuery
+): Promise<Omit<NightBuildChatTranscriptV1, 'protocolVersion' | 'appVersion' | 'transportStartedAt' | 'observedAt'>> {
+  const expectedHandle = nightBuildChatConversationHandle(salt, sessionId, conversationId);
+  if (expectedHandle !== query.conversation) throw new Error('chat_transport_conversation_not_found');
+  const row = await catalogRowForIdentity(userData, sessionId, conversationId);
+  if (!row) throw new Error('chat_transport_conversation_not_found');
+  return transcriptForRow(userData, salt, row, query);
+}
+
 export function createNightBuildChatTransportSource(userData: string, salt: string): NightBuildChatTransportDataSource {
   if (!salt) throw new Error('chat_transport_salt_missing');
   return {
@@ -1312,87 +1455,7 @@ export function createNightBuildChatTransportSource(userData: string, salt: stri
       const rows = await catalogRows(userData);
       const matches = rows.filter((row) => conversationHandle(row, salt) === query.conversation);
       if (matches.length !== 1) throw new Error('chat_transport_conversation_not_found');
-      const projection = await selectedProjection(userData, matches[0]!);
-      const activity = projectNightBuildToolActivity(
-        projection.toolActivity,
-        {
-          conversationId: projection.row.meta.conversationId,
-          lowerBoundOrigin: projection.lowerBoundOrigin,
-          turnOrigin: (turnId) => projectedTurnOrigin(projection.identity, turnId),
-          requestTurn: (requestId) => {
-            if (!Object.hasOwn(projection.identity.requestTurns, requestId)) return undefined;
-            const owner = projection.identity.requestTurns[requestId];
-            return owner && owner.conversationId === projection.row.meta.conversationId ? owner : null;
-          }
-        },
-        salt,
-        os.homedir()
-      );
-      const messages = projection.messages.filter((message) => message.origin >= projection.lowerBoundOrigin);
-      const progress = projection.journal.progress
-        .map((row) => publicProgress(row, projection, salt))
-        .filter((row): row is NightBuildChatTranscriptItemV1 => row !== null);
-      type PageRow = {
-        origin: number;
-        revision: number;
-        item?: NightBuildChatTranscriptItemV1;
-        activity?: NightBuildChatActivityItemV1;
-      };
-      const timeline: PageRow[] = [
-        ...messages.map((message) => {
-          const item = publicItem(message, projection, salt);
-          return { origin: item.originSeq, revision: item.revisionSeq, item };
-        }),
-        ...progress.map((item) => ({ origin: item.originSeq, revision: item.revisionSeq, item })),
-        ...activity.map((row) => ({ origin: row.originSeq, revision: row.revisionSeq, activity: row }))
-      ];
-      let selected: PageRow[];
-      let mode: NightBuildChatTranscriptV1['page']['mode'];
-      let hasEarlier = false;
-      let hasMore = false;
-      if (query.afterRevision !== undefined) {
-        mode = 'incremental';
-        const changed = timeline.filter((row) => row.revision > query.afterRevision!).sort((a, b) => a.revision - b.revision || a.origin - b.origin);
-        selected = changed.slice(0, query.limit);
-        hasMore = changed.length > selected.length;
-      } else if (query.beforeOrigin !== undefined) {
-        mode = 'backfill';
-        const earlier = timeline.filter((row) => row.origin < query.beforeOrigin!).sort((a, b) => a.origin - b.origin || a.revision - b.revision);
-        selected = earlier.slice(-query.limit);
-        hasEarlier = earlier.length > selected.length;
-      } else {
-        mode = 'recent';
-        const ordered = [...timeline].sort((a, b) => a.origin - b.origin || a.revision - b.revision);
-        selected = ordered.slice(-query.limit);
-        hasEarlier = ordered.length > selected.length;
-      }
-      const items = selected.flatMap((row) => row.item ? [row.item] : []);
-      const pageActivity = selected.flatMap((row) => row.activity ? [row.activity] : []);
-      const origins = selected.map((row) => row.origin);
-      return {
-        conversation: {
-          handle: query.conversation,
-          title: projection.row.meta.title,
-          updatedAt: projection.row.meta.updatedAt
-        },
-        projection: {
-          current: true,
-          identitySource: projection.identitySource,
-          lowerBoundOrigin: projection.lowerBoundOrigin,
-          observedHighWaterSeq: projection.highWaterSeq,
-          metadataHighWaterSeq: projection.row.meta.historySeq
-        },
-        page: {
-          mode,
-          hasEarlier,
-          hasMore,
-          earliestOrigin: origins.length ? Math.min(...origins) : null,
-          latestRevision: selected.reduce((max, row) => Math.max(max, row.revision), query.afterRevision ?? 0)
-        },
-        currentTurn: currentTurn(projection),
-        items,
-        activity: pageActivity
-      };
+      return transcriptForRow(userData, salt, matches[0]!, query);
     }
   };
 }

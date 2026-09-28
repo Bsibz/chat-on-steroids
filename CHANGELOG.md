@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.48] - Compaction restore identity and browser scan efficiency
+
+- Restart recovery no longer lets a stale, dropped Compact & Resume command remember a finished ticket ahead of the live continuation for the same session; owner controls and Cancel keep pointing at the transaction the durable ledger still owes.
+- Fiber stamp reconciliation no longer walks every historical turn's markdown, tool and generated-image trees during repeated generation scans. It writes the live desired stamps directly and removes only elements that still carry stale CoS fiber-stamp attributes.
+- Exact Native Chat ownership, transcript capture, send/stop fences and standalone sidecar behavior are unchanged.
+
 ## [2.1.47] - Native Chat in-process metadata reuse
 
 - Night Build Native Chat now resolves its repeated in-process conversation list, control and owner-control reads from CoS's existing process-lifetime session metadata index instead of reparsing every retained `meta.json` on every poll.

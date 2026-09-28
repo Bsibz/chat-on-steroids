@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.56] - Release auto-compaction after terminal Native Chat ACK
+
+- A terminal Native Chat `sent` row with an exact browser ACK no longer fences future Compact & Resume merely because richer recorder acceptance metadata has not yet been projected.
+- Authorized-but-uncertain sends and unsettled Stops remain mutation owners and continue to block compaction fail-closed.
+- Adds regression coverage for threshold-exceeded automatic compaction, concurrent continuation admission, pre-Send failure release, and authorized cancellation retention.
+
 ## [2.1.55] - Ready attachment draft continuity
 
 - Keeps an exact Native Chat attachment draft owned after ChatGPT has fully enabled native Send even if stale upload progress semantics remain mounted in the composer.

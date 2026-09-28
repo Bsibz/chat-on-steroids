@@ -11,14 +11,17 @@ if (process.platform !== 'darwin') {
   throw new Error(`smoke-macos-bundle.mjs must run on macOS, got ${process.platform}`);
 }
 
-const arch = process.argv[2];
+const rawArgs = process.argv.slice(2);
+const arch = rawArgs[0];
 if (arch !== 'x64' && arch !== 'arm64') throw new Error(`Expected x64 or arm64, got ${arch ?? '(missing)'}`);
+const allowAppleDevelopment = rawArgs.includes('--allow-apple-development');
 const expectedMachArch = arch === 'x64' ? 'x86_64' : 'arm64';
 const oppositeMachArch = arch === 'x64' ? 'arm64' : 'x86_64';
 const releaseDir = path.resolve('release');
 const unpackedDir = arch === 'arm64' ? 'mac-arm64' : 'mac';
-const app = process.argv[3]
-  ? path.resolve(process.argv[3])
+const appArg = rawArgs.slice(1).find((arg) => arg !== '--allow-apple-development');
+const app = appArg
+  ? path.resolve(appArg)
   : path.join(releaseDir, unpackedDir, 'Chat On Steroids.app');
 const contents = path.join(app, 'Contents');
 const resources = path.join(contents, 'Resources');
@@ -173,15 +176,26 @@ if (launchedMachOCount < 6) {
 // The afterPack hook creates the seal and runs the real --verify --deep --strict against the app
 // it just sealed, where a failure can still stop the build before an artifact exists.
 const signature = run('codesign', ['--display', '--verbose=4', app], { allowFailure: true });
-assertNoTrustBearingMacCodeSignature(
-  app,
-  signature,
-  existsSync(path.join(contents, '_CodeSignature', 'CodeResources'))
-);
+if (allowAppleDevelopment) {
+  const shown = `${signature.stdout ?? ''}\n${signature.stderr ?? ''}`;
+  if (signature.status !== 0) throw new Error(`Apple Development signature inspection failed for ${app}`);
+  if (/^Signature=adhoc$/m.test(shown) || !/^Authority=Apple Development:/m.test(shown)) {
+    throw new Error(`Expected an Apple Development signature for local dogfood: ${shown.trim()}`);
+  }
+  if (!/^Identifier=com\.chatonsteroids\.app$/m.test(shown) || !/^TeamIdentifier=[A-Z0-9]{10}$/m.test(shown)) {
+    throw new Error(`Local dogfood signature has the wrong identifier or no TeamIdentifier: ${shown.trim()}`);
+  }
+} else {
+  assertNoTrustBearingMacCodeSignature(
+    app,
+    signature,
+    existsSync(path.join(contents, '_CodeSignature', 'CodeResources'))
+  );
+}
 // Check the copied payload too: a valid source seal does not prove that DMG/ZIP
 // construction preserved every sealed resource and nested executable.
 run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', app]);
 
 process.stdout.write(
-  `macOS ${arch} bundle metadata/icon, ${launchedMachOCount} launchable executable modes, ${machOCount} thin Mach-O payloads, deployment floors and unsigned policy verified.\n`
+  `macOS ${arch} bundle metadata/icon, ${launchedMachOCount} launchable executable modes, ${machOCount} thin Mach-O payloads, deployment floors and ${allowAppleDevelopment ? 'Apple Development local-dogfood' : 'unsigned'} policy verified.\n`
 );

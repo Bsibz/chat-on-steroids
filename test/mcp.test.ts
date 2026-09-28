@@ -23,6 +23,8 @@ import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
+import { matchInboundRequestOrigin, requestOriginDigest, resetRequestOriginDiagnostics } from '../src/main/request-origin-diagnostic.js';
+import { matchInboundRequestId, resetRequestOriginStateForTests } from '../src/main/request-origin.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
 import { friendlyError } from '../src/main/mcp/kernel.js';
 import { SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
@@ -574,6 +576,48 @@ describe('endpoint hardening', () => {
     const res = await rawPost(endpoint.urls.core, JSON.stringify({ hello: 'world' }));
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(toolNames(await core('tools/list'))).toContain('read');
+  });
+
+  it('records a valid inbound x-request-id as bounded diagnostic digest and exact production id', async () => {
+    resetRequestOriginDiagnostics();
+    resetRequestOriginStateForTests();
+    const requestId = 'wfr_diag_ingress_probe_01';
+    const reply = await modern(
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/notes.txt'], start_line: 1, end_line: 1 } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
+    expect(failed(reply)).toBe(false);
+    // The normalized join key is what the page model holds; its digest is present, and
+    // the per-hop suffix is not a separate identity.
+    const age = matchInboundRequestOrigin(requestOriginDigest(requestId));
+    expect(age).not.toBeNull();
+    expect(age).toBeGreaterThanOrEqual(0);
+    expect(matchInboundRequestOrigin(requestOriginDigest('wfr_absent_digest'))).toBeNull();
+    expect(matchInboundRequestOrigin(requestOriginDigest(`${requestId}/att1`))).toBeNull();
+    // The production registry holds the same normalized id for exact equality with a
+    // direct-A SSE observation; the suffix and any other id remain unmatched.
+    expect(matchInboundRequestId(requestId)).toBe(true);
+    expect(matchInboundRequestId(`${requestId}/att1`)).toBe(false);
+    expect(matchInboundRequestId('wfr_absent_digest')).toBe(false);
+    // The approved contract scopes production equality evidence to Core. A Desktop request
+    // still feeds the diagnostic digest, but never the direct-A equality registry.
+    const desktopId = 'wfr_desktop_ingress_probe_01';
+    const desktop = await rawPost(endpoint.urls.desktop, JSON.stringify({
+      jsonrpc: '2.0',
+      id: 99,
+      method: 'tools/list',
+      params: { _meta: { [META_VERSION]: PROTOCOL_2026, [META_CAPABILITIES]: {} } }
+    }), {
+      'x-request-id': desktopId,
+      'MCP-Protocol-Version': PROTOCOL_2026,
+      'Mcp-Method': 'tools/list'
+    });
+    expect(desktop.status).toBe(200);
+    expect(matchInboundRequestId(desktopId)).toBe(false);
+    expect(matchInboundRequestOrigin(requestOriginDigest(desktopId))).not.toBeNull();
+    resetRequestOriginDiagnostics();
+    resetRequestOriginStateForTests();
   });
 });
 
@@ -2809,6 +2853,7 @@ describe('exec_command and write_stdin', () => {
     expect(Object.keys(stdin.inputSchema.properties)).toEqual([
       'session_id',
       'chars',
+      'reread_retained',
       'yield_time_ms',
       'max_output_tokens'
     ]);
@@ -2816,6 +2861,7 @@ describe('exec_command and write_stdin', () => {
     expect(stdin.inputSchema.additionalProperties).toBe(false);
     expect(stdin.inputSchema.properties.session_id.type).toBe('number');
     expect(stdin.inputSchema.properties.chars.type).toBe('string');
+    expect(stdin.inputSchema.properties.reread_retained.type).toBe('boolean');
     expect(stdin.inputSchema.properties.yield_time_ms.type).toBe('number');
     expect(stdin.inputSchema.properties.max_output_tokens.type).toBe('number');
     for (const retired of ['cursor', 'close', 'signal', 'env', 'max_lines']) {
@@ -3408,9 +3454,12 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(unifiedExecManager.exitedUnread(owned)).toEqual([]);
     const reread = await asChat('wfr_background_owner', 'write_stdin', { session_id: sessionId, chars: '' });
     expect(failed(reread), textOf(reread)).toBe(false);
-    expect(textOf(reread)).toContain('Retained output');
-    expect(textOf(reread)).toContain('background-e2e-once');
+    expect(textOf(reread)).toContain('duplicate body omitted');
+    expect(textOf(reread)).not.toContain('background-e2e-once');
     expect(textOf(reread)).toContain('Process exited with code 7');
+    expect(reread.body.result?.structuredContent).toMatchObject({ output_replayed: true, duplicate_output_omitted: true });
+    const exactReread = await asChat('wfr_background_owner', 'write_stdin', { session_id: sessionId, chars: '', reread_retained: true });
+    expect(textOf(exactReread)).toContain('background-e2e-once');
     const forbidden = await asChat('wfr_background_other', 'write_stdin', { session_id: sessionId, chars: '' });
     expect(failed(forbidden)).toBe(true);
     expect(textOf(forbidden)).not.toContain('background-e2e-once');
@@ -3421,7 +3470,7 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(failed(direct), textOf(direct)).toBe(false);
     const completedId = Number(textOf(direct).match(/Completed session ID: (\d+)/)?.[1]);
     expect(Number.isInteger(completedId)).toBe(true);
-    const directRead = await asChat('wfr_background_owner', 'write_stdin', { session_id: completedId, chars: '' });
+    const directRead = await asChat('wfr_background_owner', 'write_stdin', { session_id: completedId, chars: '', reread_retained: true });
     expect(failed(directRead), textOf(directRead)).toBe(false);
     expect(textOf(directRead)).toContain('direct-result');
   });

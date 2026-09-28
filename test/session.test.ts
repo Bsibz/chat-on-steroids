@@ -53,6 +53,7 @@ import {
   conversationHasMcpCallSince,
   readHandoff,
   rebindSession,
+  refuseAutomaticCompactionNow,
   renameSession,
   reopenSession,
   resetSessionStoreForTests,
@@ -1745,6 +1746,40 @@ describe('session store', () => {
     }
   });
 
+  it('fires exactly at the shipped 750k trigger and keeps a refused turn latched far above it', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true } });
+    try {
+      const summary = await createSession({ title: 'long chat window', conversationId: 'conv-long-window' });
+      await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'long-turn' });
+      await appendEvent(summary.id, {
+        time: 2,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'long-u',
+        turnId: 'long-turn',
+        // Clipped storage with an exact original length: the estimate follows the whole text.
+        message: { text: 'long chat preview', truncated: true, chars: 3_000_000 }
+      });
+      const atLine = (await getSession(summary.id))!;
+      // The trigger is the local recorded estimate itself, never provider context occupancy.
+      expect(base.compaction.autoTokens).toBe(750_000);
+      expect(atLine.contextTokens).toBe(750_000);
+      expect(autoCompactionReady(atLine)).toBe(true);
+      // One local unit below the line stays quiet.
+      expect(autoCompactionReady({ ...atLine, contextTokens: 749_999 })).toBe(false);
+
+      // The exact-turn refusal holds even at the observed long-chat volume, until the turn changes.
+      await refuseAutomaticCompactionNow(summary.id, 'conv-long-window', 'long-turn');
+      expect(autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_300_000 })).toBe(false);
+      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 'long-turn', outcome: 'interrupted' });
+      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_start', turnId: 'next-long-turn' });
+      expect(autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_300_000 })).toBe(true);
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
   it('offers nothing while the switch is off or below the line', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: false, autoTokens: 10_000 } });
@@ -2395,6 +2430,40 @@ describe('canonical recorder 1.8', () => {
     await recordChatObservations(conversationId, [{ ...snapshot, time: 210 }, { ...snapshot, time: 220 }]);
     const messages = await readEvents(first.sessionId!, { kinds: ['assistant_message'] });
     expect(messages).toHaveLength(1);
+  });
+
+  it('revises visible browser commentary at its first durable position across recorder restart', async () => {
+    const conversationId = 'conv-visible-commentary';
+    const turnId = 'turn-visible-commentary';
+    const progressId = 'g-live-commentary#p0';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: 100, turnId },
+      { kind: 'progress', time: 110, turnId, progressId, text: 'Checking the bridge' },
+      { kind: 'progress', time: 120, turnId, progressId, text: 'Checking the bridge and recorder' }
+    ]);
+    const first = await readEvents(opened.sessionId!, { kinds: ['progress'] });
+    expect(first).toHaveLength(2);
+    expect(first[1]).toMatchObject({
+      kind: 'progress', progressId, origin: first[0]!.seq, time: 110, turnId,
+      message: { text: 'Checking the bridge and recorder' }
+    });
+
+    resetRecorderForTests();
+    await recordChatObservations(conversationId, [
+      { kind: 'progress', time: 130, turnId, progressId, text: 'Root cause confirmed' }
+    ]);
+    const rows = await readEvents(opened.sessionId!, { kinds: ['progress'] });
+    expect(rows).toHaveLength(3);
+    expect(rows[2]).toMatchObject({
+      kind: 'progress', progressId, origin: rows[0]!.seq, time: 110, turnId,
+      message: { text: 'Root cause confirmed' }
+    });
+    const folded = foldProgress(rows);
+    expect(folded).toHaveLength(1);
+    expect(folded[0]).toMatchObject({
+      seq: rows[0]!.seq, time: 110, kind: 'progress', progressId, turnId,
+      message: { text: 'Root cause confirmed' }
+    });
   });
 
   it('correlates every hidden or rowless MCP request independently by request id', async () => {

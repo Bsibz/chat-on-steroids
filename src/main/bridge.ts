@@ -44,7 +44,9 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
-import type { BridgeStatus, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
+import type { BridgeStatus, CompanionDiagnostics, CompanionPageDiagnostics, CompanionRequestFingerprint, CompanionRequestShape, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
+import { matchInboundRequestOrigin, resetRequestOriginDiagnostics } from './request-origin-diagnostic.js';
+import { authorizeDirectOriginOffer, type DirectOriginDocument, type DirectOriginOffer } from './request-origin.js';
 import { recoveryBusyMs } from '../shared/recovery.js';
 import { CHAT_ACTIVE_MS, CHAT_SILENCE_MS, continuationMarkerOf, isReasoningEffort, normalizedToolOutcome, toolCallSummary, unescapeMarkdown,
   type ReasoningEffort, type SessionEvent, type SessionOrigin, type StoredText, type ToolCallRecord } from '../shared/session.js';
@@ -133,6 +135,7 @@ import {
   claimWorkerRevival,
   closableWorkerConversations,
   activeRunIds,
+  currentRunId,
   swarmRunning,
   failAgent,
   WORKER_SILENCE_MS,
@@ -203,6 +206,12 @@ import { bindAgentWorkspace } from './workspace.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
+let companionReloadVersion: string | null = null;
+
+/** Startup-only proof from extensionDir(); bridge requests never touch Electron/filesystem state. */
+export function setCompanionReloadVersion(version: string | null): void {
+  companionReloadVersion = typeof version === 'string' && /^\d+\.\d+\.\d+$/.test(version) ? version : null;
+}
 /**
  * The shipped range is fixed on purpose, but the test suite runs many bridges in parallel
  * forks on a machine where an installed app already holds 8765. A test whose own bind lost
@@ -599,6 +608,111 @@ function diagnosticNullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function diagnosticToken(value: unknown, pattern: RegExp): string | null {
+  return typeof value === 'string' && pattern.test(value) ? value : null;
+}
+
+function diagnosticTokenList(value: unknown, limit: number, pattern: RegExp): string[] | null {
+  if (!Array.isArray(value) || value.length > limit) return null;
+  const out: string[] = [];
+  for (const entry of value) {
+    const token = diagnosticToken(entry, pattern);
+    if (token === null || out.includes(token)) return null;
+    out.push(token);
+  }
+  return out;
+}
+
+const SHAPE_FINGERPRINT_LIMIT = 8;
+const SHAPE_FINGERPRINT_DIGEST = /^[0-9a-f]{64}$/;
+
+/**
+ * Parse the wire-only fingerprints of one shape.
+ *
+ * A fingerprint is a bounded SHA-256 digest tied to a property path the shape already
+ * observed. A present-but-malformed list (wrong type, too many entries, unknown path,
+ * non-digest value, duplicate pair) rejects the whole shape; absence is simply empty.
+ */
+function diagnosticFingerprints(value: unknown, requestPaths: string[]): CompanionRequestFingerprint[] | null {
+  if (!Array.isArray(value) || value.length > SHAPE_FINGERPRINT_LIMIT) return null;
+  const out: CompanionRequestFingerprint[] = [];
+  for (const candidate of value) {
+    const row = diagnosticObject(candidate);
+    const path = row ? diagnosticToken(row.path, /^[A-Za-z_][A-Za-z0-9_.-]{0,79}$/) : null;
+    const digest = row ? diagnosticToken(row.digest, SHAPE_FINGERPRINT_DIGEST) : null;
+    if (!path || !digest || !requestPaths.includes(path)) return null;
+    if (out.some(entry => entry.path === path && entry.digest === digest)) return null;
+    out.push({ path, digest });
+  }
+  return out;
+}
+
+/**
+ * Exact-digest comparison against the bounded recent inbound registry.
+ *
+ * Only the structural answer survives: whether anything matched, which property paths
+ * matched and a coarse age of the newest match. The digest is never returned, stored,
+ * rendered or logged.
+ */
+function matchFingerprints(fingerprints: CompanionRequestFingerprint[]): { match: boolean | null; paths: string[]; ageMs: number | null } {
+  if (fingerprints.length === 0) return { match: null, paths: [], ageMs: null };
+  const paths: string[] = [];
+  let youngest: number | null = null;
+  for (const fingerprint of fingerprints) {
+    const age = matchInboundRequestOrigin(fingerprint.digest);
+    if (age === null) continue;
+    if (!paths.includes(fingerprint.path)) paths.push(fingerprint.path);
+    youngest = youngest === null ? age : Math.min(youngest, age);
+  }
+  return { match: paths.length > 0, paths, ageMs: youngest === null ? null : Math.floor(youngest / 1000) * 1000 };
+}
+
+/**
+ * Diagnostic-only request-envelope shapes.
+ *
+ * Property paths, transport/envelope names, an author role enum, booleans and — when the
+ * observer could derive them — one-way digests that are compared here and discarded.
+ * Anything carrying a value, a wrong shape or an unexpected type is dropped rather than
+ * forwarded, and nothing here can reach correlation, request ownership or a recovery decision.
+ */
+function diagnosticRequestShapes(value: unknown): CompanionRequestShape[] {
+  if (!Array.isArray(value)) return [];
+  const out: CompanionRequestShape[] = [];
+  for (const entry of value.slice(0, 24)) {
+    const row = diagnosticObject(entry);
+    if (!row) continue;
+    const transport = row.transport === 'sse' || row.transport === 'socket' ? row.transport : null;
+    const endpoint = diagnosticToken(row.endpoint, /^[a-z][a-z0-9-]{0,31}$/);
+    const envelope = diagnosticTokenList(row.envelope, 4, /^[a-z][a-z0-9-]{0,39}$/);
+    const requestPaths = diagnosticTokenList(row.requestPaths, 8, /^[A-Za-z_][A-Za-z0-9_.-]{0,79}$/);
+    const conversationPaths = diagnosticTokenList(row.conversationPaths, 4, /^[A-Za-z_][A-Za-z0-9_.-]{0,79}$/);
+    if (!transport || !endpoint || !envelope || envelope.length === 0 ||
+        !requestPaths || requestPaths.length === 0 || !conversationPaths) continue;
+    const hasFingerprints = row.fingerprints !== undefined;
+    const fingerprints = hasFingerprints ? diagnosticFingerprints(row.fingerprints, requestPaths) : [];
+    if (fingerprints === null) continue;
+    const match = hasFingerprints ? matchFingerprints(fingerprints) : null;
+    const tri = (candidate: unknown): boolean | null =>
+      candidate === true ? true : candidate === false ? false : null;
+    out.push({
+      transport,
+      endpoint,
+      envelope,
+      requestPaths,
+      requestStyle: row.requestStyle === 'snake' || row.requestStyle === 'camel' ? row.requestStyle : null,
+      conversationPaths,
+      conversationValid: row.conversationValid === true,
+      conversationConsistent: tri(row.conversationConsistent),
+      conversationMatch: tri(row.conversationMatch),
+      author: diagnosticToken(row.author, /^[a-z][a-z0-9_]{0,23}$/),
+      scope: diagnosticToken(row.scope, /^[a-z][a-z0-9_-]{0,39}$/),
+      occurrences: Math.max(1, Math.min(999, diagnosticNumber(row.occurrences, 999))),
+      ...(match ? { inboundMatch: match.match, matchedRequestPaths: match.paths, inboundMatchAgeMs: match.ageMs } : {})
+    });
+  }
+  return out;
+}
+
 function diagnosticTrace(value: unknown): CompanionTraceEntry[] {
   if (!Array.isArray(value)) return [];
   return value.slice(0, 16).flatMap((entry) => {
@@ -631,6 +745,7 @@ function diagnosticPage(value: unknown): CompanionPageDiagnostics | null {
     queueBytes: diagnosticNumber(page.queueBytes, 64 * 1024 * 1024),
     requestId: diagnosticString(page.requestId, 160),
     trace: diagnosticTrace(page.trace),
+    requestShapes: diagnosticRequestShapes(page.requestShapes),
     overwrite: page.overwrite === true,
     painted: page.painted === true,
     events: diagnosticNumber(page.events, 10_000_000),
@@ -706,12 +821,62 @@ function sanitiseCompanionDiagnostics(value: unknown): CompanionDiagnostics | nu
   };
 }
 
+/** Signatures already written to the activity log. Bounded; only suppresses exact repeats. */
+const loggedRequestShapes = new Set<string>();
+
+/**
+ * One compact, value-free activity-log line for a request-envelope shape.
+ *
+ * The controller inspects exactly this pattern while dogfooding:
+ * `request-origin diagnostic: transport=... request_path=... conversation_match=...`.
+ *
+ * `inbound_match` is the diagnostic equality answer against recent inbound MCP request ids;
+ * `matched_request_path` names only the property paths that matched. Neither a raw id nor a
+ * fingerprint digest ever appears here.
+ */
+function requestShapeLine(shape: CompanionRequestShape): string {
+  const flag = (value: boolean | null | undefined): string => value === true ? 'true' : value === false ? 'false' : 'unknown';
+  const fields = [
+    'request-origin diagnostic:',
+    `transport=${shape.transport}`,
+    `endpoint=${shape.endpoint}`,
+    `envelope=${shape.envelope.join('>')}`,
+    `request_path=${shape.requestPaths.join(',')}`,
+    `request_style=${shape.requestStyle ?? 'unknown'}`,
+    `conversation_path=${shape.conversationPaths.join(',') || 'none'}`,
+    `conversation_valid=${flag(shape.conversationValid)}`,
+    `conversation_consistent=${flag(shape.conversationConsistent)}`,
+    `conversation_match=${flag(shape.conversationMatch)}`,
+    `author=${shape.author ?? 'none'}`,
+    `scope=${shape.scope ?? 'unknown'}`,
+    `occurrences=${shape.occurrences}`,
+    `inbound_match=${flag(shape.inboundMatch)}`
+  ];
+  if (shape.inboundMatch === true) {
+    if (shape.matchedRequestPaths?.length) fields.push(`matched_request_path=${shape.matchedRequestPaths.join(',')}`);
+    if (typeof shape.inboundMatchAgeMs === 'number') fields.push(`inbound_match_age_ms=${shape.inboundMatchAgeMs}`);
+  }
+  return fields.join(' ');
+}
+
 function recordCompanionDiagnostics(value: unknown): void {
   const next = sanitiseCompanionDiagnostics(value);
   if (!next) return;
   latestCompanionDiagnostics = next;
   companionDiagnosticsRevision += 1;
   for (const waiter of companionDiagnosticsWaiters) waiter();
+  // Diagnostic evidence only. The line names the envelope structure, never a request id,
+  // conversation id or payload value, and it is not read anywhere that decides identity.
+  for (const shape of next.tab?.page?.requestShapes ?? []) {
+    const signature = JSON.stringify(shape);
+    if (loggedRequestShapes.has(signature)) continue;
+    if (loggedRequestShapes.size >= 256) {
+      const oldest = loggedRequestShapes.values().next().value;
+      if (oldest !== undefined) loggedRequestShapes.delete(oldest);
+    }
+    loggedRequestShapes.add(signature);
+    logInfo(requestShapeLine(shape));
+  }
 }
 
 /** Ask the companion for a fresh popup-equivalent snapshot, but keep a bounded wait. */
@@ -740,6 +905,7 @@ export function companionDiagnostics(): Promise<CompanionDiagnostics | null> {
 
 function clearCompanionDiagnostics(): void {
   latestCompanionDiagnostics = null;
+  loggedRequestShapes.clear();
   companionDiagnosticsRevision++;
   for (const waiter of companionDiagnosticsWaiters) waiter();
 }
@@ -994,6 +1160,7 @@ const OBSERVATION_KINDS = new Set([
   'conversation_title',
   'user_message',
   'assistant_message',
+  'progress',
   'native_image',
   'page_tool',
   'turn_start',
@@ -1071,6 +1238,142 @@ function parseCallEvidence(input: unknown, untooled = false): PageCallEvidence[]
 }
 
 /**
+ * Bound on direct-A SSE candidates in one handshake. A turn observes one request id; the
+ * small allowance covers a retried/steered turn without letting a body become an id batch.
+ */
+const DIRECT_ORIGIN_LIMIT = 16;
+const DIRECT_ORIGIN_REQUEST_ID = /^[a-z0-9_-]{1,100}$/i;
+const DIRECT_ORIGIN_COMMIT_TTL_MS = 10_000;
+const DIRECT_ORIGIN_COMMIT_MAX = 64;
+
+interface PreparedDirectOriginCommit {
+  token: string;
+  conversationId: string;
+  document: DirectOriginDocument;
+  claims: DirectOriginClaim[];
+  preparedAt: number;
+}
+
+/**
+ * A short-lived second phase for direct-A ownership.
+ *
+ * `/correlations` may prove exact inbound equality, but it deliberately does not persist a
+ * direct owner in that same request. The extension must first re-read Chrome and prove the
+ * same document/route is still current, then redeem this opaque one-shot token. This closes
+ * the navigation window in which the app previously wrote durable ownership before the
+ * background worker's post-call document check could veto it.
+ */
+const preparedDirectOriginCommits = new Map<string, PreparedDirectOriginCommit>();
+
+function sameDirectOriginDocument(left: DirectOriginDocument, right: DirectOriginDocument): boolean {
+  return left.tab === right.tab && left.documentId === right.documentId && left.navigationEpoch === right.navigationEpoch;
+}
+
+function pruneDirectOriginCommits(now = Date.now()): void {
+  for (const [token, prepared] of preparedDirectOriginCommits) {
+    if (now - prepared.preparedAt <= DIRECT_ORIGIN_COMMIT_TTL_MS) continue;
+    preparedDirectOriginCommits.delete(token);
+  }
+  while (preparedDirectOriginCommits.size > DIRECT_ORIGIN_COMMIT_MAX) {
+    const oldest = preparedDirectOriginCommits.keys().next().value;
+    if (oldest === undefined) break;
+    preparedDirectOriginCommits.delete(oldest);
+  }
+}
+
+function prepareDirectOriginCommit(
+  conversationId: string,
+  document: DirectOriginDocument,
+  claims: DirectOriginClaim[],
+  now = Date.now()
+): string | null {
+  if (claims.length === 0) return null;
+  pruneDirectOriginCommits(now);
+  const token = randomBytes(18).toString('base64url');
+  preparedDirectOriginCommits.set(token, {
+    token,
+    conversationId,
+    document: { ...document },
+    claims: claims.map((claim) => ({ ...claim })),
+    preparedAt: now
+  });
+  pruneDirectOriginCommits(now);
+  return token;
+}
+
+function consumeDirectOriginCommit(
+  token: unknown,
+  conversationId: string,
+  document: DirectOriginDocument,
+  now = Date.now()
+): PreparedDirectOriginCommit | null {
+  if (typeof token !== 'string' || token.length < 16 || token.length > 128) return null;
+  pruneDirectOriginCommits(now);
+  const prepared = preparedDirectOriginCommits.get(token);
+  if (!prepared) return null;
+  preparedDirectOriginCommits.delete(token);
+  if (now - prepared.preparedAt > DIRECT_ORIGIN_COMMIT_TTL_MS ||
+      prepared.conversationId !== conversationId || !sameDirectOriginDocument(prepared.document, document)) return null;
+  return prepared;
+}
+
+/**
+ * The exact browser document an extension request came from.
+ *
+ * Taken only from the extension worker's validated sender identity (`tab`, Chrome
+ * `documentId`, page navigation epoch); a body-supplied value is rebuilt and re-checked by
+ * the caller before it can bind a direct-A candidate.
+ */
+function parseDirectOriginDocument(input: unknown): DirectOriginDocument | null {
+  const row = diagnosticObject(input);
+  if (!row) return null;
+  const tab = row['tab'];
+  const documentId = row['documentId'];
+  const navigationEpoch = row['navigationEpoch'];
+  if (!Number.isSafeInteger(tab) || (tab as number) < 0) return null;
+  if (typeof documentId !== 'string' || documentId.length === 0 || documentId.length > 200) return null;
+  if (!Number.isSafeInteger(navigationEpoch) || (navigationEpoch as number) < 0) return null;
+  return { tab: tab as number, documentId, navigationEpoch: navigationEpoch as number };
+}
+
+interface DirectOriginClaim {
+  requestId: string;
+  observedAt: number;
+}
+
+/**
+ * Rebuilds the direct-A claims of one handshake, or refuses the whole body.
+ *
+ * These are the raw request ids an exact-A SSE observation reported, each with the page
+ * observation time. They are matching evidence only: the route below asks
+ * `authorizeDirectOriginOffer` whether each id exactly equals a fresh normalized inbound MCP
+ * `x-request-id`, and only a `paired` verdict may join the ownership evidence batch. A
+ * duplicate id in one body is a contradiction, not a batch of two.
+ */
+function parseDirectOriginEvidence(
+  input: unknown
+): { ok: true; claims: DirectOriginClaim[] } | { ok: false; error: string } {
+  if (input === undefined) return { ok: true, claims: [] };
+  if (!Array.isArray(input) || input.length > DIRECT_ORIGIN_LIMIT) return { ok: false, error: 'bad_direct_evidence' };
+  const claims: DirectOriginClaim[] = [];
+  const seen = new Set<string>();
+  for (const entry of input) {
+    const row = diagnosticObject(entry);
+    const requestId = row && typeof row['requestId'] === 'string' && DIRECT_ORIGIN_REQUEST_ID.test(row['requestId'])
+      ? row['requestId']
+      : null;
+    const observedAt = row && typeof row['observedAt'] === 'number' && Number.isFinite(row['observedAt'])
+      ? row['observedAt']
+      : null;
+    if (!requestId || observedAt === null) return { ok: false, error: 'bad_direct_evidence' };
+    if (seen.has(requestId)) return { ok: false, error: 'duplicate_direct_evidence' };
+    seen.add(requestId);
+    claims.push({ requestId, observedAt });
+  }
+  return { ok: true, claims };
+}
+
+/**
  * Turns whatever the extension posted into observations we are willing to store.
  *
  * The extension reads an undocumented page that can change under it, so nothing from
@@ -1120,16 +1423,29 @@ function parseObservations(input: unknown): ChatObservation[] {
       }
     }
     if (kind === 'user_message' && Array.isArray(item['attachments'])) {
-      observation.attachments = item['attachments'].slice(0, 4).filter(file => file && typeof file === 'object' &&
+      observation.attachments = item['attachments'].slice(0, 10).filter(file => file && typeof file === 'object' &&
         typeof file.id === 'string' && file.id.length > 0 && file.id.length <= 100 && typeof file.name === 'string' && file.name.length > 0 && file.name.length <= 200 &&
         /^image\/[a-z0-9.+-]{1,80}$/i.test(file.mimeType) && Number.isSafeInteger(file.size) && file.size >= 0 && file.size <= 512 * 1024 * 1024)
-        .map(file => ({ id: file.id, name: file.name, size: file.size, mimeType: file.mimeType }));
+        .map(file => ({
+          id: file.id,
+          name: file.name,
+          size: file.size,
+          mimeType: file.mimeType,
+          ...(typeof file.preview === 'string' && file.preview.length <= 32_768 && /^data:image\/webp;base64,[A-Za-z0-9+/]+={0,2}$/.test(file.preview)
+            ? { preview: file.preview }
+            : {})
+        }));
     }
     if (typeof item['messageId'] === 'string') {
       // Fiber's exact logical assistant tuple can span 190 characters. A prefix
       // is a different identity and can merge otherwise distinct authored rows.
       if (!item['messageId'].length || item['messageId'].length > 190) continue;
       observation.messageId = item['messageId'];
+    }
+    if (kind === 'progress') {
+      if (typeof item['progressId'] !== 'string' ||
+          !/^[A-Za-z0-9._:#-]{1,240}$/.test(item['progressId'])) continue;
+      observation.progressId = item['progressId'];
     }
     if (kind === 'assistant_message' && typeof item['providerMessageId'] === 'string' &&
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item['providerMessageId'])) {
@@ -1439,6 +1755,24 @@ function goalBlockReason(id: string): 'worker' | 'blocked' | '' {
   return '';
 }
 
+/**
+ * The one effective chat-mode projection, shared by the app UI, the browser sheet and the
+ * cross-app owner-control surface.
+ *
+ * A fenced chat reports Off: a worker/helper chat is the prime's to write, and a blocked chat
+ * is one the user took this app's hands off. The stored switch and objective are untouched;
+ * only their effect is suspended, and releasing the fence brings the same mode back.
+ */
+export function conversationAutomationMode(id: string): {
+  mode: 'off' | 'goal' | 'loop';
+  blocked: 'worker' | 'blocked' | null;
+} {
+  const blocked = goalBlockReason(id);
+  if (blocked) return { mode: 'off', blocked };
+  const control = goalSwitchFor(id);
+  return { mode: goalArmedFor(id) ? (control.enabled ? control.mode : 'goal') : 'off', blocked: null };
+}
+
 export type SessionControlsView = {
   sessionId: string;
   recovery?: import('../shared/recovery.js').RecoveryCountdown[];
@@ -1474,7 +1808,8 @@ async function controlledConversation(sessionId: string): Promise<string> {
 export async function sessionControlsFor(sessionId: string): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
   const control = goalSwitchFor(id);
-  const blocked = goalBlockReason(id);
+  const mode = conversationAutomationMode(id);
+  const blocked = mode.blocked ?? '';
   const session = await getSession(sessionId);
   if (session?.conversationId !== id) throw new Error('conversation_changed');
   // A persisted start is history, not proof that the provider is still generating.
@@ -1504,7 +1839,7 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
     objective: goalObjectiveFor(id),
     loopAfterTurn: control.afterTurn,
     proLoopDelivery: session.selectedModel?.conversationId === id && isProModel(session.selectedModel.model, session.selectedModel.reasoningEffort),
-    automation: goalArmedFor(id) && !blocked ? control.enabled ? control.mode : 'goal' : 'off',
+    automation: mode.mode,
     blocked, job: resumeJobFor(sessionId) };
 }
 /** One absolute budget includes opening an absent tab and native hydration. */
@@ -1775,10 +2110,22 @@ export async function compactSession(sessionId: string): Promise<SessionControls
   }
   return sessionControlsFor(sessionId);
 }
-export async function cancelSessionCompaction(sessionId: string): Promise<SessionControlsView> {
+/**
+ * The durable cancel, reporting whether it changed the outcome.
+ *
+ * False means there was nothing open to cancel, or the commit barrier had already crossed —
+ * `cancelResumeNow` owns both refusals. Callers that must not report a cancellation that did
+ * not happen use this value rather than the mere absence of an error.
+ */
+export async function cancelSessionCompactionNow(sessionId: string): Promise<boolean> {
   await controlledConversation(sessionId);
-  await cancelResumeNow(sessionId);
+  const cancelled = await cancelResumeNow(sessionId);
   changed();
+  return cancelled;
+}
+
+export async function cancelSessionCompaction(sessionId: string): Promise<SessionControlsView> {
+  await cancelSessionCompactionNow(sessionId);
   return sessionControlsFor(sessionId);
 }
 
@@ -1880,6 +2227,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       {
         app: 'chat-on-steroids',
         version: APP_VERSION,
+        companionReloadVersion,
         bridge: BRIDGE_PROTOCOL,
         compatible: protocolCompatible(req),
         paired: stored !== null && stored !== BROWSER_DISCONNECTED,
@@ -2073,7 +2421,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const repaired = url.searchParams.get('repaired');
     const repairFailed = url.searchParams.get('repairFailed');
     const repairAction = url.searchParams.get('repairAction');
-    const action = repairAction === 'reloaded' || repairAction === 'reopened' ? repairAction : null;
+    const action = repairAction === 'reloaded' || repairAction === 'reopened' || repairAction === 'repaired' ? repairAction : null;
     if (repaired) {
       await confirmRepair(repaired.slice(0, 64), action);
     } else if (repairFailed) {
@@ -2211,7 +2559,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       compactionRepairCurrent(conversationId, repair);
     // An observation still publishing can revoke this handout. Refuse this
     // claim transiently; the same unclaimed token remains eligible to be checked.
-    const allowed = current && observationWritesInFlight === 0 && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
+    const cooldownReady = repair.reason !== 'unattributed' || Date.now() >= Math.max(repair.notBefore, sharedBrowserRecoveryDueAt(conversationId));
+    const allowed = current && cooldownReady && observationWritesInFlight === 0 &&
+      repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
     if (allowed) {
       repair.claimed = true;
       if (repair.reason === 'assistant-error' && repair.assistantSource)
@@ -2220,6 +2570,72 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         repair.attribution.incident.firstAttemptAt = Date.now();
     }
     return json(res, 200, { allowed }, origin);
+  }
+
+  if (route === '/correlations/direct/commit' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = conversationId(body['conversationId']);
+    const document = parseDirectOriginDocument(body['document']);
+    if (!id || !document) return json(res, 400, { error: 'bad_direct_commit' }, origin);
+    const prepared = consumeDirectOriginCommit(body['token'], id, document);
+    if (!prepared) return json(res, 409, { error: 'direct_commit_expired_or_mismatched' }, origin);
+
+    const directPaired: string[] = [];
+    const directRejected: string[] = [];
+    const now = Date.now();
+    for (const claim of prepared.claims) {
+      const held = requestCorrelation(claim.requestId);
+      if (held) {
+        (held.conversationId === id ? directPaired : directRejected).push(claim.requestId);
+        continue;
+      }
+      const verdict = authorizeDirectOriginOffer({
+        requestId: claim.requestId,
+        conversationId: id,
+        observedAt: claim.observedAt,
+        document
+      }, now);
+      if (verdict === 'paired') directPaired.push(claim.requestId);
+      else directRejected.push(claim.requestId);
+    }
+
+    const directEvidence: PageCallEvidence[] = directPaired.map((requestId) => ({
+      messageId: `direct:${requestId}`.slice(0, 120),
+      tool: '', order: 0, answered: false, requestId, createTime: null
+    }));
+    const conflicts = directEvidence
+      .map((call) => call.requestId)
+      .filter((requestId): requestId is string => Boolean(requestId))
+      .filter((requestId) => {
+        const held = requestCorrelation(requestId);
+        return held !== null && held.conversationId !== id;
+      });
+    const blocked = new Set(conflicts);
+    const unresolved = directEvidence.filter((call) =>
+      call.requestId && !blocked.has(call.requestId) && requestCorrelation(call.requestId) === null);
+    const observations: ChatObservation[] = unresolved.length > 0
+      ? [{ kind: 'tool_evidence', time: Date.now(), calls: unresolved }]
+      : [];
+    const sessionId = await recordRequestEvidence(id, observations);
+    const requestIds = [...new Set(prepared.claims.map((claim) => claim.requestId))];
+    const confirmed = requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id);
+    return json(res, 200, {
+      ok: true,
+      conversationId: id,
+      sessionId,
+      requestIds,
+      confirmed,
+      conflicts,
+      directPending: [],
+      directRejected: [...new Set([...directRejected, ...conflicts])],
+      complete: conflicts.length === 0 && confirmed.length === requestIds.length
+    }, origin);
   }
 
   if (route === '/correlations' && req.method === 'POST') {
@@ -2233,7 +2649,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     const calls = parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null);
-    if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
+    const direct = parseDirectOriginEvidence(body['direct']);
+    if (!direct.ok) return json(res, 400, { error: direct.error }, origin);
+    const directDocument = direct.claims.length > 0 ? parseDirectOriginDocument(body['document']) : null;
+    if (direct.claims.length > 0 && !directDocument) return json(res, 400, { error: 'bad_direct_document' }, origin);
+    if (calls.length === 0 && direct.claims.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
 
     // This is the live-turn ownership handshake, deliberately separate from transcript
     // delivery. A fresh ChatGPT conversation can expose metadata.request_id before its
@@ -2254,28 +2674,85 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // reads them back before ACKing. An id already proven for another conversation is refused
     // here without feeding contradictory evidence into the sticky conflict registry. No tool
     // name, clock, active-tab or nearest-turn fallback participates.
-    const requestIds = [...new Set(calls.map((call) => call.requestId).filter((value): value is string => Boolean(value)))];
+    //
+    // A direct-A SSE claim is different evidence: unlike the page-model Fiber path, the page's
+    // own stream cannot by itself name the request that is running. It may enter this batch
+    // only while `request-origin.ts` answers that the observed scalar id exactly equals a fresh
+    // normalized inbound Core MCP `x-request-id` and that the claim still belongs to the same
+    // exact extension document, conversation and navigation epoch that first observed it.
+    // Everything else is reported back as pending (retry while fresh) or rejected (stop).
+    const now = Date.now();
+    const directAlreadyConfirmed: string[] = [];
+    const directPrepared: DirectOriginClaim[] = [];
+    const directPending: string[] = [];
+    const directRejected: string[] = [];
+    for (const claim of direct.claims) {
+      const held = requestCorrelation(claim.requestId);
+      if (held) {
+        (held.conversationId === id ? directAlreadyConfirmed : directRejected).push(claim.requestId);
+        continue;
+      }
+      const offer: DirectOriginOffer = {
+        requestId: claim.requestId,
+        conversationId: id,
+        observedAt: claim.observedAt,
+        document: directDocument!
+      };
+      const verdict = authorizeDirectOriginOffer(offer, now);
+      if (verdict === 'paired') directPrepared.push(claim);
+      else if (verdict === 'awaiting_inbound') directPending.push(claim.requestId);
+      else directRejected.push(claim.requestId);
+    }
+    const directCommitToken = directDocument
+      ? prepareDirectOriginCommit(id, directDocument, directPrepared, now)
+      : null;
+
+    // Fiber remains the existing one-phase page-model proof. Direct-A is deliberately only
+    // prepared here; the extension must revalidate Chrome's exact document/route before a
+    // second one-shot commit request may turn those ids into durable evidence.
+    const claimed = [...calls];
+    const requestIds = [...new Set(claimed.map((call) => call.requestId).filter((value): value is string => Boolean(value)))];
     const conflicts = requestIds.filter((requestId) => {
       const held = requestCorrelation(requestId);
       return held !== null && held.conversationId !== id;
     });
     const blocked = new Set(conflicts);
-    const unresolved = calls.filter((call) => call.requestId && !blocked.has(call.requestId) && requestCorrelation(call.requestId) === null);
+    const unresolved = claimed.filter((call) => call.requestId && !blocked.has(call.requestId) && requestCorrelation(call.requestId) === null);
     const observations: ChatObservation[] = unresolved.length > 0
       ? [{ kind: 'tool_evidence', time: Date.now(), calls: unresolved }]
       : [];
     // Even an already-confirmed mapping must ensure/reuse the chat session, matching /events'
     // first-observation semantics and making this one atomic operation from the page's view.
     const sessionId = await recordRequestEvidence(id, observations);
-    const confirmed = requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id);
+    const confirmed = [...new Set([
+      ...requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id),
+      ...directAlreadyConfirmed
+    ])];
+    const allRequestIds = [...new Set([
+      ...requestIds,
+      ...directAlreadyConfirmed,
+      ...directPrepared.map((claim) => claim.requestId),
+      ...directPending,
+      ...directRejected
+    ])];
     return json(res, 200, {
       ok: true,
       conversationId: id,
       sessionId,
-      requestIds,
+      requestIds: allRequestIds,
       confirmed,
       conflicts,
-      complete: conflicts.length === 0 && confirmed.length === requestIds.length
+      ...(directCommitToken ? {
+        directCommitToken,
+        directPrepared: directPrepared.map((claim) => claim.requestId)
+      } : {}),
+      // Direct-A claims are not all-or-nothing with the Fiber batch: the page retries the
+      // pending ones while fresh, commits prepared ones only after browser revalidation, and
+      // drops rejected ones. `confirmed` remains the only ownership answer.
+      directPending,
+      directRejected,
+      complete: directPrepared.length === 0 && directPending.length === 0 && directRejected.length === 0 &&
+        conflicts.length === 0 && confirmed.length === allRequestIds.length
     }, origin);
   }
   if (route === '/events' && req.method === 'POST') {
@@ -5415,6 +5892,22 @@ async function cancelAutomaticResumesNow(sessionId?: string): Promise<number> {
 }
 
 /**
+ * The app-wide automatic-compaction switch, with the durable cancellation an Off requires.
+ *
+ * The standalone form of the same two steps the browser settings sheet performs for an
+ * unscoped write: one committed config change, then the retirement of every automatic ticket
+ * that switch was about to feed. Manual Compact & Resume is explicit and stays exactly where
+ * it is. The cross-app owner-control surface uses this so it cannot skip the cancellation;
+ * returns how many automatic tickets the Off actually retired.
+ */
+export async function setAutomaticCompactionNow(enabled: boolean): Promise<number> {
+  await updateConfig((config) => ({ ...config, compaction: { ...config.compaction, auto: enabled } }));
+  const cancelled = enabled ? 0 : await cancelAutomaticResumesNow();
+  changed();
+  return cancelled;
+}
+
+/**
  * Queues the bootstrap for a worker chat.
  *
  * Called by the broker through onSpawnRequest. Nothing about identity is passed in or
@@ -6242,10 +6735,19 @@ export function unattributedRepairEta(now = Date.now(), requestId?: string | nul
   // A request-specific budget cannot borrow another incident's ETA or become fresh again.
   if (known && !eligible(known)) return null;
   const pending = known ? [known] : requestId ? [] : [...unattributedIncidents.values()].filter(eligible);
-  if (pending.length) return Math.max(0, Math.ceil((Math.min(...pending.map(incident =>
-    incident.pass === 0 ? incident.firstDueAt : incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS)) - now) / 1000));
-  const count = pendingSuspects(null).length;
-  return count ? (count === 1 ? UNATTRIBUTED_SINGLE_WINDOW_MS : UNATTRIBUTED_FIRST_WINDOW_MS) / 1000 : null;
+  if (pending.length) {
+    const dueAt = Math.min(...pending.map(incident => incident.pass === 0
+      ? Math.min(...pendingSuspects(incident).map(candidate =>
+        Math.max(incident.firstDueAt, sharedBrowserRecoveryDueAt(candidate.conversationId))))
+      : incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS));
+    return Math.max(0, Math.ceil((dueAt - now) / 1000));
+  }
+  const suspects = pendingSuspects(null);
+  const count = suspects.length;
+  if (!count) return null;
+  const opening = count === 1 ? UNATTRIBUTED_SINGLE_WINDOW_MS : UNATTRIBUTED_FIRST_WINDOW_MS;
+  const cooldown = Math.min(...suspects.map(candidate => sharedBrowserRecoveryDueAt(candidate.conversationId)));
+  return Math.max(0, Math.ceil((Math.max(now + opening, cooldown) - now) / 1000));
 }
 
 /** Project the actual owners; reading controls cannot file, extend or spend recovery. */
@@ -6297,11 +6799,10 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
       if (!suspect || (session.activeTurnId ?? null) !== suspect.turnId) return [];
       // The attribution watch stays visible for its entire original window.
       // A conditional second check is not itself permission to reload.
-      const deadline = incident.pass === 0 ? incident.firstDueAt : incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS;
-      const retry = incident.pass === 1 && incident.requestId !== null && incident.firstAttemptAt !== null &&
-        incident.lastUnknownStartedAt > incident.firstAttemptAt;
-      return [{ kind: incident.pass === 0 ? 'unattributed' as const : 'unattributed-wait' as const,
-        deadline, ...(retry ? { reload: true as const } : {}) }];
+      const deadline = incident.pass === 0
+        ? Math.max(incident.firstDueAt, sharedBrowserRecoveryDueAt(conversationId))
+        : incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS;
+      return [{ kind: incident.pass === 0 ? 'unattributed' as const : 'unattributed-wait' as const, deadline }];
     });
     const earliest = deadlines.sort((a, b) => a.deadline - b.deadline)[0];
     if (earliest) result.push(earliest);
@@ -6467,8 +6968,11 @@ async function silenceSourceCurrent(conversationId: string, grant: ActivityGrant
     !!boundary && boundary.kind !== 'user_message' && boundary.turnId === grant.turnId &&
     !(boundary.kind === 'turn_end' && boundary.outcome === 'stopped');
 }
-/** Last browser action per exact chat. Error/no-tab recovery shares a cooldown; owned schedules do not. */
+/** Last confirmed browser action per exact chat; unattributed recovery checks this shared floor. */
 const lastBrowserRecoveryAt = new Map<string, number>();
+function sharedBrowserRecoveryDueAt(conversationId: string): number {
+  return (lastBrowserRecoveryAt.get(conversationId) ?? 0) + BROWSER_RECOVERY_COOLDOWN_MS;
+}
 
 /**
  * The user turn on which each chat has already spent its one error reload.
@@ -6481,8 +6985,8 @@ const lastBrowserRecoveryAt = new Map<string, number>();
  * latest recorded start, which also survives its own end.
  *
  * This is the error reload's budget alone. Silence answers a different question — is this chat
- * alive at all — and carries no budget beyond its own two minutes; an `unattributed` reload is
- * rationed by its request-specific two-attempt incident. None of the
+ * alive at all — and carries no budget beyond its own two minutes; unattributed recovery gets
+ * at most one action only when one exact candidate remains. None of the
  * three waits on, or is refused because of, another.
  *
  * Reserved at the browser's action claim, before Chrome can reload. A lost ACK cannot
@@ -6520,9 +7024,9 @@ async function assistantRepairCurrent(conversationId: string, repair: Repair): P
  * Queues one exact browser action for one inactivity/failure episode.
  *
  * Every trigger converges here. A second reason while an action is already pending is the same
- * recovery, not another reload. Once carried out it stays spent until new activity changes the
- * episode key; the three-minute floor then protects distinct error/no-tab failures. Silence,
- * Goal and compaction carry their own schedules and therefore bypass that unrelated floor.
+ * recovery, not another browser action. Once carried out it stays spent until new activity
+ * changes the episode key; the floor protects distinct assistant-error, stalled and
+ * unattributed failures. Silence, Goal and compaction carry their own schedules and bypass it.
  */
 function queueBrowserRecovery(
   conversationId: string,
@@ -6572,7 +7076,8 @@ function queueBrowserRecovery(
   // Silence already paid its complete two-minute inactivity boundary. Once genuine new activity
   // starts another episode, layering the unrelated browser-action floor on top delays the next
   // stuck-page recovery beyond its own contract. Assistant-error repairs keep that shared
-  // floor; attribution owns its fixed two-attempt schedule. `goal` is exempt for the same reason and a stronger one: it carries its own backoff,
+  // floor; unattributed recovery checks the same floor before its single browser action.
+  // `goal` is exempt for the same reason and a stronger one: it carries its own backoff,
   // which after the opening step is already longer than the shared floor, so applying both would
   // only move the user's stated schedule without changing what protects the page. `no-tab` is
   // exempt because the floor protects a page that is still loading from a second reload, and a
@@ -6580,9 +7085,9 @@ function queueBrowserRecovery(
   // floor for two and a half minutes because a silence reopen had landed moments earlier. One
   // close is one reopen, and it is immediate.
   const notBefore =
-    reason === 'silence' || reason === 'goal' || reason === 'compaction' || reason === 'no-tab' || reason === 'unattributed'
+    reason === 'silence' || reason === 'goal' || reason === 'compaction' || reason === 'no-tab'
       ? now
-      : Math.max(now, (lastBrowserRecoveryAt.get(conversationId) ?? 0) + BROWSER_RECOVERY_COOLDOWN_MS);
+      : Math.max(now, sharedBrowserRecoveryDueAt(conversationId));
   const repair: Repair = {
     ...(reason === 'silence' ? { silenceGrant: activeUntil.get(conversationId) } : {}),
     ...(assistantSource ? { assistantSource } : {}),
@@ -6859,6 +7364,27 @@ async function noteRecoveryObservations(
       }
       break;
     }
+    // Explicitly enabled auto-compaction is its own recovery authority. An ordinary owner Chat
+    // must still keep its page, draft and uploads when tab recovery is off, but a failed oversized
+    // turn may file a Compact & Resume ticket before that ordinary-recovery fence is evaluated.
+    // Once filed, the continuation owns the browser pickup schedule instead of assistant-error
+    // recovery, exactly like a ticket that already existed when this failure arrived.
+    if (sessionId && item.turnId) {
+      await considerAutomaticCompaction(conversationId, sessionId, item.turnId);
+      if (pendingContinuations().some((entry) => entry.from === conversationId)) {
+        if (expediteCompactionPickup(conversationId)) {
+          logInfo(`bridge: assistant transport failure — bringing the new compaction pickup for ${conversationId} forward`);
+        }
+        break;
+      }
+    }
+    // An ordinary owner chat keeps its page, draft and uploads unless the owner explicitly
+    // enabled tab recovery. Goal/Loop chats and opted-in agent recovery still use the bounded
+    // automatic repair below. A recoverable transport error remains recorded either way.
+    if (!tabRecoveryWanted(conversationId)) {
+      logInfo(`bridge: assistant transport failure recorded without automatic browser recovery for ${conversationId}`);
+      break;
+    }
     const source = sessionId ? await assistantRepairSource(sessionId) : null;
     const episode = `assistant-error:${source?.key ?? 'page'}:${(item.text ?? '').slice(0, 240)}`;
     // How many turns this chat will have finished once the broken turn is over. The turn that
@@ -6875,8 +7401,6 @@ async function noteRecoveryObservations(
     ) {
       logInfo(`bridge: assistant transport failure — asking the browser to recover ${conversationId}`);
     }
-    if (sessionId && item.turnId && source?.turnId === item.turnId && !source.completed)
-      await considerAutomaticCompaction(conversationId, sessionId, item.turnId);
     break;
   }
 }
@@ -7093,7 +7617,8 @@ async function browserTabPolicy(openConversations: Set<string>) {
  * comes back only when the user has turned tab recovery on for them, and that starts off.
  */
 function tabRecoveryWanted(conversationId: string): boolean {
-  return goalActiveFor(conversationId) || getConfig().multiAgent.recoverAgentTabs;
+  return goalActiveFor(conversationId) ||
+    (getConfig().multiAgent.recoverAgentTabs && currentRunId(conversationId) !== null);
 }
 
 /** The active agent chats for which the browser must keep asking the app for recovery work. */
@@ -7131,7 +7656,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
       continue;
     }
     const pro = await extendedSilenceWindowFor(conversationId, grant.sessionId);
-    const afterTurn = recoveryInputAllowed(grant.sessionId, conversationId) || loopAfterTurnFor(conversationId) || await hasQueuedAfterTurnInput(grant.sessionId);
+    const afterTurn = loopAfterTurnFor(conversationId) || await hasQueuedAfterTurnInput(grant.sessionId);
     if (activeUntil.get(conversationId) !== grant) continue;
     if (afterTurn && runningToolCalls(conversationId) > 0) {
       grant.until = now + GOAL_QUIET_MS;
@@ -7281,7 +7806,7 @@ const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
  * opening, the prompt's durable dispatch) or when it was last picked up. A phase change resets
  * the count — the writing phase's three do not include the two the asking phase spent.
  */
-type CompactionPhase = 'asking' | 'writing' | 'opening';
+export type CompactionPhase = 'asking' | 'writing' | 'opening';
 const COMPACTION_PICKUPS: Record<CompactionPhase, { every: number; attempts: number }> = {
   asking: { every: 2 * 60_000, attempts: 5 },
   writing: { every: 5 * 60_000, attempts: 3 },
@@ -7289,7 +7814,8 @@ const COMPACTION_PICKUPS: Record<CompactionPhase, { every: number; attempts: num
 };
 const compactionWatch = new Map<string, { token: string; phase: CompactionPhase; since: number; attempts: number }>();
 
-function compactionPhaseOf(entry: ContinuationView): CompactionPhase {
+/** The one phase projection shared by pickup scheduling and the owner-control surface. */
+export function compactionPhaseOf(entry: ContinuationView): CompactionPhase {
   if (entry.state !== 'awaiting-summary') return 'opening';
   return sendUnattempted(entry.sourceSend) ? 'asking' : 'writing';
 }
@@ -7833,7 +8359,12 @@ function armUnattributedTick(): void {
   unattributedTimer = null;
   const pending = [...unattributedIncidents.values()].filter(incident => incident.pass < 2);
   if (!pending.length) return;
-  const due = Math.min(...pending.map(incident => incident.pass === 0 ? incident.firstDueAt : incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS));
+  const due = Math.min(...pending.map(incident => {
+    if (incident.pass !== 0) return incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS;
+    const suspects = pendingSuspects(incident);
+    return suspects.length ? Math.min(...suspects.map(candidate =>
+      Math.max(incident.firstDueAt, sharedBrowserRecoveryDueAt(candidate.conversationId)))) : incident.firstDueAt;
+  }));
   unattributedTimer = setTimeout(() => { unattributedTimer = null; void tickUnattributedIncident().catch(error =>
     logWarn(`bridge: attribution recovery failed: ${String(error)}`)); }, Math.max(0, due - Date.now()));
   unattributedTimer.unref?.();
@@ -7847,14 +8378,27 @@ async function tickUnattributedIncident(): Promise<void> {
     await incident.ready;
     if (incident.pass >= 2 || ![...unattributedIncidents.values()].includes(incident)) continue;
     const suspects = pendingSuspects(incident);
-    if (!suspects.length) { incident.pass = 2; updated = true; continue; }
+    if (!suspects.length) {
+      incident.pass = 2;
+      await retireUnattributedRepair(incident, false);
+      updated = true;
+      continue;
+    }
     const due = incident.pass === 0 ? incident.firstDueAt : incident.startedAt + UNATTRIBUTED_FINAL_WINDOW_MS;
-    if (Date.now() < due) continue;
+    const firstActionDue = incident.pass === 0
+      ? Math.min(...suspects.map(candidate => Math.max(due, sharedBrowserRecoveryDueAt(candidate.conversationId))))
+      : due;
+    if (Date.now() < firstActionDue) continue;
     const pass = ++incident.pass;
     updated = true;
-    // No fresh same-request work after the issued first action means no second refresh.
-    if (pass === 2 && (!incident.requestId || incident.firstAttemptAt === null ||
-        incident.lastUnknownStartedAt <= incident.firstAttemptAt)) continue;
+    // Pass two diagnoses a still-unresolved same-request incident. It never grants
+    // a second browser action, even if new unknown work appeared after pass one.
+    if (pass === 2) {
+      await retireUnattributedRepair(incident);
+      logInfo(`bridge: unattributed incident ${incident.requestId ?? incident.startedAt} reached diagnostic pass 2; no browser action`);
+      continue;
+    }
+    const eligibleTargets: UnattributedCandidate[] = [];
     for (const target of suspects) {
       const session = await getSession(target.sessionId);
       if (![...unattributedIncidents.values()].includes(incident)) break;
@@ -7866,20 +8410,38 @@ async function tickUnattributedIncident(): Promise<void> {
         continue;
       }
       if (![...unattributedIncidents.values()].includes(incident)) break;
-      const held = repairsInFlight.get(target.conversationId);
-      if (held?.attribution?.incident === incident) repairsInFlight.delete(target.conversationId);
-      else if (held) continue;
-      if (queueBrowserRecovery(target.conversationId, target.sessionId,
-          `unattributed:${incident.startedAt}:${pass}`, 'unattributed', target.endedTurns)) {
-        const repair = repairsInFlight.get(target.conversationId)!;
-        repair.attribution = { incident, candidate: target };
-        if (held) { repair.progressId = held.progressId; repair.progress = held.progress; }
-        logInfo(`bridge: unattributed activity — requesting refresh ${pass}/2 for ${target.conversationId}`);
-      }
+      eligibleTargets.push(target);
+    }
+    // The request is still unattributed. When more than one chat remains eligible,
+    // choosing one by ordering would invent ownership; this incident spends no action.
+    if (eligibleTargets.length !== 1) {
+      logInfo(`bridge: unattributed incident ${incident.requestId ?? incident.startedAt} has ${eligibleTargets.length} eligible chats; no browser action`);
+      continue;
+    }
+    const target = eligibleTargets[0]!;
+    const held = repairsInFlight.get(target.conversationId);
+    if (held?.attribution?.incident === incident) repairsInFlight.delete(target.conversationId);
+    else if (held) continue;
+    if (queueBrowserRecovery(target.conversationId, target.sessionId,
+        `unattributed:${incident.startedAt}:${pass}`, 'unattributed', target.endedTurns)) {
+      const repair = repairsInFlight.get(target.conversationId)!;
+      repair.attribution = { incident, candidate: target };
+      if (held) { repair.progressId = held.progressId; repair.progress = held.progress; }
+      logInfo(`bridge: unattributed activity — requesting one recovery action for ${target.conversationId}`);
     }
   }
   armUnattributedTick();
   if (updated) changed();
+}
+
+/** Retire the incident's exact handout at its diagnostic deadline without treating it as success. */
+async function retireUnattributedRepair(incident: UnattributedIncident, unresolved = true): Promise<void> {
+  for (const [conversationId, repair] of repairsInFlight) {
+    if (repair.reason !== 'unattributed' || repair.attribution?.incident !== incident || repair.state === 'done') continue;
+    repair.state = 'done';
+    if (unresolved) await updateRepairProgress(conversationId, repair,
+      'Request attribution is still unresolved; no further browser action will be taken for this incident.');
+  }
 }
 
 /**
@@ -7970,11 +8532,14 @@ async function takePendingRepairs(
   for (const [conversationId, repair] of repairsInFlight) {
     const unclaimed = repair.reason !== 'unattributed' && repairNeedsClaim(repair) && repair.state === 'handed' && !repair.claimed;
     if (repair.state !== 'queued' && !unclaimed) continue;
+    if (repair.reason === 'unattributed') repair.notBefore = Math.max(repair.notBefore, sharedBrowserRecoveryDueAt(conversationId));
     if (now < repair.notBefore) continue;
     if (!unclaimed) {
       repair.state = 'handed';
       repair.token = randomBytes(9).toString('base64url');
-      await updateRepairProgress(conversationId, repair, `Trying to reload chat to recover ${repairReason(repair)}…`);
+      await updateRepairProgress(conversationId, repair, repair.reason === 'unattributed'
+        ? `Checking the page before recovering ${repairReason(repair)}…`
+        : `Trying to reload chat to recover ${repairReason(repair)}…`);
     }
     // A missed pre-action claim may retry the same offer. Once claimed, ambiguous
     // acknowledgement keeps custody and cannot authorize a second browser action.
@@ -8022,7 +8587,7 @@ async function attributionRepairAllowed(repair: Repair, session: SessionSummary 
 
 function attributionRepairCurrent(repair: Repair, session: SessionSummary | null): boolean {
   const scope = repair.attribution;
-  return !scope || (!!session && session.endedAt === null && [...unattributedIncidents.values()].includes(scope.incident) &&
+  return !scope || (!!session && scope.incident.pass < 2 && session.endedAt === null && [...unattributedIncidents.values()].includes(scope.incident) &&
     session.conversationId === scope.candidate.conversationId &&
     (session.activeTurnId ?? null) === scope.candidate.turnId && !session.finishTurn?.released &&
     (!scope.incident.requestId || !requestCorrelation(scope.incident.requestId)) &&
@@ -8031,13 +8596,13 @@ function attributionRepairCurrent(repair: Repair, session: SessionSummary | null
 }
 
 /**
- * That repair actually happened: this exact chat's tab reloaded.
+ * That repair action completed for this exact chat: it was reloaded or its page helpers attached.
  *
  * The token, not the conversation, is what is answered here. A receipt that names a handout
  * this app is no longer waiting on - an older turn's, or one already re-queued - matches
  * nothing and closes nothing, which is the only safe reading of it.
  */
-async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | null): Promise<void> {
+async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | 'repaired' | null): Promise<void> {
   for (const [conversationId, repair] of repairsInFlight) {
     if (repair.state === 'handed' && repair.token === token) {
       if (!compactionRepairCurrent(conversationId, repair)) { repairsInFlight.delete(conversationId); return; }
@@ -8046,7 +8611,7 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
         repair.attribution.incident.firstAttemptAt = Date.now();
       lastBrowserRecoveryAt.set(conversationId, Date.now());
-      awaitingReturn.add(conversationId);
+      if (action !== 'repaired') awaitingReturn.add(conversationId);
       if (repair.reason === 'silence') {
         const failedGrant = activeUntil.get(conversationId);
         if (failedGrant) failedGrant.until = Date.now() + recoveryBusyMs(failedGrant.model === 'pro');
@@ -8075,7 +8640,9 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       await updateRepairProgress(
         conversationId,
         repair,
-        `${action === 'reopened' ? 'Reopened' : 'Reloaded'} chat to recover ${repairReason(repair)}.`
+        action === 'repaired'
+          ? `Repaired the page observers for ${repairReason(repair)}.`
+          : `${action === 'reopened' ? 'Reopened' : 'Reloaded'} chat to recover ${repairReason(repair)}.`
       );
       return;
     }
@@ -8083,14 +8650,14 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
 }
 
 /** An exact browser action failed; keep the episode queued and replace its one debug row. */
-async function failRepairAttempt(token: string, action: 'reloaded' | 'reopened' | null): Promise<void> {
+async function failRepairAttempt(token: string, action: 'reloaded' | 'reopened' | 'repaired' | null): Promise<void> {
   for (const [conversationId, repair] of repairsInFlight) {
     if (repair.state !== 'handed' || repair.token !== token) continue;
     logWarn(`bridge: the browser reported failed ${repair.reason} recovery for ${conversationId} (${action ?? 'action unspecified'})`);
     await updateRepairProgress(
       conversationId,
       repair,
-      `${action === 'reopened' ? 'Reopen' : 'Reload'} failed while recovering ${repairReason(repair)}${repair.attribution ? '.' : '; will retry.'}`
+      `${action === 'repaired' ? 'Observer repair' : action === 'reopened' ? 'Reopen' : 'Reload'} failed while recovering ${repairReason(repair)}${repair.attribution ? '.' : '; will retry.'}`
     );
     if (repairsInFlight.get(conversationId) !== repair) return;
     if (repair.reason === 'assistant-error' && turnRepairSpent.get(conversationId)?.token === token)
@@ -9162,6 +9729,7 @@ export async function restoreCommands(): Promise<void> {
 /** Test seam. */
 export function resetBridgeForTests(): void {
   clearCompanionDiagnostics();
+  resetRequestOriginDiagnostics();
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = null;

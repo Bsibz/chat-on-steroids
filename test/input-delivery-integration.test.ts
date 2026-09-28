@@ -37,6 +37,7 @@ const { registerIpc } = await import('../src/main/ipc.js');
 const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
 const input = await import('../src/main/session/input.js');
 const goal = await import('../src/main/goal.js');
+const agents = await import('../src/main/agents.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 let directory: string;
 let bearer: string;
@@ -61,7 +62,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   await writeDurableNow('session-input', []);
   await writeDurableNow('plugin-refresh', []);
-  goal.resetGoalStateForTests(); input.resetInputForTests(); pushed.mockClear();
+  agents.resetAgentsForTests(); goal.resetGoalStateForTests(); input.resetInputForTests(); pushed.mockClear();
   await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false }, goal: { ...defaultConfig().goal, enabled: false } });
 });
 
@@ -99,8 +100,10 @@ it('keeps automatic Continue attached to the native question after injected corr
   try {
     const bridge = await import('../src/main/bridge.js');
     const store = await import('../src/main/session/store.js');
-    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } });
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false },
+      multiAgent: { ...defaultConfig().multiAgent, enabled: true, recoverAgentTabs: true } });
     const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    agents.spawn({ workers: [{ task: 'Native recovery fixture' }], caller: { conversationId } }, { deferDelivery: true });
     const session = await createSession({ title: 'Native recovery question', conversationId });
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
@@ -1702,8 +1705,10 @@ it('retires a late-confirmed cancelled desktop send after two minutes even as th
 describe('native progress silence authority', () => {
   const bridge = async () => import('../src/main/bridge.js');
   async function open(model: string, proof: 'none' | 'previous' | 'request' | 'current' = 'current') {
-    await saveConfig(defaultConfig());
+    await saveConfig({ ...defaultConfig(),
+      multiAgent: { ...defaultConfig().multiAgent, enabled: true, recoverAgentTabs: true } });
     const conversationId = randomUUID(), turnId = randomUUID(), questionId = randomUUID();
+    agents.spawn({ workers: [{ task: 'Native silence recovery fixture' }], caller: { conversationId } }, { deferDelivery: true });
     const session = await createSession({ title: 'Native progress regression', conversationId });
     if (proof === 'previous') {
       await post('/events', { conversationId, events: [{ kind: 'turn_start', turnId: 'previous', time: Date.now() - 2 }] });
@@ -2022,13 +2027,32 @@ describe('native progress silence authority', () => {
   });
 });
 
-describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)', mode => {
+it('does not give an ordinary chat silence-reload authority when Goal and Loop are off', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const bridge = await import('../src/main/bridge.js');
+    const conversationId = randomUUID(), turnId = randomUUID();
+    await createSession({ title: 'Ordinary owner chat', conversationId });
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', reasoningEffort: 'high', time: now },
+      { kind: 'user_message', messageId: randomUUID(), text: 'Keep working', time: now },
+      { kind: 'turn_start', turnId, time: now }
+    ] });
+    await attributedMcp(conversationId);
+    now += 120_001;
+    await bridge.sweepStaleSwarm(now);
+    expect((await post('/status', { openConversations: [conversationId] })).body.repairs
+      .some((row: any) => row.conversationId === conversationId)).toBe(false);
+  } finally { clock.mockRestore(); }
+});
+
+describe.each(['goal', 'loop'] as const)('shared automatic Continue (%s)', mode => {
   beforeEach(async () => { await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: false } }); });
   async function silent(model: string, advance: (ms: number) => void, reloadDelay = 0, sourceEnd?: 'completed' | 'interrupted' | 'unknown', mcp = true, manualClose = false) {
     const bridge = await import('../src/main/bridge.js');
     const conversationId = randomUUID();
     const session = await createSession({ title: 'Automatic Continue fixture', conversationId });
-    if (mode !== 'off') await goal.setGoalSwitchNow(conversationId, mode, true);
+    await goal.setGoalSwitchNow(conversationId, mode, true);
     const questionId = randomUUID(), turnId = randomUUID();
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model, reasoningEffort: 'high', time: Date.now() },
@@ -2160,7 +2184,7 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
         state: 'final', final: true, goalEligible: true, activeNow: true, time: ++now }] });
       expect(await input.claimBrowserInput(row.id, 'late-doc', conversationId, true)).toBeNull();
       expect((await input.listInputs()).find(entry => entry.id === row.id)?.state).toBe('cancelled');
-      expect(goal.goalPendingReplyFor(conversationId)?.replyId ?? null).toBe(mode === 'off' ? null : messageId);
+      expect(goal.goalPendingReplyFor(conversationId)?.replyId ?? null).toBe(messageId);
     } finally { clock.mockRestore(); }
   });
 
@@ -2241,10 +2265,8 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
       const bridge = await import('../src/main/bridge.js');
       const conversationId = randomUUID(), turnId = randomUUID();
       const session = await createSession({ title: 'Failed response recovery', conversationId });
-      if (mode !== 'off') {
-        await goal.setGoalSwitchNow(conversationId, mode, true);
-        await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false } });
-      }
+      await goal.setGoalSwitchNow(conversationId, mode, true);
+      await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false } });
       await post('/events', { conversationId, events: [
         ...(model ? [{ kind: 'model_selection', model, reasoningEffort: 'high', time: now }] : []),
         { kind: 'user_message', messageId: randomUUID(), text: 'Complete the task', time: now },
@@ -2340,7 +2362,7 @@ describe.each(['off', 'goal', 'loop'] as const)('shared automatic Continue (%s)'
           messageId: row.recovery!.questionId, text: 'An explicitly authored change', authoredNow: true, time: now }] });
         if (change === 'activity') await attributedMcp(conversationId);
         if (change === 'setting') {
-          await goal.setGoalSwitchNow(conversationId, mode === 'off' ? 'goal' : mode, false);
+          await goal.setGoalSwitchNow(conversationId, mode, false);
           await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoContinue: false } });
         }
         if (change === 'block') (await import('../src/main/session/blocked-chats.js')).setChatBlocked(conversationId, true);

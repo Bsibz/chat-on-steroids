@@ -9,6 +9,149 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.44] - Night Build owner controls and daily-driver hardening
+
+- Add a separate authenticated `night-build-chat-owner-control-v1` loopback lane so Night Build can read and change exact-chat Auto Compaction, Off/Goal/Loop and Compact & Resume state without changing the frozen Native Chat v3 contract.
+- Bind owner mutations to the existing opaque conversation handle and shared transport generation, with strict stale/superseded/change fences, durable compaction tickets and explicit cancel-boundary truth.
+- Preserve the current ChatGPT shell, model/reasoning picker, context-estimate wording, request-origin diagnostics and recent local runtime/recovery hardening already dogfooded through 2.1.43.
+- Keep owner-control startup additive: failure of the new lane never changes v2/v3 availability, and no provider context occupancy is invented from the local recorder estimate.
+
+## [2.1.43] - Current ChatGPT shell compatibility
+
+- Read current ChatGPT shell turns through exact typed public message identity, including visible commentary/preamble text, while keeping private reasoning bodies and tool arguments out of the companion boundary.
+- Treat model-less exact DOM/Fiber turns as degraded terminal evidence only when that exact renderer shape proves it cannot publish `end_turn`; ordinary Fiber turns remain fail-closed until provider terminal truth arrives.
+- Support the current ChatGPT model/reasoning picker, including exact live `5.6` family to `gpt-5-6-thinking` High execution-lane proof, closed-trigger confirmation, and composer reacquisition after picker remounts.
+- Preserve legacy and September search-unit renderer compatibility alongside the current app-shell path.
+
+## [2.1.42] - Modern composer recovery and context truth
+
+- Recognize ChatGPT's current scoped composer when the legacy `#prompt-textarea` node is absent, preferring the markdown contenteditable inside `form[data-chatgpt-composer]` and then the form's textbox fallback. Fresh worker bootstrap and Compact & Resume now share that same current composer primitive instead of failing on the removed legacy selector.
+- Keep automatic compaction tied to the explicitly enabled local recorded-text estimate; do not present that heuristic as provider context occupancy. The compaction trigger itself remains fail-closed on worker/role/liveness and continuation ownership.
+- Stop spending context on completed command output that was already delivered: ordinary completed `write_stdin` polls omit the duplicate body, and `reread_retained=true` is required for a deliberate exact reread without rerunning work.
+- Align model-visible instructions, retained-output diagnostics, renderer labels, release notes and Spanish/Simplified-Chinese/Traditional-Chinese translations with that exact behavior.
+- Preserve both MCP result representations required by ordinary clients and ChatGPT Code Mode while recording only one authored local copy of exec/write output.
+
+## [2.1.41] - Leaner tool context and idle tabs
+
+- Stop spending context on completed command output that was already delivered: an ordinary completed `write_stdin` poll omits an already-delivered body, and only explicit `reread_retained=true` performs the deliberate retained reread. This replay suppression is the main context saving.
+- Keep the dual MCP representations required by ordinary clients and ChatGPT Code Mode. Recording `exec_command` / `write_stdin` now keeps one authored copy of the command text instead of serializing the mirrored protocol envelope as a duplicate local copy; this removes a redundant duplicate, not the primary context saving.
+- Label the context meter as a local recorded-text estimate and state explicitly that ChatGPT provider occupancy, hidden reasoning, system prompts, tool schemas and provider-side compaction are not observable here.
+- Back the full companion DOM reconciliation loop from one second to ten seconds only for hidden idle ChatGPT tabs; visible or generating tabs keep the one-second fallback and mutation observers still react immediately.
+- Hide the manual connector-refresh reminder when Automatic plugin refresh is enabled; the existing exact-schema helper-tab refresh path remains fail-closed.
+- Bound OS secure-storage availability checks so a hung macOS Keychain cannot freeze the first renderer state snapshot. Startup fails closed to no credential visibility/writes for that snapshot and later reads may retry when the OS key store responds.
+
+## [2.1.40] - Intermediate local dogfood snapshot
+
+- Installed during local development before the context/runtime hardening pass was complete.
+- Superseded by 2.1.41 because the verified updater intentionally refuses to replace a running 2.1.40 with a different same-version artifact.
+
+## [2.1.39] - Stable local macOS identity
+
+- Apple-Development-sign only the owner-local macOS dogfood copy with a Team-bound designated requirement, while leaving public macOS DMG/ZIP artifacts on the existing ad-hoc/unnotarized policy.
+- Keep public release outputs untouched: the local publisher copies the already-smoked app into temporary staging, signs that copy, re-smokes it, archives it separately, extracts and audits the exact signed ZIP, then publishes only that local artifact.
+- Bind LocalUpdateChannel manifests to Team ID, signing identifier and designated requirement; 2.1.39+ re-verifies all three before and after the updater swaps the installed bundle.
+- Preserve Accessibility and Screen Recording identity across future local rebuilds by binding macOS TCC to team + bundle identifier instead of each build's changing ad-hoc CDHash.
+
+The first transition from an ad-hoc build to this stable development identity may require one fresh macOS privacy grant. Later local builds keep the same identity.
+
+## [2.1.38] - One-step app + companion update
+
+- Let an older unpacked companion detect a newer packaged companion only when the app proves its stable materialization matches the current app build and that extension id independently sees the same new manifest in its own authorized root.
+- Fence reload durably by the extension version being reloaded from, with the in-memory single-flight claimed before any await, so rotating peer versions and overlapping hellos cannot create a reload loop.
+- Re-inject current ChatGPT DOM/Fiber/usage/content helpers through one no-navigation startup recovery flight; discarded/loading/frozen tabs are left alone.
+- Repair Fiber recovery parity at helper version 16 and retire stale MAIN-world Fiber listeners across version changes.
+- Keep the existing manual extension-reload warning as fail-closed recovery when the automatic reload cannot complete.
+
+After this bootstrap, the verified local app updater also refreshes the companion automatically.
+
+## [2.1.37] - Controller-driven local updater
+
+- Add a fixed `--install-local-update` startup/second-instance command for packaged macOS dogfood builds. It carries no candidate path, version, hash, or installer authority; the running primary still uses the fixed local channel and all 2.1.36 verification gates.
+- Defer that command until normal app bootstrap is complete, then join the ordinary update check, require a verified staged candidate, and enter the same bounded shutdown/update handoff used by the UI Install button.
+- Add `npm run local:update:mac:install` so an owner-authorized controller can trigger a green local update without manually replacing the app or clicking through the CoS UI.
+- Keep public macOS releases manual and keep development Electron runs unable to consume the install command.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.36] - Owner-local macOS update channel
+
+- Add a fixed, local-only macOS development update channel under Chat On Steroids app support so verified dogfood builds no longer require replacing the installed app by hand after this bootstrap release.
+- Bind every local candidate to an exact versioned ZIP name, architecture, product bundle id, and SHA-256. The running app copies and rehashes the archive before it becomes installable.
+- Require an explicit Install press for local macOS updates. The detached post-quit helper rehashes the archive again, verifies bundle id/version/architecture and the ad-hoc code seal, swaps the exact running bundle with rollback, then relaunches that exact path.
+- Add `npm run local:update:mac` to run full CI, package the host architecture, smoke the packaged runtime/bundle/GUI plus the extracted ZIP, and atomically publish the local candidate without touching the installed app.
+- Keep public macOS releases on the existing manual path; this local owner channel does not pretend ad-hoc builds are Developer-ID signed or notarized.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.35] - Model-less commentary Fiber shell
+
+- Preserve a bounded, text-free Fiber turn shell when ChatGPT visibly renders commentary under `data-interrupted` but exposes no reachable canonical turn messages, activities, calls, request ids, images, or final id.
+- Use that shell only as the ephemeral DOM-to-Fiber join for an already-owned live assistant section. Public visible commentary remains read from the DOM; no prose, request identity, tool identity, or provider content is invented by the shell.
+- Fix the 2.1.34 replacement-document path where exact SSE evidence successfully opened the first live turn but the empty Fiber descriptor was discarded, preventing 2.1.33's commentary fallback from ever emitting `progress`.
+- Keep genuinely empty Fiber sections discarded, preserving the historical and attribution fail-closed fences.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.34] - Live fresh-chat commentary ownership
+
+- Open a replacement document's first live turn as soon as the exact current-route ChatGPT conversation SSE proves the user-authored request, instead of waiting for a Stop control or natural EOF.
+- Adopt an already-mounted latest assistant section only under that exact live transport proof, so model-less visible commentary can be recorded while the turn is still running without treating hydrated history as new work.
+- Preserve the 2.1.32 natural-EOF fence: only the exact request that opened this recovered turn may close it, and EOF still settles as terminal `unknown` unless stronger provider/Fiber evidence proves a more specific outcome.
+- Keep request attribution, historical transcript fences, and the bridge protocol unchanged.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.33] - Native Chat visible commentary capture
+
+- Restore public ChatGPT commentary/progress prose that is visibly rendered between tool calls when the current renderer exposes an exact live Fiber turn but no reachable canonical assistant messages.
+- Keep Fiber/provider prose authoritative whenever it exists. The DOM fallback is live-turn-only, reads visible page text only, strips native tool rows, and never consumes private analysis/page-model content.
+- Persist growing commentary under a stable generation-scoped identity so redraws revise one row at its first chronological position instead of duplicating captions.
+- Project those durable commentary rows into Night Build as non-final assistant transcript items interleaved with tool activity. If stronger canonical assistant prose later contains the exact same visible text, the fallback duplicate is suppressed.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.32] - Fast fresh-chat first-turn recovery
+
+- Recover a brand-new ChatGPT conversation whose first answer starts and finishes before the replacement document can witness the normal composer receipt or Stop control.
+- Recovery requires the exact current conversation's live POST SSE request plus natural stream EOF in the same document epoch. Old hydrated history, a terminal signal without its matching live start, and foreign routes remain ineligible.
+- The recovered turn is closed as terminal `unknown` unless stronger provider/Fiber evidence independently proves a more specific outcome. This removes false perpetual-working state without inventing completion semantics.
+- Ordinary owner-Chat reload authority, attribution, Native Chat send pinning, and historical transcript fences are unchanged.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.31] - Exact-ID assistant presentation whitespace
+
+- Preserve paragraph and list whitespace for September assistant rows even when ChatGPT exposes no reachable canonical turn model.
+- The exact-ID DOM fallback may use the same owned block's `innerText` only when its non-whitespace authored characters exactly match the fallback `textContent`.
+- Identity, attribution, recovery and canonical raw capture rules are unchanged. A character mismatch keeps the flat fallback and never upgrades presentation.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.30] - Native Chat terminal and assistant layout truth
+
+- Recognize the September ChatGPT assistant `data-markdown-text-tone="assistant-message"` renderer so exact same-message DOM layout can restore paragraph and list whitespace without replacing Fiber/provider content.
+- Let durable exact-turn `turn_end` evidence settle stale active-turn metadata in Native Chat. Only the latest assistant row owned by that ended turn is projected final, so interim prose is not promoted into duplicate finished answers.
+- Keep ordinary owner Chat recovery authority unchanged. These fixes affect transcript presentation and terminal projection only.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.29] - Observed screenshot transcript projection
+
+- Accept zero-byte-size observed screenshot metadata in Native Chat transcript projection. DOM-only screenshots know their rendered pixels but intentionally do not claim a provider file byte size, so `size: 0` now means unknown rather than malformed.
+- Keep preview data bounded and public attachment ids opaque. No provider URL, synthetic DOM attachment id, or private page metadata is exposed.
+
+Reload the matching unpacked companion after updating.
+
+## [2.1.28] - Native Chat daily-driver hardening
+
+- Make user-message layout upgrades deterministic across the normal DOM recorder and Fiber refresh paths. Fiber/provider bytes remain canonical while exact same-message DOM text may restore whitespace only when the non-whitespace characters are identical.
+- Capture up to ten observed screenshot attachments from the September ChatGPT search-unit renderer, including late-rendered thumbnails, while keeping writable Native Chat sends capped at four and never exposing DOM image URLs or provider-private metadata.
+- Keep borrowed owner Chat tabs open after worker/input completion. Only tabs that the exact app input created as disposable helpers may be physically closed by helper cleanup.
+- Keep ordinary owner Chat free from silence, assistant-error, and missing-tab browser recovery unless a current agent run owns that conversation or Goal/Loop explicitly owns recovery.
+- Preserve explicitly enabled auto-compaction as its own recovery authority, so an oversized failed ordinary Chat may still file Compact & Resume without restoring ordinary tab-reload authority.
+
+Reload the matching unpacked companion after updating so current ChatGPT tabs use the 2.1.28 recorder and search-unit attachment path.
+
 ## [2.1.27] — Current ChatGPT renderer recovery
 
 - Recover public assistant transcript revisions from ChatGPT's exact provider-owned DOM message ids when the September renderer no longer exposes `turn.messages` / `allMessages` on either the inner or outer mounted Fiber branch.

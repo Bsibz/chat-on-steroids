@@ -86,6 +86,7 @@ it('delivers one recovered-identity notice on the real structured MCP wire after
   const recovered = await send();
   expect(recovered.result.isError, text(recovered)).not.toBe(true);
   expect(recovered.result.structuredContent.output).toBe('command output');
+  expect(text(recovered)).toContain('command output');
   expect(recovered.result.structuredContent.supplemental_context).toContain('Earlier update_plan calls were refused');
   expect(text(recovered).match(/--- Identity recovered ---/g)).toHaveLength(1);
   expect(text(await send())).not.toContain('Identity recovered');
@@ -144,6 +145,7 @@ it('preserves a nonzero terminal exit and leaves nested correction delivery with
   await enqueueInput({ id: randomUUID(), sessionId: who.session.id, text: 'NONZERO_CORRECTION', mode: 'auto', dueAt: 0, model: null, reasoningEffort: null });
   const direct = await rpc('tools/call', { name: 'exec_command', arguments: { cmd: 'echo fixture', workdir: '/workspace' } }, who.requestId);
   expect(direct.result.structuredContent).toMatchObject({ exit_code: 7, output: 'process failure', supplemental_context: expect.stringContaining('NONZERO_CORRECTION') });
+  expect(text(direct)).toContain('process failure');
   expect(direct.result.structuredContent).not.toHaveProperty('session_id');
   await call(who.requestId, 'text("receipt")');
   await enqueueInput({ id: randomUUID(), sessionId: who.session.id, text: 'OUTER_ONLY_CORRECTION', mode: 'auto', dueAt: 0, model: null, reasoningEffort: null });

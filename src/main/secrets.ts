@@ -83,13 +83,35 @@ export function secureStorageCiphertextIsProtected(
   return platform !== 'linux' || !encrypted.subarray(0, LINUX_BASIC_TEXT_PREFIX.length).equals(LINUX_BASIC_TEXT_PREFIX);
 }
 
-export async function secureStorageStatus(platform: NodeJS.Platform = process.platform): Promise<SecureStorageInfo> {
+let secureStorageStatusFlight: Promise<SecureStorageInfo> | null = null;
+export const SECURE_STORAGE_PROBE_TIMEOUT_MS = 8_000;
+
+async function asyncEncryptionAvailability(): Promise<{ available: boolean; timedOut: boolean }> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<{ available: false; timedOut: true }>(resolve => {
+    timer = setTimeout(() => resolve({ available: false, timedOut: true }), SECURE_STORAGE_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+  });
   try {
-    if (!(await safeStorage.isAsyncEncryptionAvailable())) {
+    return await Promise.race([
+      safeStorage.isAsyncEncryptionAvailable().then(available => ({ available, timedOut: false })),
+      timeout
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function probeSecureStorageStatus(platform: NodeJS.Platform): Promise<SecureStorageInfo> {
+  try {
+    const availability = await asyncEncryptionAvailability();
+    if (!availability.available) {
       return {
         available: false,
         detail:
-          platform === 'linux'
+          availability.timedOut
+            ? `Secure operating-system credential storage did not answer within ${SECURE_STORAGE_PROBE_TIMEOUT_MS / 1000} seconds. No credentials were exposed; retry after the OS key store is responsive.`
+            : platform === 'linux'
             ? 'Secure credential storage is unavailable. Start or unlock a Linux desktop keyring/Secret Service (for example GNOME Keyring or KWallet), then try again.'
             : platform === 'darwin'
               ? 'macOS Keychain credential storage is unavailable. Unlock the login keychain, then try again.'
@@ -112,6 +134,25 @@ export async function secureStorageStatus(platform: NodeJS.Platform = process.pl
   } catch {
     return { available: false, detail: 'Secure operating-system credential storage could not be initialized.' };
   }
+}
+
+/**
+ * Share one OS-keychain availability probe across a burst of status snapshots.
+ *
+ * The renderer asks for state from several independent surfaces during cold startup. On macOS a
+ * first safeStorage probe can take seconds while Keychain wakes; running five identical probes in
+ * parallel only adds contention and can make an otherwise healthy packaged startup miss its
+ * readiness deadline. This is a single-flight, not a cache: once the probe settles, a later call
+ * checks the OS again so unlocking a keychain can still be observed without restarting.
+ */
+export function secureStorageStatus(platform: NodeJS.Platform = process.platform): Promise<SecureStorageInfo> {
+  if (secureStorageStatusFlight) return secureStorageStatusFlight;
+  const work = probeSecureStorageStatus(platform);
+  const tracked = work.finally(() => {
+    if (secureStorageStatusFlight === tracked) secureStorageStatusFlight = null;
+  });
+  secureStorageStatusFlight = tracked;
+  return tracked;
 }
 
 export async function isEncryptionAvailable(platform: NodeJS.Platform = process.platform): Promise<boolean> {
@@ -326,4 +367,5 @@ export function resetSecretsCacheForTests(): void {
   cache = null;
   rotationPending = false;
   loadInFlight = null;
+  secureStorageStatusFlight = null;
 }

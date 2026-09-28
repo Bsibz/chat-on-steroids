@@ -16,13 +16,15 @@ import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLo
 import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
 import { pluginManager } from './plugins/manager.js';
-import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
+import { setBrowserOpener, setBrowserWorkArea, setCompanionReloadVersion, shutdownBridge, startBridge } from './bridge.js';
 import { startNightBuildBridgeV2, type NightBuildBridgeV2Handle } from './night-build-bridge-v2.js';
 import { createInProcessNightBuildBridgeV2Source } from './night-build-bridge-v2-in-process.js';
 import { startNightBuildChatTransportV2, type NightBuildChatTransportV2Handle } from './night-build-chat-transport-v2.js';
 import { createInProcessNightBuildChatTransportV2Source } from './night-build-chat-transport-v2-source.js';
 import { startNightBuildChatControlV3, type NightBuildChatControlV3Handle } from './night-build-chat-control-v3.js';
 import { createInProcessNightBuildChatControlV3Source } from './night-build-chat-control-v3-source.js';
+import { startNightBuildChatOwnerControlV1, type NightBuildChatOwnerControlV1Handle } from './night-build-chat-owner-control-v1.js';
+import { createInProcessNightBuildChatOwnerControlV1Source } from './night-build-chat-owner-control-v1-source.js';
 import { flushSessions, initSessionStore } from './session/store.js';
 import { initSkillsPath } from './skills.js';
 import { usageOverview } from './session/usage.js';
@@ -71,12 +73,13 @@ import {
   type ContinuationSnapshot
 } from './session/continuation.js';
 import { runShutdownSequence } from './shutdown.js';
-import { applyStagedUpdate, startUpdateChecks } from './update.js';
+import { applyStagedUpdate, checkForUpdates, markInstallOnQuit, startUpdateChecks } from './update.js';
 import { UI_BASE_ZOOM, windowLayoutForWorkArea, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { openInPreferredBrowser } from './browser.js';
 import {
   applyLoginStartup,
   isBackgroundLaunch,
+  isLocalUpdateInstallLaunch,
   createWindowActivationGate,
   ownsAppRuntime,
   registerNativeWindowActivation,
@@ -86,7 +89,7 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
-import { extensionDir } from './extension-path.js';
+import { extensionDir, packagedExtensionReloadVersion } from './extension-path.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -98,9 +101,13 @@ let quitting = false;
 let nightBuildBridge: NightBuildBridgeV2Handle | null = null;
 let nightBuildChatTransportV2: NightBuildChatTransportV2Handle | null = null;
 let nightBuildChatControlV3: NightBuildChatControlV3Handle | null = null;
+let nightBuildChatOwnerControlV1: NightBuildChatOwnerControlV1Handle | null = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
 const usageWarmup = new AbortController();
+let localUpdateInstallReady = false;
+let localUpdateInstallPending = false;
+let localUpdateInstallRunning = false;
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -253,6 +260,43 @@ setBrowserWorkArea(() => screen.getPrimaryDisplay().workArea);
 // for the initial window that startup is already going to show, so do not construct one early.
 const windowActivation = createWindowActivationGate(showWindow);
 
+/**
+ * Accept a fixed local updater command from this process or a losing second instance.
+ *
+ * The command carries no candidate identity. update.ts remains the only authority for the fixed
+ * local channel, exact version/architecture/product binding and SHA-256. Execution is deferred
+ * until ordinary bootstrap completes so shutdown cannot race half-initialized stores.
+ */
+function requestLocalUpdateInstall(argv: readonly string[]): boolean {
+  if (!isLocalUpdateInstallLaunch(argv, process.platform, app.isPackaged)) return false;
+  localUpdateInstallPending = true;
+  if (localUpdateInstallReady) void consumeLocalUpdateInstall();
+  return true;
+}
+
+async function consumeLocalUpdateInstall(): Promise<void> {
+  if (!localUpdateInstallReady || !localUpdateInstallPending || localUpdateInstallRunning || quitting) return;
+  localUpdateInstallPending = false;
+  localUpdateInstallRunning = true;
+  try {
+    await checkForUpdates();
+    if (!markInstallOnQuit()) {
+      logWarn('update: local install command found no verified staged update');
+      windowActivation.request();
+      return;
+    }
+    logInfo('update: verified local install requested by owner command; entering normal shutdown');
+    quitting = true;
+    app.quit();
+  } catch (error) {
+    logWarn('update: local install command failed: ' + (error instanceof Error ? error.message : String(error)));
+    windowActivation.request();
+  } finally {
+    localUpdateInstallRunning = false;
+    if (localUpdateInstallPending && !quitting) void consumeLocalUpdateInstall();
+  }
+}
+
 /** Build the native tray image from encoded PNGs, never platform-dependent bitmap bytes. */
 function trayIcon(running: boolean): Electron.NativeImage {
   const spec = trayImageSpec(process.platform, running);
@@ -300,6 +344,7 @@ function refreshTray(): void {
 }
 
 app.on('second-instance', (_event, argv) => {
+  if (requestLocalUpdateInstall(argv)) return;
   if (!isBackgroundLaunch(argv)) windowActivation.request();
 });
 
@@ -324,8 +369,13 @@ void app.whenReady().then(async () => {
   // A packaged update carries the matching companion. Refresh Chrome's stable unpacked source
   // before any bridge/version UI can observe this app generation, so a local dogfood build never
   // requires another Load unpacked step — Chrome only needs Reload to execute the replaced files.
-  if (app.isPackaged && !extensionDir()) {
-    logWarn('Bundled browser extension could not be synchronized into the stable extension folder');
+  if (app.isPackaged) {
+    if (!extensionDir()) {
+      logWarn('Bundled browser extension could not be synchronized into the stable extension folder');
+      setCompanionReloadVersion(null);
+    } else {
+      setCompanionReloadVersion(packagedExtensionReloadVersion());
+    }
   }
   await pluginManager.initialize(userData);
   if (windowActivation.isDisabled()) return;
@@ -489,6 +539,23 @@ void app.whenReady().then(async () => {
       // already-started stable v2 transcript/Send/Stop lane is unavailable.
       logWarn('Night Build Chat v3 control could not start');
     }
+    try {
+      // Owner controls are their own versioned generation beside frozen v3, for the
+      // same reason: an installed 0.1.67 client reads v3's exact capability set and
+      // rejects an unexpected generation. It reuses the same v2 identity generation.
+      nightBuildChatOwnerControlV1 = await startNightBuildChatOwnerControlV1(
+        userData,
+        createInProcessNightBuildChatOwnerControlV1Source(userData, chatSalt),
+        {
+          startedAt: nightBuildChatTransportV2.discovery.startedAt,
+          instanceId: nightBuildChatTransportV2.discovery.instanceId
+        }
+      );
+    } catch {
+      // The owner-control lane is additive; its failure must never imply that v2/v3
+      // reads, sends or stops are unavailable.
+      logWarn('Night Build Chat owner control v1 could not start');
+    }
   }
   logInfo('app started');
 
@@ -509,6 +576,9 @@ void app.whenReady().then(async () => {
   // push, every failure ends inside it, and its own timer keeps it running for a tray app that
   // is never restarted.
   startUpdateChecks();
+  localUpdateInstallReady = true;
+  requestLocalUpdateInstall(process.argv);
+  if (localUpdateInstallPending) void consumeLocalUpdateInstall();
   // Warm the existing derived cache once, after startup, without delaying the UI.
   // A visit to Usage joins this same calculation; unchanged recordings cost no reads.
   void usageOverview(usageWarmup.signal).catch((error: Error) => {
@@ -560,7 +630,8 @@ app.on('will-quit', (event) => {
           shutdownBridge(),
           nightBuildBridge?.stop() ?? Promise.resolve(),
           nightBuildChatTransportV2?.stop() ?? Promise.resolve(),
-          nightBuildChatControlV3?.stop() ?? Promise.resolve()
+          nightBuildChatControlV3?.stop() ?? Promise.resolve(),
+          nightBuildChatOwnerControlV1?.stop() ?? Promise.resolve()
         ]
       },
       // Phase 2: only after request handlers are done may their owned child processes go.

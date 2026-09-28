@@ -7,9 +7,9 @@ catch { /* Dismissal still works for this window when storage is unavailable. */
  * No saved acknowledgement also covers the first upgrade that introduces this notice.
  * This is only a reminder; dismissing it does not assert that ChatGPT refreshed anything.
  */
-export function paintPluginRefreshReminder(currentVersion: string): void {
+export function paintPluginRefreshReminder(currentVersion: string, automaticRefresh: boolean): void {
   const notice = document.getElementById('pluginRefreshReminder')!;
-  notice.hidden = dismissedVersion === currentVersion;
+  notice.hidden = automaticRefresh || dismissedVersion === currentVersion;
   document.getElementById('dismissPluginRefreshReminder')!.onclick = () => {
     dismissedVersion = currentVersion;
     try { window.localStorage.setItem(DISMISSED_VERSION_KEY, currentVersion); }

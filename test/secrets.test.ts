@@ -21,6 +21,7 @@ const {
   initSecretsPath,
   peekSecret,
   resetSecretsCacheForTests,
+  SECURE_STORAGE_PROBE_TIMEOUT_MS,
   secureStorageCiphertextIsProtected,
   secureStorageStatus,
   setSecret
@@ -50,6 +51,23 @@ afterEach(async () => {
 });
 
 describe('secret store', () => {
+  it('bounds a hung OS secure-storage availability probe and fails closed', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockImplementationOnce(
+        () => new Promise<boolean>(() => undefined)
+      );
+      const pending = secureStorageStatus('darwin');
+      await vi.advanceTimersByTimeAsync(SECURE_STORAGE_PROBE_TIMEOUT_MS);
+      await expect(pending).resolves.toEqual({
+        available: false,
+        detail: expect.stringMatching(/did not answer.*No credentials were exposed/i)
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('refuses Linux v10 hard-coded-key ciphertext instead of trusting the legacy backend label', async () => {
     vi.mocked(safeStorage.getSelectedStorageBackend).mockReturnValue('basic_text');
     vi.mocked(safeStorage.encryptStringAsync).mockResolvedValueOnce(Buffer.from('v10fallback-ciphertext', 'ascii'));

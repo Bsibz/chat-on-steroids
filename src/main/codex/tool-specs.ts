@@ -90,7 +90,7 @@ export const EXEC_COMMAND_LOGIN_DESCRIPTION =
     : 'True runs the shell with -l/-i semantics; false disables them. Defaults to true.';
 
 export const WRITE_STDIN_DESCRIPTION =
-  'Polls or writes to the returned session ID. Empty chars reread retained output after completion, including automatic delivery; never reruns work. Completed processes reject input. Retains the latest 64 results in this app, 256 KiB each.';
+  'Polls or writes to the returned session ID. After completion, an empty poll omits output already delivered by an earlier tool result; set reread_retained=true only for a deliberate exact reread. Never reruns work. Completed processes reject input. Retains the latest 64 results in this app, 256 KiB each.';
 
 export const WRITE_STDIN_SESSION_ID_DESCRIPTION = 'Returned running or completed session ID.';
 

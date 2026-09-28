@@ -133,7 +133,8 @@ describe('extension release metadata', () => {
 
 // ---------------------------------------------------------------------- DOM
 
-const TURN_SELECTOR = '[data-testid^="conversation-turn"], [data-chatgpt-search-unit-key]';
+const TURN_SELECTOR =
+  '[data-testid^="conversation-turn"], [data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key], [data-chatgpt-search-unit-key]';
 const TOOL_SELECTOR = 'span[class*="tool-message"]';
 
 class FakeNode {
@@ -170,7 +171,19 @@ class FakeNode {
   }
 
   querySelectorAll(selector: string): FakeNode[] {
-    return this.all.get(selector) ?? [];
+    const exact = this.all.get(selector);
+    if (exact) return exact;
+    if (!selector.includes(',')) return [];
+    const out: FakeNode[] = [];
+    const seen = new Set<FakeNode>();
+    for (const part of selector.split(',').map(value => value.trim())) {
+      for (const node of this.all.get(part) ?? []) {
+        if (seen.has(node)) continue;
+        seen.add(node);
+        out.push(node);
+      }
+    }
+    return out;
   }
 
   querySelector(selector: string): FakeNode | null {
@@ -207,6 +220,7 @@ interface DomApi {
   conversationFromPath(pathname: unknown): string | null;
   turns(): Array<{ node: FakeNode; nodes: FakeNode[]; id: string | null; role: string | null }>;
   messages(): Array<{ id: string; role: string; text: string; turnId: string | null }>;
+  userAttachmentPreviews(message: unknown): Promise<Array<{ id: string; name: string; size: number; mimeType: string; preview?: string }>>;
   progressLine(turn: unknown): string | null;
   interrupted(turn: unknown): boolean;
   markProgress(turn: unknown): number;
@@ -285,6 +299,11 @@ describe('ChatGPT DOM adapter', () => {
     expect(loadDom([], '/').conversationId()).toBeNull();
   });
 
+  it('exports the bounded visible user-attachment preview helper', () => {
+    const dom = loadDom([]);
+    expect(typeof dom.userAttachmentPreviews).toBe('function');
+  });
+
   it('groups split assistant sections that share one data-turn-id before counting tool blocks', () => {
     const user = turn('user', 'user-1');
     const a1 = turn('assistant', 'request-1').with(TOOL_SELECTOR, [toolBlock(), toolBlock()]);
@@ -311,6 +330,22 @@ describe('ChatGPT DOM adapter', () => {
     expect(dom.messages()).toMatchObject([
       { id: 'user-search-message', role: 'user', text: 'Ship the fix.', turnId: 'fallback-turn-7:0:user' },
       { id: 'assistant-search-message', role: 'assistant', text: 'Locked in.', turnId: 'fallback-turn-7:2:assistant' }
+    ]);
+  });
+
+  it('preserves visible paragraph and code boundaries in authored assistant Markdown', () => {
+    const assistant = searchUnit('assistant', 8, 'assistant-search-message', 'First paragraphSecond paragraphconst x = 1;');
+    const authored = assistant.querySelectorAll('[data-markdown-text-style="assistant-message"]')[0]!;
+    authored.innerText = 'First paragraph\n\nSecond paragraph\n\nconst x = 1;';
+    const dom = loadDom([assistant]);
+
+    expect(dom.messages()).toMatchObject([
+      {
+        id: 'assistant-search-message',
+        role: 'assistant',
+        text: 'First paragraph\n\nSecond paragraph\n\nconst x = 1;',
+        turnId: 'fallback-turn-8:2:assistant'
+      }
     ]);
   });
 
@@ -507,6 +542,7 @@ interface WorkerHarness {
   scriptingInsertCSS: ReturnType<typeof vi.fn>;
   alarmCreate: ReturnType<typeof vi.fn>;
   alarmClear: ReturnType<typeof vi.fn>;
+  runtimeReload: ReturnType<typeof vi.fn>;
 }
 
 function response(status: number, data: unknown) {
@@ -526,6 +562,7 @@ function response(status: number, data: unknown) {
 function loadWorker(options: {
   local: FakeStorageArea;
   session: FakeStorageArea;
+  manifestVersion?: string;
   fetch?: (input: string, init?: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
   tabsGet?: (tabId: number) => Promise<{ id?: number; url?: string; pendingUrl?: string; status?: string; autoDiscardable?: boolean }>;
   tabsQuery?: () => Promise<
@@ -557,10 +594,12 @@ function loadWorker(options: {
   const tabsSendMessage = vi.fn(options.tabsSendMessage ?? (async () => ({ ok: true })));
   const tabsRemove = vi.fn(async () => undefined);
   const tabsReload = vi.fn(async () => undefined);
-  const scriptingExecuteScript = vi.fn(async () => []);
+  const scriptingExecuteScript = vi.fn(async (details: Record<string, unknown>) =>
+    details && typeof details.func === 'function' ? [{ result: true }] : []);
   const scriptingInsertCSS = vi.fn(async () => undefined);
   const alarmCreate = vi.fn(() => undefined);
   const alarmClear = vi.fn(async () => true);
+  const runtimeReload = vi.fn(() => undefined);
   const windowsUpdate = vi.fn(async () => ({ id: 7 }));
   const documentNumbers = new Map<number, number>();
   const currentDocuments = new Map<number, string>();
@@ -576,7 +615,9 @@ function loadWorker(options: {
   const chrome = {
     storage: { local: options.local, session: options.session },
     runtime: {
-      getManifest: () => ({ version: '1.6.0' }),
+      getManifest: () => ({ version: options.manifestVersion ?? '1.6.0' }),
+      getURL: (file: string) => `chrome-extension://test/${file}`,
+      reload: runtimeReload,
       onMessage: {
         addListener(fn: typeof listener) {
           listener = fn;
@@ -657,6 +698,7 @@ function loadWorker(options: {
     scriptingInsertCSS,
     alarmCreate,
     alarmClear,
+    runtimeReload,
     async fireAlarm(name = 'clf-bridge-drain') {
       for (const fn of alarmListeners) fn({ name });
       for (let turn = 0; turn < 12; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -760,6 +802,194 @@ function loadWorker(options: {
   };
 }
 
+describe('packaged extension hot update', () => {
+  it('reloads once only after this extension root proves the packaged companion bytes are present', async () => {
+    const local = new FakeStorageArea({
+      port: 8765,
+      token: 'paired-token',
+      disconnected: false,
+      commandAckOutbox: [{ id: 'keep-ack' }],
+      deferredRevivals: [{
+        id: 'cmd-keep-revival',
+        conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        queuedAt: Date.now()
+      }]
+    });
+    const worker = loadWorker({
+      local,
+      session: new FakeStorageArea(),
+      fetch: async (input) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, {
+          app: 'chat-on-steroids',
+          paired: true,
+          version: '2.1.38',
+          companionReloadVersion: '2.1.38'
+        });
+        if (route === '/manifest.json') return response(200, { version: '2.1.38' });
+        return response(200, {});
+      }
+    });
+
+    const first = await worker.send({ type: 'status' });
+    const second = await worker.send({ type: 'status' });
+    expect(first.connected).toBe(false);
+    expect(second.connected).toBe(false);
+    expect(worker.runtimeReload).toHaveBeenCalledTimes(1);
+    expect(local.data.companionReloadFromVersion).toBe('1.6.0');
+    expect(local.data.token).toBe('paired-token');
+    expect(local.data.disconnected).toBe(false);
+    expect(local.data.commandAckOutbox).toEqual([{ id: 'keep-ack' }]);
+    expect(local.data.deferredRevivals).toEqual([{
+      id: 'cmd-keep-revival',
+      conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      queuedAt: expect.any(Number)
+    }]);
+  });
+
+  it('does not reload without packaged proof even when the app version differs', async () => {
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch: async (input) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true, version: '2.1.38' });
+        if (route === '/manifest.json') return response(200, { version: '2.1.38' });
+        return response(200, {});
+      }
+    });
+
+    const status = await worker.send({ type: 'status' });
+    expect(status.connected).toBe(true);
+    expect(worker.runtimeReload).not.toHaveBeenCalled();
+  });
+
+  it('does not reload when the loaded extension root does not contain the proven packaged version', async () => {
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch: async (input) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, {
+          app: 'chat-on-steroids',
+          paired: true,
+          version: '2.1.38',
+          companionReloadVersion: '2.1.38'
+        });
+        if (route === '/manifest.json') return response(200, { version: '1.6.0' });
+        return response(200, {});
+      }
+    });
+    const status = await worker.send({ type: 'status' });
+    expect(status.connected).toBe(true);
+    expect(worker.runtimeReload).not.toHaveBeenCalled();
+  });
+
+  it('fences by the loaded from-version across worker restart even if a peer rotates targets', async () => {
+    const local = new FakeStorageArea({
+      port: 8765,
+      token: 'paired-token',
+      companionReloadFromVersion: '1.6.0'
+    });
+    const worker = loadWorker({
+      local,
+      session: new FakeStorageArea(),
+      fetch: async (input) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, {
+          app: 'chat-on-steroids',
+          paired: true,
+          version: '2.1.99',
+          companionReloadVersion: '2.1.99'
+        });
+        if (route === '/manifest.json') return response(200, { version: '2.1.99' });
+        return response(200, {});
+      }
+    });
+    const status = await worker.send({ type: 'status' });
+    expect(status.connected).toBe(true);
+    expect(worker.runtimeReload).not.toHaveBeenCalled();
+    expect(local.data.companionReloadFromVersion).toBe('1.6.0');
+  });
+
+  it('claims the in-memory reload flight before awaits so overlapping hellos reload once', async () => {
+    let releaseManifest!: () => void;
+    const manifestGate = new Promise<void>((resolve) => { releaseManifest = resolve; });
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const worker = loadWorker({
+      local,
+      session: new FakeStorageArea(),
+      fetch: async (input) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, {
+          app: 'chat-on-steroids',
+          paired: true,
+          version: '2.1.38',
+          companionReloadVersion: '2.1.38'
+        });
+        if (route === '/manifest.json') {
+          await manifestGate;
+          return response(200, { version: '2.1.38' });
+        }
+        return response(200, {});
+      }
+    });
+    const first = worker.send({ type: 'status' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = worker.send({ type: 'status' });
+    releaseManifest();
+    await Promise.all([first, second]);
+    expect(worker.runtimeReload).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reload when app and extension already match', async () => {
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      manifestVersion: '2.1.38',
+      fetch: async (input) => {
+        const route = new URL(input).pathname;
+        if (route === '/hello') return response(200, {
+          app: 'chat-on-steroids',
+          paired: true,
+          version: '2.1.38',
+          companionReloadVersion: '2.1.38'
+        });
+        return response(200, {});
+      }
+    });
+    const status = await worker.send({ type: 'status' });
+    expect(status.connected).toBe(true);
+    expect(worker.runtimeReload).not.toHaveBeenCalled();
+  });
+
+  it('reinjects every current helper without navigating or reloading healthy tabs', async () => {
+    const tab = { id: 7, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', status: 'complete' };
+    const discarded = { id: 8, url: 'https://chatgpt.com/c/11111111-2222-4333-8444-555555555555', status: 'complete', discarded: true };
+    const worker = loadWorker({
+      local: new FakeStorageArea(),
+      session: new FakeStorageArea(),
+      manifestVersion: '2.1.38',
+      tabsQuery: async () => [tab, discarded],
+      tabsGet: async (id) => id === 7 ? tab : discarded,
+      tabsSendMessage: async () => { throw new Error('old isolated world was invalidated'); }
+    });
+
+    await vi.waitFor(() => expect(worker.scriptingExecuteScript).toHaveBeenCalledWith(
+      expect.objectContaining({ target: { tabId: 7 }, files: ['content.js'] })
+    ));
+    const files = worker.scriptingExecuteScript.mock.calls
+      .map(([details]) => details.files?.[0])
+      .filter(Boolean);
+    expect(files).toEqual(expect.arrayContaining(['chatgpt-dom.js', 'usage.js', 'fiber.js', 'content.js']));
+    expect(worker.scriptingInsertCSS).toHaveBeenCalledWith(
+      expect.objectContaining({ target: { tabId: 7 }, files: ['overlay.css'] })
+    );
+    expect(worker.scriptingExecuteScript.mock.calls.some(([details]) => details.target?.tabId === 8)).toBe(false);
+    expect(worker.tabsReload).not.toHaveBeenCalled();
+  });
+});
+
 function journalOf(session: FakeStorageArea): any[] {
   const value = session.data.journal;
   return Array.isArray(value) ? value : [];
@@ -858,8 +1088,14 @@ describe('accepted helper tab cleanup', () => {
       const other = '11111111-2222-4333-8444-555555555555';
       let url = `https://chatgpt.com/c/${helper}`;
       let pinned = outcome === 'pinned';
+      const inputId = 'ffffffff-1111-4222-8333-444444444444';
       const worker = loadWorker({
-        local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+        local: new FakeStorageArea({
+          port: 8765,
+          token: 'paired-token',
+          inputOpenings: { [inputId]: { tab: 1, stage: 'ready', conversationId: helper, openedByApp: true } }
+        }),
+        session: new FakeStorageArea(),
         tabsGet: async () => ({ id: 1, url, pinned }),
         tabsSendMessage: async (_id, message) => {
           if (message.type !== 'clf-tab-close-check') return { ok: true };
@@ -877,7 +1113,7 @@ describe('accepted helper tab cleanup', () => {
         }
       });
       await worker.registerTab(1);
-      const result = await worker.send({ type: 'desktop_input', id: 'ffffffff-1111-4222-8333-444444444444',
+      const result = await worker.send({ type: 'desktop_input', id: inputId,
         owner: '1:document-1-0:0', response: '{"action":"stop","reply":""}' });
       expect(result.ok).toBe(true);
       if (outcome === 'accepted') expect(worker.tabsRemove).toHaveBeenCalledExactlyOnceWith(1);
@@ -981,6 +1217,47 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     return { fetch, asked, actions, failedActions, arm: (id: string) => { outstanding = id; } };
   }
 
+  async function runUnattributedChecks(checks: Array<unknown>, changeTabAtLatest?: 'url' | 'document') {
+    let armed = false, handed = false;
+    let checkIndex = 0, claims = 0, repaired = 0, failed = 0;
+    let tabUrl = `https://chatgpt.com/c/${CHAT}`;
+    let worker: WorkerHarness;
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/repairs/claim') { claims++; return response(200, { allowed: true }); }
+      if (url.pathname === '/status') {
+        if (url.searchParams.has('repaired')) repaired++;
+        if (url.searchParams.has('repairFailed')) failed++;
+        if (armed && !handed) {
+          handed = true;
+          return response(200, { repairs: [{ conversationId: CHAT, token: 'responsive-page', reason: 'unattributed', requiresClaim: true }] });
+        }
+        return response(200, { repairs: [] });
+      }
+      return response(200, {});
+    });
+    worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+      tabsGet: async () => ({ id: 21, url: tabUrl }),
+      tabsSendMessage: async (_id, message) => {
+        if (message.type !== 'clf-repair-check') return { ok: true };
+        if (message.expected && changeTabAtLatest === 'url') tabUrl = `https://chatgpt.com/c/${OTHER}`;
+        if (message.expected && changeTabAtLatest === 'document') await worker.navigateTab(21, `https://chatgpt.com/c/${CHAT}`);
+        const reply = checks[Math.min(checkIndex, checks.length - 1)];
+        checkIndex++;
+        return reply;
+      }
+    });
+    await worker.registerTab(21);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+    await worker.fireAlarm();
+    const scriptsBeforeRepair = worker.scriptingExecuteScript.mock.calls.length;
+    armed = true;
+    await worker.fireAlarm();
+    return { worker, scriptsBeforeRepair, checkIndex, claims, repaired, failed };
+  }
+
   it('browser-only recovery waits for the missing chat and then reloads its exact existing tab', async () => {
     const { fetch, asked } = appWith(OTHER, true);
     const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
@@ -1049,8 +1326,11 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       });
       const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
         tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${navigated ? OTHER : CHAT}` }),
-        tabsSendMessage: async (_id, message) => message.type === 'clf-repair-check'
-          ? { safe: true, revision: 1, turnId: 'source', questionId: 'question' } : { ok: true },
+        tabsSendMessage: async (_id, message) => {
+          return message.type === 'clf-repair-check'
+            ? { safe: true, responsive: true, generating: false, conversationId: CHAT, pageEpoch: 0,
+              revision: 1, turnId: 'source', questionId: 'question' } : { ok: true };
+        },
         tabsQuery: async () => {
           if (handed) {
             trace.push('scan');
@@ -1061,12 +1341,21 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       await worker.registerTab(21);
       await worker.send({ type: 'bind', conversationId: CHAT }, 21);
       await worker.fireAlarm();
+      const scriptsBeforeRepair = worker.scriptingExecuteScript.mock.calls.length;
       armed = true;
       await worker.fireAlarm();
       expect(trace.indexOf('scan')).toBeGreaterThan(trace.indexOf('handout'));
       expect(trace.indexOf('claim')).toBeGreaterThan(trace.indexOf('scan'));
       if (mode === 'unresolved') {
-        expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+        if (reason === 'unattributed') {
+          // A responsive page gets observer/helper repair even if it is safe to reload.
+          expect(worker.tabsReload).not.toHaveBeenCalled();
+          expect(worker.scriptingExecuteScript.mock.calls.slice(scriptsBeforeRepair).map(([details]) => details.files).flat()).toEqual(
+            expect.arrayContaining(['usage.js', 'fiber.js'])
+          );
+        } else {
+          expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+        }
         expect(trace).toContain('repaired');
       } else {
         expect(worker.tabsReload).not.toHaveBeenCalled();
@@ -1075,6 +1364,171 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       expect(worker.tabsCreate).not.toHaveBeenCalled();
     }
   );
+
+  const responsiveGenerating = {
+    safe: false, responsive: true, generating: true, conversationId: CHAT, pageEpoch: 0,
+    revision: 4, turnId: 'live-turn', questionId: 'live-question'
+  };
+
+  it('vetoes two identity-free negative checks before helper injection or reload', async () => {
+    const result = await runUnattributedChecks([{ safe: false }, { safe: false }]);
+    expect(result.checkIndex).toBe(1);
+    expect(result.claims).toBe(0);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+  });
+
+  it('vetoes an identity-free exception-style negative response', async () => {
+    const result = await runUnattributedChecks([{ safe: false, error: 'inspection failed' }]);
+    expect(result.checkIndex).toBe(1);
+    expect(result.claims).toBe(0);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+  });
+
+  it.each(['stale/non-current', 'stopped'] as const)('vetoes an identity-free %s page reply', async _state => {
+    const result = await runUnattributedChecks([{ safe: false }]);
+    expect(result.claims).toBe(0);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+  });
+
+  it('vetoes a negative latest check even after a responsive first check', async () => {
+    const result = await runUnattributedChecks([responsiveGenerating, { safe: false }]);
+    expect(result.checkIndex).toBe(2);
+    expect(result.claims).toBe(1);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+    expect(result.failed).toBe(1);
+  });
+
+  it('does not treat responsive:false as permission for helper repair or reload', async () => {
+    const result = await runUnattributedChecks([{ ...responsiveGenerating, responsive: false }]);
+    expect(result.claims).toBe(0);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+  });
+
+  it.each(['revision', 'turnId', 'questionId'] as const)('rejects a latest-check %s mismatch', async field => {
+    const latest = { ...responsiveGenerating, [field]: field === 'revision' ? 5 : `changed-${field}` };
+    const result = await runUnattributedChecks([responsiveGenerating, latest]);
+    expect(result.checkIndex).toBe(2);
+    expect(result.claims).toBe(1);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+    expect(result.failed).toBe(1);
+  });
+
+  it('requires a non-negative safe integer revision', async () => {
+    for (const revision of [null, -1, 1.5]) {
+      const result = await runUnattributedChecks([{ ...responsiveGenerating, revision }]);
+      expect(result.claims).toBe(0);
+      expect(result.worker.tabsReload).not.toHaveBeenCalled();
+      expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+      expect(result.repaired).toBe(0);
+    }
+  });
+
+  it('accepts explicit nullable turn and question identities when both checks match', async () => {
+    const check = { ...responsiveGenerating, turnId: null, questionId: null };
+    const result = await runUnattributedChecks([check, check]);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair).map(([details]) => details.files).flat())
+      .toEqual(expect.arrayContaining(['usage.js', 'fiber.js']));
+    expect(result.repaired).toBe(1);
+  });
+
+  it('rejects a latest-check conversation identity mismatch', async () => {
+    const result = await runUnattributedChecks([responsiveGenerating, { ...responsiveGenerating, conversationId: OTHER }]);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+    expect(result.failed).toBe(1);
+  });
+
+  it.each(['url', 'document'] as const)('rejects a tab %s change before helper repair', async change => {
+    const result = await runUnattributedChecks([responsiveGenerating, responsiveGenerating], change);
+    expect(result.worker.tabsReload).not.toHaveBeenCalled();
+    expect(result.worker.scriptingExecuteScript.mock.calls.slice(result.scriptsBeforeRepair)).toEqual([]);
+    expect(result.repaired).toBe(0);
+    expect(result.failed).toBe(1);
+  });
+
+  it('repairs observers on a responsive generating page without reloading it', async () => {
+    let armed = false, handed = false;
+    const receipts: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/repairs/claim') return response(200, { allowed: true });
+      if (url.pathname === '/status') {
+        if (url.searchParams.has('repaired')) receipts.push(url.searchParams.get('repairAction') || '');
+        if (armed && !handed) {
+          handed = true;
+          return response(200, { repairs: [{ conversationId: CHAT, token: 'generating-attribution',
+            reason: 'unattributed', requiresClaim: true }] });
+        }
+        return response(200, { repairs: [] });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+      tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+      tabsSendMessage: async (_id, message) => message.type === 'clf-repair-check'
+        ? responsiveGenerating
+        : { ok: true }
+    });
+    await worker.registerTab(21);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+    await worker.fireAlarm();
+    const scriptsBeforeRepair = worker.scriptingExecuteScript.mock.calls.length;
+    armed = true; await worker.fireAlarm();
+
+    expect(worker.tabsReload).not.toHaveBeenCalled();
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(worker.scriptingExecuteScript.mock.calls.slice(scriptsBeforeRepair).map(([details]) => details.files).flat()).toEqual(
+      expect.arrayContaining(['usage.js', 'fiber.js'])
+    );
+    expect(receipts).toEqual(['repaired']);
+  });
+
+  it('keeps the existing unattributed reload authority when the bound page is unresponsive', async () => {
+    let armed = false, handed = false;
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/repairs/claim') return response(200, { allowed: true });
+      if (url.pathname === '/status') {
+        if (armed && !handed) {
+          handed = true;
+          return response(200, { repairs: [{ conversationId: CHAT, token: 'dead-attribution',
+            reason: 'unattributed', requiresClaim: true }] });
+        }
+        return response(200, { repairs: [] });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+      tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+      tabsSendMessage: async (_id, message) => message.type === 'clf-repair-check' ? null : { ok: true }
+    });
+    await worker.registerTab(21);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+    await worker.fireAlarm();
+    const scriptsBeforeRepair = worker.scriptingExecuteScript.mock.calls.length;
+    armed = true; await worker.fireAlarm();
+
+    expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+    expect(worker.scriptingExecuteScript.mock.calls).toHaveLength(scriptsBeforeRepair);
+  });
 
   /**
    * Two tabs of one chat used to end the repair: neither was reloaded and the duplicate stayed
@@ -2075,8 +2529,7 @@ describe('extension command delivery', () => {
   it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
-    const worker = loadWorker({ local, session });
-    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }, { id: 42 }]);
+    const worker = loadWorker({ local, session, tabsQuery: async () => [{ id: 41 }, { id: 42 }] });
 
     await worker.installed('update');
 
@@ -2085,10 +2538,16 @@ describe('extension command delivery', () => {
     });
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
       [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['usage.js'] }],
+      [expect.objectContaining({ target: { tabId: 41 }, world: 'MAIN', func: expect.any(Function) })],
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
+      [expect.objectContaining({ target: { tabId: 41 }, world: 'MAIN', func: expect.any(Function) })],
       [{ target: { tabId: 41 }, files: ['content.js'] }],
       [{ target: { tabId: 42 }, files: ['chatgpt-dom.js'] }],
+      [{ target: { tabId: 42 }, world: 'MAIN', files: ['usage.js'] }],
+      [expect.objectContaining({ target: { tabId: 42 }, world: 'MAIN', func: expect.any(Function) })],
       [{ target: { tabId: 42 }, world: 'MAIN', files: ['fiber.js'] }],
+      [expect.objectContaining({ target: { tabId: 42 }, world: 'MAIN', func: expect.any(Function) })],
       [{ target: { tabId: 42 }, files: ['content.js'] }]
     ]);
     expect(worker.scriptingInsertCSS.mock.calls).toEqual([
@@ -2113,7 +2572,7 @@ describe('extension command delivery', () => {
       const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
         tabsQuery: async () => [tab],
         tabsGet: async () => scenario === 'navigated' ? { id: 41, url: 'https://example.com/' } : tab });
-      if (scenario === 'healthy') worker.tabsSendMessage.mockResolvedValue({ ok: true, recorderVersion: 13 });
+      if (scenario === 'healthy') worker.tabsSendMessage.mockResolvedValue({ ok: true, recorderVersion: 14 });
       // Startup restoration is a separate path; exercise the later maintenance pass.
       await worker.installed('update');
       worker.scriptingExecuteScript.mockClear();
@@ -2164,15 +2623,21 @@ describe('extension command delivery', () => {
   it('keeps a live recorder but revalidates the idempotent MAIN-world Fiber helper', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
-    const worker = loadWorker({ local, session });
-    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 13 });
+    const worker = loadWorker({
+      local,
+      session,
+      tabsQuery: async () => [{ id: 41 }],
+      tabsSendMessage: async () => ({ ok: true, recorderVersion: 14 })
+    });
 
     await worker.installed('update');
 
     expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-recorder-ping' }, undefined);
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
-      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['usage.js'] }],
+      [expect.objectContaining({ target: { tabId: 41 }, world: 'MAIN', func: expect.any(Function) })],
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
+      [expect.objectContaining({ target: { tabId: 41 }, world: 'MAIN', func: expect.any(Function) })]
     ]);
     expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
   });
@@ -2188,11 +2653,68 @@ describe('extension command delivery', () => {
     expect(worker.scriptingExecuteScript).toHaveBeenCalledWith({
       target: { tabId: 73, documentIds: ['document-73-0'] },
       world: 'MAIN',
+      files: ['usage.js']
+    });
+    expect(worker.scriptingExecuteScript).toHaveBeenCalledWith(expect.objectContaining({
+      target: { tabId: 73, documentIds: ['document-73-0'] },
+      world: 'MAIN',
+      func: expect.any(Function)
+    }));
+    expect(worker.scriptingExecuteScript).toHaveBeenCalledWith({
+      target: { tabId: 73, documentIds: ['document-73-0'] },
+      world: 'MAIN',
       files: ['fiber.js']
     });
+    expect(worker.scriptingExecuteScript).toHaveBeenCalledWith(expect.objectContaining({
+      target: { tabId: 73, documentIds: ['document-73-0'] },
+      world: 'MAIN',
+      func: expect.any(Function)
+    }));
 
     await worker.navigateTab(73, 'https://example.com/left');
     expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false, error: 'tab_closed' });
+  });
+
+  it('reports usage observer attachment failure while still attempting Fiber repair', async () => {
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea() });
+    worker.scriptingExecuteScript.mockImplementation(async (details: Record<string, unknown>) => {
+      if (typeof details.func !== 'function') return [];
+      return [{ result: !String(details.func).includes('__cosUsageObserverState') }];
+    });
+
+    const repaired = await worker.send({ type: 'repair_fiber' }, 73);
+
+    expect(repaired).toEqual({ ok: false, error: 'usage_repair_failed', usageObserverOk: false, fiberOk: true });
+    expect(worker.scriptingExecuteScript).toHaveBeenCalledWith(expect.objectContaining({
+      target: { tabId: 73, documentIds: ['document-73-0'] }, world: 'MAIN', files: ['fiber.js']
+    }));
+  });
+
+  it.each([
+    [4, true, false],
+    [6, true, false],
+    [7, true, true],
+    [7, false, false]
+  ])('treats usage observer version %i with reattach=%s as attached: %s', async (version, reattach, attached) => {
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea() });
+    worker.scriptingExecuteScript.mockImplementation(async (details: Record<string, unknown>) => {
+      if (typeof details.func !== 'function') return [];
+      // The injected checker reads the page's `window`; evaluate its real source in a
+      // context where that global exists, exactly as the MAIN world provides it.
+      const check = vm.runInNewContext(`(${String(details.func)})`, {
+        window: {
+          __cosUsageObserverState: { version, reattach: () => reattach },
+          __clfFiberHelper: { version: 16, listener: () => undefined }
+        }
+      });
+      return [{ result: check() }];
+    });
+
+    const repaired = await worker.send({ type: 'repair_fiber' }, 73);
+
+    expect(repaired).toMatchObject(attached
+      ? { ok: true, usageObserverOk: true, fiberOk: true }
+      : { ok: false, error: 'usage_repair_failed', usageObserverOk: false, fiberOk: true });
   });
 
   it('has no way to ask the app for work at all', async () => {
@@ -2297,7 +2819,7 @@ describe('extension revival delivery', () => {
 
   const liveRecorder = async (_tabId: number, message: Record<string, unknown>) =>
     message.type === 'clf-recorder-ping'
-      ? { ok: true, recorderVersion: 13 }
+      ? { ok: true, recorderVersion: 14 }
       : { ok: true, claimed: true };
 
   it('scans before opening and routes to the oldest exact worker tab', async () => {
@@ -4021,6 +4543,187 @@ describe('extension connection', () => {
         requestId: 'f0f00009-1111-4111-8111-111111111111' }]
     })).resolves.toMatchObject({ ok: false, error: 'stale_document' });
     expect(requested).not.toContain('/correlations');
+  });
+
+  it('forwards direct-A SSE candidates with the exact sender document and never grants ownership itself', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_direct_forward_01';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/correlations') {
+        body = JSON.parse(String(init.body));
+        return response(200, {
+          ok: true,
+          conversationId,
+          sessionId: '2026-09-25-direct',
+          requestIds: [requestId],
+          confirmed: [],
+          conflicts: [],
+          directPending: [requestId],
+          directRejected: [],
+          complete: false
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${conversationId}` })
+    });
+
+    const reply = await worker.send({
+      type: 'correlate',
+      conversationId,
+      calls: [],
+      direct: [{ requestId, observedAt: 1_700_000_000_000 }],
+      navigationEpoch: 0
+    });
+
+    expect(body).toMatchObject({
+      conversationId,
+      calls: [],
+      direct: [{ requestId, observedAt: 1_700_000_000_000 }],
+      document: { tab: 1, documentId: 'document-1-0', navigationEpoch: 0 }
+    });
+    expect(reply).toMatchObject({
+      ok: true,
+      status: 200,
+      data: { conversationId, confirmed: [], directPending: [requestId] }
+    });
+
+    // A correlate message that names no evidence at all is still refused before transport.
+    const requested: string[] = [];
+    const empty = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch: vi.fn(async (input: string) => {
+        requested.push(new URL(input).pathname);
+        return response(200, { app: 'chat-on-steroids', paired: true });
+      }),
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${conversationId}` })
+    });
+    await expect(empty.send({ type: 'correlate', conversationId, calls: [] }))
+      .resolves.toMatchObject({ ok: false, error: 'bad_request_evidence' });
+    expect(requested).not.toContain('/correlations');
+  });
+
+  it('commits a prepared direct-A owner only after revalidating the same browser document', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_direct_commit_01';
+    const requested: string[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const pathname = new URL(input).pathname;
+      requested.push(pathname);
+      if (pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (pathname === '/correlations') return response(200, {
+        ok: true, conversationId, sessionId: '2026-09-25-direct', requestIds: [requestId], confirmed: [], conflicts: [],
+        directCommitToken: 'prepared-direct-token-1234', directPrepared: [requestId], directPending: [], directRejected: [], complete: false
+      });
+      if (pathname === '/correlations/direct/commit') {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          conversationId,
+          token: 'prepared-direct-token-1234',
+          document: { tab: 1, documentId: 'document-1-0', navigationEpoch: 0 }
+        });
+        return response(200, {
+          ok: true, conversationId, sessionId: '2026-09-25-direct', requestIds: [requestId], confirmed: [requestId],
+          conflicts: [], directPending: [], directRejected: [], complete: true
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(), fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${conversationId}` })
+    });
+    const reply = await worker.send({
+      type: 'correlate', conversationId, calls: [],
+      direct: [{ requestId, observedAt: 1_700_000_000_000 }], navigationEpoch: 0
+    });
+    expect(requested).toContain('/correlations/direct/commit');
+    expect(reply).toMatchObject({ ok: true, data: { conversationId, confirmed: [requestId], complete: true } });
+  });
+
+  it('does not redeem a prepared direct-A token after the real tab changes conversation', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const otherConversationId = '11111111-2222-4333-8444-555555555555';
+    const requestId = 'wfr_direct_navigation_race';
+    const requested: string[] = [];
+    let changed = false;
+    const fetch = vi.fn(async (input: string) => {
+      const pathname = new URL(input).pathname;
+      requested.push(pathname);
+      if (pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (pathname === '/correlations') {
+        changed = true;
+        return response(200, {
+          ok: true, conversationId, sessionId: '2026-09-25-direct', requestIds: [requestId], confirmed: [], conflicts: [],
+          directCommitToken: 'prepared-direct-token-race', directPrepared: [requestId], directPending: [], directRejected: [], complete: false
+        });
+      }
+      if (pathname === '/correlations/direct/commit') throw new Error('stale document must never commit');
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(), fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${changed ? otherConversationId : conversationId}` })
+    });
+    const reply = await worker.send({
+      type: 'correlate', conversationId, calls: [],
+      direct: [{ requestId, observedAt: 1_700_000_000_000 }], navigationEpoch: 0
+    });
+    expect(reply).toMatchObject({ ok: false, error: 'stale_document' });
+    expect(requested).toContain('/correlations');
+    expect(requested).not.toContain('/correlations/direct/commit');
+  });
+
+  it('treats navigation after the final browser check as later history, not a different request owner', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const otherConversationId = '11111111-2222-4333-8444-555555555555';
+    const requestId = 'wfr_direct_post_check_navigation';
+    const requested: string[] = [];
+    let currentConversation = conversationId;
+    let commitStarted = false;
+    const fetch = vi.fn(async (input: string) => {
+      const pathname = new URL(input).pathname;
+      requested.push(pathname);
+      if (pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (pathname === '/correlations') return response(200, {
+        ok: true, conversationId, sessionId: '2026-09-25-direct', requestIds: [requestId], confirmed: [], conflicts: [],
+        directCommitToken: 'prepared-direct-token-post-check', directPrepared: [requestId], directPending: [], directRejected: [], complete: false
+      });
+      if (pathname === '/correlations/direct/commit') {
+        // Model the exact reviewer interval: chrome.tabs.get() just authorized chat A, then
+        // navigation starts while the app is processing the commit. That later navigation does
+        // not retroactively change the historical owner of A's already-proved request. The
+        // worker's post-call check still refuses to hand the result back to the departed page.
+        commitStarted = true;
+        currentConversation = otherConversationId;
+        return response(200, {
+          ok: true, conversationId, sessionId: '2026-09-25-direct', requestIds: [requestId], confirmed: [requestId],
+          conflicts: [], directPending: [], directRejected: [], complete: true
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(), fetch,
+      tabsGet: async (id) => ({ id, url: `https://chatgpt.com/c/${currentConversation}` })
+    });
+    const reply = await worker.send({
+      type: 'correlate', conversationId, calls: [],
+      direct: [{ requestId, observedAt: 1_700_000_000_000 }], navigationEpoch: 0
+    });
+    expect(commitStarted).toBe(true);
+    expect(requested).toContain('/correlations/direct/commit');
+    expect(reply).toMatchObject({ ok: false, error: 'stale_document' });
   });
 
   it('does not re-ask where the app is before every single request', async () => {

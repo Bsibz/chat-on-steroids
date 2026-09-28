@@ -25,6 +25,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { app } from 'electron';
+import { APP_VERSION } from './version.js';
 
 const MATERIALIZED_FINGERPRINT = '.chat-on-steroids-source';
 
@@ -182,4 +183,24 @@ export function extensionDir(): string | null {
     if (existsSync(path.join(candidate, 'manifest.json'))) return candidate;
   }
   return null;
+}
+
+/**
+ * Version of the exact stable unpacked companion this packaged app has safely materialized.
+ *
+ * This is intentionally narrower than extensionDir(): an older last-known-good copy remains a
+ * valid manual recovery path when a package refresh fails, but it must never authorize the old
+ * browser worker to reload itself expecting new bytes. The materialization fingerprint proves a
+ * complete promotion occurred; the manifest must then agree with this exact app build.
+ */
+export function packagedExtensionReloadVersion(): string | null {
+  if (!app || app.isPackaged !== true) return null;
+  const stable = path.join(app.getPath('userData'), 'extension');
+  try {
+    if (!validExtension(stable) || materializedFingerprint(stable) === null) return null;
+    const manifest = JSON.parse(readFileSync(path.join(stable, 'manifest.json'), 'utf8')) as { version?: unknown };
+    return manifest.version === APP_VERSION ? APP_VERSION : null;
+  } catch {
+    return null;
+  }
 }

@@ -14,6 +14,13 @@ import { WebSocket } from 'ws';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
+import { REQUEST_ORIGIN_DIAGNOSTIC_TTL_MS, rememberInboundRequestOrigin, requestOriginDigest } from '../src/main/request-origin-diagnostic.js';
+import {
+  REQUEST_ORIGIN_TTL_MS,
+  authorizeDirectOriginOffer,
+  rememberInboundRequestId,
+  resetRequestOriginStateForTests
+} from '../src/main/request-origin.js';
 import { userPromptText } from '../src/shared/user-prompt.js';
 import { currentCoreInstructions } from '../src/main/mcp/instructions.js';
 import { browserControl } from '../src/main/browser-control.js';
@@ -155,6 +162,7 @@ const {
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF, faultGate } = await import('./helpers.js');
 const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
 const { getLog } = await import('../src/main/logger.js');
+const { requestCorrelation } = await import('../src/main/session/correlation.js');
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 /** The chat that spawns the swarm in these tests: only a proven conversation can. */
@@ -207,6 +215,10 @@ async function compactedSession(from: string, brief: string): Promise<{ sessionI
  * reach the state this file's claim test is about.
  */
 async function automaticCompactedSession(from: string, brief: string): Promise<{ sessionId: string; token: string }> {
+  const config = getConfig();
+  if (!config.compaction.auto) {
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true } });
+  }
   const reply = await request('POST', '/events', {
     body: {
       conversationId: from,
@@ -483,6 +495,140 @@ describe('who is allowed to talk to it', () => {
     expect(await companionDiagnostics()).toBeNull();
   });
 
+  it('logs bounded request-shape structure and keeps exact correlation untouched', async () => {
+    await pair();
+    const secret = randomUUID();
+    const shape = {
+      transport: 'socket', endpoint: 'socket',
+      envelope: ['message', 'conversation-turn-stream', 'stream-item'],
+      requestPaths: ['message.metadata.request_id'], requestStyle: 'snake',
+      conversationPaths: ['payload.conversation_id'], conversationValid: true, conversationConsistent: true,
+      conversationMatch: true, author: 'assistant', scope: 'message', occurrences: 3,
+      // Unknown extras are never forwarded, logged or treated as evidence.
+      requestId: secret, conversationId: secret, metadata: { request_id: secret }, content: secret
+    };
+    const body = {
+      capturedAt: Date.now(),
+      status: { connected: true, paired: true },
+      preferences: { overwrite: true, durations: false },
+      tab: { tab: 17, page: { requestShapes: [shape, { transport: 'carrier-pigeon' }, 'shape', 7,
+        { ...shape, requestPaths: ['<script>alert(1)</script>'] }, { ...shape, envelope: ['<script>'] }] } }
+    };
+    const pending = companionDiagnostics();
+    expect((await request('POST', '/diagnostics', { body })).status).toBe(200);
+    const snapshot = await pending;
+    expect(snapshot?.tab?.page?.requestShapes).toEqual([{
+      transport: 'socket', endpoint: 'socket',
+      envelope: ['message', 'conversation-turn-stream', 'stream-item'],
+      requestPaths: ['message.metadata.request_id'], requestStyle: 'snake',
+      conversationPaths: ['payload.conversation_id'], conversationValid: true, conversationConsistent: true,
+      conversationMatch: true, author: 'assistant', scope: 'message', occurrences: 3
+    }]);
+    const lines = getLog().filter(entry => entry.message.startsWith('request-origin diagnostic:'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.message).toBe('request-origin diagnostic: transport=socket endpoint=socket ' +
+      'envelope=message>conversation-turn-stream>stream-item request_path=message.metadata.request_id ' +
+      'request_style=snake conversation_path=payload.conversation_id conversation_valid=true ' +
+      'conversation_consistent=true conversation_match=true author=assistant scope=message occurrences=3 ' +
+      'inbound_match=unknown');
+    expect(JSON.stringify(snapshot)).not.toContain(secret);
+    expect(JSON.stringify(getLog())).not.toContain(secret);
+    // An identical shape does not repeat its line, and a request id smuggled through
+    // diagnostic extras never becomes correlation evidence.
+    const again = companionDiagnostics();
+    expect((await request('POST', '/diagnostics', { body })).status).toBe(200);
+    await again;
+    expect(getLog().filter(entry => entry.message.startsWith('request-origin diagnostic:'))).toHaveLength(1);
+    expect(requestCorrelation(secret)).toBeNull();
+  });
+
+  it('reports exact inbound digest matches per request path and discards the digest', async () => {
+    await pair();
+    const inboundId = `wfr_${randomUUID().replace(/-/g, '')}`;
+    const unmatchedId = `wfr_${randomUUID().replace(/-/g, '')}`;
+    rememberInboundRequestOrigin(inboundId);
+    const matching = requestOriginDigest(inboundId);
+    const unmatched = requestOriginDigest(unmatchedId);
+    const shape = (requestPaths: string[], fingerprints?: Array<{ path: string; digest: string }>) => ({
+      transport: 'sse', endpoint: 'conversation', envelope: ['root'], requestPaths, requestStyle: 'snake',
+      conversationPaths: ['conversation_id'], conversationValid: true, conversationConsistent: true,
+      conversationMatch: true, author: 'user', scope: 'input_message', occurrences: 1,
+      ...(fingerprints === undefined ? {} : { fingerprints })
+    });
+    const body = {
+      capturedAt: Date.now(),
+      status: { connected: true, paired: true },
+      preferences: { overwrite: true, durations: false },
+      tab: { tab: 17, page: { requestShapes: [
+        // The two live paths are separate shapes and stay separate conclusions.
+        shape(['input_message.metadata.request_id'], [{ path: 'input_message.metadata.request_id', digest: matching }]),
+        shape(['v.message.metadata.request_id'], [{ path: 'v.message.metadata.request_id', digest: unmatched }]),
+        shape(['input_message.metadata.request_id', 'v.message.metadata.request_id'],
+          [{ path: 'input_message.metadata.request_id', digest: unmatched }, { path: 'v.message.metadata.request_id', digest: matching }]),
+        shape(['message.metadata.request_id'], []),
+        // A malformed fingerprint rejects the shape rather than forwarding anything.
+        shape(['message.metadata.request_id'], [{ path: 'message.metadata.request_id', digest: 'not-a-digest' }])
+      ] } }
+    };
+    const pending = companionDiagnostics();
+    expect((await request('POST', '/diagnostics', { body })).status).toBe(200);
+    const snapshot = await pending;
+    const shapes = snapshot?.tab?.page?.requestShapes ?? [];
+    expect(shapes).toHaveLength(4);
+    expect(shapes[0]).toMatchObject({ requestPaths: ['input_message.metadata.request_id'], inboundMatch: true,
+      matchedRequestPaths: ['input_message.metadata.request_id'] });
+    expect(shapes[1]).toMatchObject({ requestPaths: ['v.message.metadata.request_id'], inboundMatch: false, matchedRequestPaths: [] });
+    expect(shapes[2]).toMatchObject({ inboundMatch: true, matchedRequestPaths: ['v.message.metadata.request_id'] });
+    expect(shapes[3]).toMatchObject({ inboundMatch: null, matchedRequestPaths: [] });
+    expect(typeof shapes[0]?.inboundMatchAgeMs).toBe('number');
+    expect(shapes[0]?.inboundMatchAgeMs).toBeLessThan(REQUEST_ORIGIN_DIAGNOSTIC_TTL_MS);
+    expect((shapes[0]?.inboundMatchAgeMs ?? 0) % 1000).toBe(0);
+    const lines = getLog().filter(entry => entry.message.startsWith('request-origin diagnostic:'));
+    expect(lines.some(entry => entry.message.includes('inbound_match=true') &&
+      entry.message.includes('matched_request_path=input_message.metadata.request_id'))).toBe(true);
+    expect(lines.some(entry => entry.message.includes('inbound_match=true') &&
+      entry.message.includes('matched_request_path=v.message.metadata.request_id'))).toBe(true);
+    expect(lines.some(entry => entry.message.includes('inbound_match=false'))).toBe(true);
+    expect(lines.some(entry => entry.message.includes('inbound_match=unknown'))).toBe(true);
+    // Neither the raw id nor any digest is stored, rendered or logged.
+    expect(JSON.stringify(snapshot)).not.toContain(matching);
+    expect(JSON.stringify(snapshot)).not.toContain(unmatched);
+    expect(JSON.stringify(snapshot)).not.toContain(inboundId);
+    expect(JSON.stringify(getLog())).not.toContain(matching);
+    expect(JSON.stringify(getLog())).not.toContain(unmatched);
+    expect(JSON.stringify(getLog())).not.toContain(inboundId);
+    // A matched diagnostic still creates no correlation entry and no ownership.
+    expect(requestCorrelation(inboundId)).toBeNull();
+    expect(requestCorrelation(unmatchedId)).toBeNull();
+  });
+
+  it('does not match a digest older than the diagnostic TTL', async () => {
+    await pair();
+    const staleId = `wfr_${randomUUID().replace(/-/g, '')}`;
+    rememberInboundRequestOrigin(staleId, Date.now() - REQUEST_ORIGIN_DIAGNOSTIC_TTL_MS - 1);
+    const stale = requestOriginDigest(staleId);
+    const body = {
+      capturedAt: Date.now(),
+      status: { connected: true, paired: true },
+      preferences: { overwrite: true, durations: false },
+      tab: { tab: 17, page: { requestShapes: [{
+        transport: 'sse', endpoint: 'conversation', envelope: ['root'],
+        requestPaths: ['input_message.metadata.request_id'], requestStyle: 'snake',
+        conversationPaths: ['conversation_id'], conversationValid: true, conversationConsistent: true,
+        conversationMatch: true, author: 'user', scope: 'input_message', occurrences: 1,
+        fingerprints: [{ path: 'input_message.metadata.request_id', digest: stale }]
+      }] } }
+    };
+    const pending = companionDiagnostics();
+    expect((await request('POST', '/diagnostics', { body })).status).toBe(200);
+    const snapshot = await pending;
+    expect(snapshot?.tab?.page?.requestShapes?.[0]).toMatchObject({ inboundMatch: false, matchedRequestPaths: [] });
+    expect(getLog().some(entry => entry.message.startsWith('request-origin diagnostic:') &&
+      entry.message.includes('inbound_match=false'))).toBe(true);
+    expect(JSON.stringify(getLog())).not.toContain(stale);
+    expect(requestCorrelation(staleId)).toBeNull();
+  });
+
   it('pushes newly detected incompatible extension versions without granting browser presence', async () => {
     const changed = vi.fn();
     const unsubscribe = onBridgeChange(changed);
@@ -522,7 +668,16 @@ describe('who is allowed to talk to it', () => {
     expect(reply.body.bridge).toBe(BRIDGE_PROTOCOL);
     expect(reply.body.paired).toBe(false);
     // Identification must not double as a status leak.
-    expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'compatible', 'paired', 'disconnected']);
+    expect(Object.keys(reply.body)).toEqual([
+      'app',
+      'version',
+      'companionReloadVersion',
+      'bridge',
+      'compatible',
+      'paired',
+      'disconnected'
+    ]);
+    expect(reply.body.companionReloadVersion).toBeNull();
     expect(reply.body.disconnected).toBe(false);
     expect(reply.body.compatible).toBe(true);
   });
@@ -552,6 +707,247 @@ describe('who is allowed to talk to it', () => {
   it('refuses a preflight that arrives without an Origin', async () => {
     const reply = await request('OPTIONS', '/events', { origin: null, auth: null });
     expect(reply.status).toBe(403);
+  });
+});
+
+// -------------------------------------------------------------- direct-A SSE ownership
+
+describe('direct-A SSE request ownership', () => {
+  const DOCUMENT = { tab: 17, documentId: 'document-17-0', navigationEpoch: 3 };
+  const freshId = (prefix: string) => `wfr_${prefix}_${randomUUID().replace(/-/g, '')}`;
+
+  function directBody(conversationId: string, requestId: string, observedAt = Date.now(), document = DOCUMENT) {
+    return { conversationId, calls: [], direct: [{ requestId, observedAt }], document };
+  }
+
+  async function commitPrepared(reply: any, conversationId: string, document = DOCUMENT) {
+    const token = reply.body.directCommitToken;
+    expect(token).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+    return request('POST', '/correlations/direct/commit', {
+      body: { conversationId, token, document }
+    });
+  }
+
+  it('records durable ownership only after exact inbound equality, for either arrival order', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const sseFirst = freshId('sse_first');
+    // SSE observation first: matching evidence exists, but no ownership and no direct trace.
+    const pending = await request('POST', '/correlations', { body: directBody(conversationId, sseFirst) });
+    expect(pending.status).toBe(200);
+    expect(pending.body.confirmed).toEqual([]);
+    expect(pending.body.directPending).toEqual([sseFirst]);
+    expect(pending.body.directRejected).toEqual([]);
+    expect(requestCorrelation(sseFirst)).toBeNull();
+    // The real normalized inbound MCP id arrives; the next offer pairs and records it.
+    rememberInboundRequestId(sseFirst);
+    const paired = await request('POST', '/correlations', { body: directBody(conversationId, sseFirst) });
+    expect(paired.body.confirmed).toEqual([]);
+    expect(paired.body.directPrepared).toEqual([sseFirst]);
+    expect(paired.body.directPending).toEqual([]);
+    expect(paired.body.directRejected).toEqual([]);
+    expect(requestCorrelation(sseFirst)).toBeNull();
+    const committed = await commitPrepared(paired, conversationId);
+    expect(committed.body.confirmed).toEqual([sseFirst]);
+    expect(requestCorrelation(sseFirst)?.conversationId).toBe(conversationId);
+
+    // Inbound first: the very first offer is already exact.
+    const inboundFirst = freshId('inbound_first');
+    rememberInboundRequestId(inboundFirst);
+    const immediate = await request('POST', '/correlations', { body: directBody(conversationId, inboundFirst) });
+    expect(immediate.body.confirmed).toEqual([]);
+    expect(immediate.body.directPrepared).toEqual([inboundFirst]);
+    expect(requestCorrelation(inboundFirst)).toBeNull();
+    const immediateCommit = await commitPrepared(immediate, conversationId);
+    expect(immediateCommit.body.confirmed).toEqual([inboundFirst]);
+    expect(requestCorrelation(inboundFirst)?.conversationId).toBe(conversationId);
+  });
+
+  it('matches concurrent distinct ids only to their own exact inbound evidence', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const left = freshId('left');
+    const right = freshId('right');
+    rememberInboundRequestId(left);
+    const body = {
+      conversationId,
+      calls: [],
+      direct: [{ requestId: left, observedAt: Date.now() }, { requestId: right, observedAt: Date.now() }],
+      document: DOCUMENT
+    };
+    const reply = await request('POST', '/correlations', { body });
+    expect(reply.body.confirmed).toEqual([]);
+    expect(reply.body.directPrepared).toEqual([left]);
+    expect(reply.body.directPending).toEqual([right]);
+    expect(requestCorrelation(left)).toBeNull();
+    const committed = await commitPrepared(reply, conversationId);
+    expect(committed.body.confirmed).toEqual([left]);
+    expect(requestCorrelation(left)?.conversationId).toBe(conversationId);
+    expect(requestCorrelation(right)).toBeNull();
+  });
+
+  it('keeps a successful proof after every process-local observation expires', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('durable');
+    rememberInboundRequestId(requestId);
+    const first = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(first.body.confirmed).toEqual([]);
+    const committed = await commitPrepared(first, conversationId);
+    expect(committed.body.confirmed).toEqual([requestId]);
+    // Simulate both five-minute registries losing everything. The durable correlation is a
+    // different owner with no TTL: the exact conversation still reads back.
+    resetRequestOriginStateForTests();
+    const readBack = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(readBack.body.confirmed).toEqual([requestId]);
+    expect(readBack.body.directPending).toEqual([]);
+    expect(requestCorrelation(requestId)?.conversationId).toBe(conversationId);
+  });
+
+  it('never records a prepared direct-A owner without the exact one-shot commit document', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('commit_fence');
+    rememberInboundRequestId(requestId);
+    const prepared = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(prepared.body.directPrepared).toEqual([requestId]);
+    expect(requestCorrelation(requestId)).toBeNull();
+
+    const wrongDocument = { ...DOCUMENT, navigationEpoch: DOCUMENT.navigationEpoch + 1 };
+    const refused = await request('POST', '/correlations/direct/commit', {
+      body: { conversationId, token: prepared.body.directCommitToken, document: wrongDocument }
+    });
+    expect(refused.status).toBe(409);
+    expect(requestCorrelation(requestId)).toBeNull();
+
+    // The token is one-shot even when the document proof is wrong; a fresh prepare is required.
+    const replay = await request('POST', '/correlations/direct/commit', {
+      body: { conversationId, token: prepared.body.directCommitToken, document: DOCUMENT }
+    });
+    expect(replay.status).toBe(409);
+    expect(requestCorrelation(requestId)).toBeNull();
+  });
+
+  it('rejects a stale direct-A candidate and never revives it with a later inbound id', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('stale');
+    const longAgo = Date.now() - REQUEST_ORIGIN_TTL_MS - 60_000;
+    expect(authorizeDirectOriginOffer({
+      requestId, conversationId, observedAt: longAgo, document: DOCUMENT
+    }, longAgo)).toBe('awaiting_inbound');
+    rememberInboundRequestId(requestId);
+    const reply = await request('POST', '/correlations', { body: directBody(conversationId, requestId, longAgo) });
+    expect(reply.body.confirmed).toEqual([]);
+    expect(reply.body.directPending).toEqual([]);
+    expect(reply.body.directRejected).toEqual([requestId]);
+    expect(requestCorrelation(requestId)).toBeNull();
+  });
+
+  it('refuses a candidate rebound to another document or navigation epoch', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('document');
+    const first = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(first.body.directPending).toEqual([requestId]);
+    rememberInboundRequestId(requestId);
+    const otherDocument = { tab: 17, documentId: 'document-17-9', navigationEpoch: 4 };
+    const rebound = await request('POST', '/correlations', { body: directBody(conversationId, requestId, Date.now(), otherDocument) });
+    expect(rebound.body.confirmed).toEqual([]);
+    expect(rebound.body.directRejected).toEqual([requestId]);
+    expect(requestCorrelation(requestId)).toBeNull();
+  });
+
+  it('refuses a direct-A claim already durably owned by another conversation', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const ownerConversation = randomUUID();
+    const claimantConversation = randomUUID();
+    const requestId = freshId('elsewhere');
+    const seeded = await request('POST', '/correlations', {
+      body: { conversationId: ownerConversation, calls: [{ messageId: 'owner-message', tool: 'read', order: 0, answered: false, requestId }] }
+    });
+    expect(seeded.body.confirmed).toEqual([requestId]);
+    rememberInboundRequestId(requestId);
+    const reply = await request('POST', '/correlations', { body: directBody(claimantConversation, requestId) });
+    expect(reply.body.confirmed).toEqual([]);
+    expect(reply.body.directRejected).toEqual([requestId]);
+    expect(requestCorrelation(requestId)?.conversationId).toBe(ownerConversation);
+  });
+
+  it('refuses malformed, duplicate and document-less direct-A evidence', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('malformed');
+    const missingDocument = { conversationId, calls: [], direct: [{ requestId, observedAt: Date.now() }] };
+    expect((await request('POST', '/correlations', { body: missingDocument })).body.error).toBe('bad_direct_document');
+    const duplicated = { conversationId, calls: [], direct: [{ requestId, observedAt: Date.now() }, { requestId, observedAt: Date.now() }], document: DOCUMENT };
+    expect((await request('POST', '/correlations', { body: duplicated })).body.error).toBe('duplicate_direct_evidence');
+    const malformed = { conversationId, calls: [], direct: [{ requestId: 'has spaces', observedAt: Date.now() }], document: DOCUMENT };
+    expect((await request('POST', '/correlations', { body: malformed })).body.error).toBe('bad_direct_evidence');
+    const oversized = {
+      conversationId, calls: [], document: DOCUMENT,
+      direct: Array.from({ length: 17 }, (_, index) => ({ requestId: `wfr_${index}`, observedAt: Date.now() }))
+    };
+    expect((await request('POST', '/correlations', { body: oversized })).body.error).toBe('bad_direct_evidence');
+    // None of the refused bodies created a candidate or ownership.
+    const clean = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(clean.body.directPending).toEqual([requestId]);
+    expect(requestCorrelation(requestId)).toBeNull();
+  });
+
+  it('never turns a diagnostic fingerprint replay into direct-A ownership', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('diagnostic');
+    rememberInboundRequestOrigin(requestId);
+    const body = {
+      capturedAt: Date.now(),
+      status: { connected: true, paired: true },
+      preferences: { overwrite: true, durations: false },
+      tab: { tab: 17, page: { requestShapes: [{
+        transport: 'sse', endpoint: 'conversation', envelope: ['root'],
+        requestPaths: ['input_message.metadata.request_id'], requestStyle: 'snake',
+        conversationPaths: ['conversation_id'], conversationValid: true, conversationConsistent: true,
+        conversationMatch: true, author: 'user', scope: 'input_message', occurrences: 1,
+        fingerprints: [{ path: 'input_message.metadata.request_id', digest: requestOriginDigest(requestId) }]
+      }] } }
+    };
+    const pending = companionDiagnostics();
+    expect((await request('POST', '/diagnostics', { body })).status).toBe(200);
+    await pending;
+    // The diagnostic says the digest matches, but ownership is still absent and the direct
+    // gate has no candidate: the same id still needs a real direct-A observation.
+    const shape = (await companionDiagnostics())?.tab?.page?.requestShapes?.[0];
+    expect(shape?.inboundMatch).toBe(true);
+    expect(requestCorrelation(requestId)).toBeNull();
+    const offer = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(offer.body.confirmed).toEqual([]);
+    expect(offer.body.directPending).toEqual([requestId]);
+    expect(requestCorrelation(requestId)).toBeNull();
+  });
+
+  it('does not let timing or a shared document alone create ownership', async () => {
+    await pair();
+    resetRequestOriginStateForTests();
+    const conversationId = randomUUID();
+    const requestId = freshId('timing');
+    const first = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(first.body.directPending).toEqual([requestId]);
+    // A second offer of the same unpaired candidate is still not ownership; only the real
+    // inbound id changes the verdict, never repetition or elapsed time.
+    const second = await request('POST', '/correlations', { body: directBody(conversationId, requestId) });
+    expect(second.body.confirmed).toEqual([]);
+    expect(second.body.directPending).toEqual([requestId]);
+    expect(requestCorrelation(requestId)).toBeNull();
   });
 });
 
@@ -902,6 +1298,26 @@ describe('observations', () => {
     const end = events.at(-1)!;
     // An outcome the page invented must not be believed.
     expect(end.kind === 'turn_end' && end.outcome).toBe('unknown');
+  });
+
+  it('admits bounded visible commentary progress and rejects malformed progress identity', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-111111111112';
+    const turnId = 'turn-commentary-1';
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'turn_start', time: Date.now(), turnId },
+          { kind: 'progress', time: Date.now(), turnId, progressId: 'g-live#p0', text: 'Checking the bridge' },
+          { kind: 'progress', time: Date.now(), turnId, progressId: 'not allowed / id', text: 'Must be dropped' }
+        ]
+      }
+    });
+    expect(reply.status).toBe(200);
+    const rows = await readEvents(reply.body.sessionId, { kinds: ['progress'] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'progress', turnId, progressId: 'g-live#p0', message: { text: 'Checking the bridge' } });
   });
 
   it('replaces an impossible timestamp rather than storing it', async () => {
@@ -1788,10 +2204,15 @@ describe('activity feed', () => {
  */
 describe('automatic compaction', () => {
   const settled = () => new Promise((resolve) => setTimeout(resolve, 25));
+  beforeEach(async () => {
+    await saveConfig({ ...suiteConfig, compaction: { ...suiteConfig.compaction, auto: true } });
+  });
 
   it.each([false, true])('hands manual compaction the pending repair only before browser claim (claimed=%s)', async claimed => {
     await pair();
     const conversationId = randomUUID();
+    spawn({ workers: [{ task: 'Keep this compaction recovery fixture owned by a live Prime' }], caller: { conversationId } }, { deferDelivery: true });
+    expect(currentRunId(conversationId)).not.toBeNull();
     await request('POST', '/events', { body: { conversationId, events: [
       { kind: 'user_message', time: Date.now(), text: 'Continue this task', messageId: 'manual-after-error' },
       { kind: 'turn_start', time: Date.now(), turnId: 'manual-after-error-turn' },
@@ -2366,6 +2787,79 @@ describe('automatic compaction', () => {
               text: 'new turn is working',
               renderedHtml: '<p>new turn is working</p>',
               messageId: 'a-after-rejection',
+              state: 'streaming',
+              activeNow: true
+            }
+          ]
+        }
+      });
+      await settled();
+      await vi.waitFor(() => expect(continuationForSession(sessionId)).toMatchObject({ automatic: true, state: 'awaiting-summary' }), { timeout: 3000 });
+    });
+  });
+
+  it('keeps a cancelled automatic compaction cancelled for its exact turn while manual compaction stays available', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac0a';
+    await withThreshold(10_000, async () => {
+      await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-cancelled-compact' }, ...over()]
+        }
+      });
+      await settled();
+      const sessionId = (await request('GET', `/activity?conversationId=${conversationId}`)).body.sessionId as string;
+      await vi.waitFor(() => expect(continuationForSession(sessionId)).toMatchObject({ automatic: true, state: 'awaiting-summary' }), { timeout: 3000 });
+
+      const cancelled = await request('POST', '/compact', { body: { conversationId, cancel: true } });
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body.cancelled).toBe(true);
+      expect(continuationForSession(sessionId)).toBeNull();
+
+      // The user's Cancel stands for the turn that is still being worked. Further evidence from
+      // that same turn must not file a fresh ticket behind the decision.
+      await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [{
+            kind: 'assistant_message',
+            time: Date.now(),
+            turnId: 'turn-cancelled-compact',
+            text: 'still working',
+            renderedHtml: '<p>still working</p>',
+            messageId: 'a-cancelled-compact',
+            state: 'streaming',
+            activeNow: true
+          }]
+        }
+      });
+      await settled();
+      expect(continuationForSession(sessionId)).toBeNull();
+
+      // Manual Compact & Resume is a separate, explicit decision and stays available.
+      const manual = await request('POST', '/compact', { body: { conversationId, ticket: true } });
+      expect(manual.status).toBe(202);
+      expect(manual.body.started).toBe(true);
+      expect(continuationForSession(sessionId)).toMatchObject({ automatic: false });
+      expect((await request('POST', '/compact', { body: { conversationId, cancel: true } })).body.cancelled).toBe(true);
+
+      // A genuine turn boundary spends the refusal: the next working turn can compact again.
+      await request('POST', '/events', {
+        body: { conversationId, events: [{ kind: 'turn_end', time: Date.now(), turnId: 'turn-cancelled-compact', outcome: 'completed' }] }
+      });
+      await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [
+            { kind: 'turn_start', time: Date.now(), turnId: 'turn-after-cancel' },
+            {
+              kind: 'assistant_message',
+              time: Date.now(),
+              turnId: 'turn-after-cancel',
+              text: 'new turn is working',
+              renderedHtml: '<p>new turn is working</p>',
+              messageId: 'a-after-cancel',
               state: 'streaming',
               activeNow: true
             }
@@ -6068,12 +6562,44 @@ describe('a worker chat that never opens', () => {
 describe('unattributed activity recovery', () => {
   let PRIME: string, WORKER: string, OTHER: string;
   let recoveryCase = 0;
+  let allowPrimeRecoveryFixture = true;
   beforeEach(() => {
     const suffix = String(++recoveryCase).padStart(12, '0');
     PRIME = `abababab-1111-2222-3333-${suffix}`;
     WORKER = `cdcdcdcd-1111-2222-3333-${suffix}`;
     OTHER = `efefefef-1111-2222-3333-${suffix}`;
+    allowPrimeRecoveryFixture = true;
   });
+
+  /**
+   * Recovery-mechanics cases in this block predate the active-run fence. Give those cases
+   * exact Prime ownership without browser bootstraps or a synthetic worker in lifecycle
+   * accounting. Tests of the ordinary owner-Chat fence disable this explicitly.
+   */
+  function ensurePrimeRecoveryFixture(conversationId: string): void {
+    if (!allowPrimeRecoveryFixture || !getConfig().multiAgent.recoverAgentTabs || currentRunId(conversationId)) return;
+    // A real worker/Prime topology already owns its own authority and must never be rewritten.
+    if (snapshotSwarm() !== null) return;
+    const created = spawn(
+      { workers: [{ task: 'Recovery-contract fixture only' }], caller: { conversationId } },
+      { deferDelivery: true }
+    );
+    const snapshot = snapshotSwarm();
+    if (!snapshot) throw new Error('recovery fixture did not create a swarm snapshot');
+    const active = snapshot.activeRuns?.find(run => run.runId === created.runId);
+    if (!active) throw new Error('recovery fixture did not create the expected active run');
+    const worker = active.agents.find(agent => agent.info.role === 'worker');
+    if (!worker) throw new Error('recovery fixture did not create its slot holder');
+    const farFuture = Date.now() + 7 * 24 * 60 * 60_000;
+    worker.info.conversationId = randomUUID();
+    worker.info.state = 'active';
+    worker.info.activatedAt = farFuture;
+    worker.info.lastSeenAt = farFuture;
+    worker.info.revivable = false;
+    resetSwarm();
+    restoreSwarm(snapshot);
+    if (!currentRunId(conversationId)) throw new Error('recovery fixture did not restore exact Prime ownership');
+  }
 
   it('withholds a recovery ETA when the browser has no eligible active chat', async () => {
     await pair();
@@ -6191,7 +6717,7 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it('keeps the original unattributed cohort visible without requiring another unknown call', async () => {
+  it('withholds an unattributed browser action while multiple chats remain eligible, then diagnoses once', async () => {
     vi.useFakeTimers();
     try {
       // Attribution owns this watch; ordinary two-minute silence is tested separately.
@@ -6202,11 +6728,9 @@ describe('unattributed activity recovery', () => {
       await unattributedTurn('five-minute-cohort-request');
       const startedAt = Date.now(), deadline = startedAt + 300_000;
       await vi.advanceTimersByTimeAsync(60_000);
-      const batch = await maintenanceBatch();
-      expect(batch).toHaveLength(3);
-      for (const repair of batch) await maintenanceBatch(repair.token, 'reloaded');
+      expect(await maintenanceBatch()).toEqual([]);
       for (const id of ids) expect((await sessionControlsFor(id)).recovery).toEqual([{ kind: 'unattributed-wait', deadline }]);
-      // The retry's existing eligibility remains unchanged; this is a UI watch.
+      // An ambiguous cohort cannot spend a browser action by candidate ordering.
       expect(unattributedRepairEta(Date.now(), 'five-minute-cohort-request')).toBeNull();
       await vi.advanceTimersByTimeAsync(1000);
       await attributed(WORKER, false, Date.now());
@@ -6317,6 +6841,9 @@ describe('unattributed activity recovery', () => {
   }
 
   function events(conversationId: string, items: unknown[]): Promise<any> {
+    if ((items as Array<{ kind?: string; recoverable?: boolean }>).some(
+      item => item?.kind === 'chat_error' && item.recoverable === true
+    )) ensurePrimeRecoveryFixture(conversationId);
     return request('POST', '/events', { body: { conversationId, events: items } });
   }
 
@@ -6326,6 +6853,7 @@ describe('unattributed activity recovery', () => {
    * real orders and the one that needs no waiting.
    */
   async function attributed(conversationId: string, endsActivity = false, startedAt?: number): Promise<void> {
+    ensurePrimeRecoveryFixture(conversationId);
     const requestId = `wfr_repair_${++requests}`;
     // This describe deliberately reuses conversation ids while fake time jumps backwards between
     // tests. Keep default synthetic call starts monotonic; boundary tests pass their exact time.
@@ -6373,7 +6901,7 @@ describe('unattributed activity recovery', () => {
    */
   async function maintenanceBatch(
     repaired?: string,
-    repairAction?: 'reloaded' | 'reopened'
+    repairAction?: 'reloaded' | 'reopened' | 'repaired'
   ): Promise<Array<{ conversationId: string; token: string; reason: string }>> {
     const path = repaired
       ? `/status?repaired=${encodeURIComponent(repaired)}${repairAction ? `&repairAction=${repairAction}` : ''}`
@@ -6392,7 +6920,7 @@ describe('unattributed activity recovery', () => {
    */
   async function maintenance(
     repaired?: string,
-    repairAction?: 'reloaded' | 'reopened'
+    repairAction?: 'reloaded' | 'reopened' | 'repaired'
   ): Promise<{ conversationId: string; token: string; reason: string } | null> {
     const batch = await maintenanceBatch(repaired, repairAction);
     expect(batch.length).toBeLessThanOrEqual(1);
@@ -6454,12 +6982,12 @@ describe('unattributed activity recovery', () => {
   const reopened = (conversationId: string): string[] =>
     opened.filter((url) => url === `https://chatgpt.com/c/${conversationId}`);
 
-  it.each([1, 2, 3])('wakes the extension at the exact deadline for %i suspects without a status poll', async count => {
+  it('wakes the extension at the exact deadline for one revalidated suspect without a status poll', async () => {
     vi.useFakeTimers();
     let socket: WebSocket | undefined;
     try {
       await pair();
-      const chats = [PRIME, WORKER, OTHER].slice(0, count);
+      const chats = [PRIME];
       for (const chat of chats) await events(chat, [openTurn(`wake-${chat}`)]);
       socket = new WebSocket(base.replace('http:', 'ws:') + '/wake', { origin: EXTENSION_ORIGIN });
       await once(socket, 'open');
@@ -6468,14 +6996,14 @@ describe('unattributed activity recovery', () => {
         if (bytes.toString() === 'wake') resolve();
       }));
       await unattributed();
-      const delay = count === 1 ? 15_000 : 60_000;
+      const delay = 15_000;
       if (delay) {
         await vi.advanceTimersByTimeAsync(delay - 1);
         expect(await maintenanceBatch()).toEqual([]);
       }
       await vi.advanceTimersByTimeAsync(delay ? 1 : 0);
       await wake;
-      expect((await maintenanceBatch()).map(row => row.conversationId).sort()).toEqual(chats.sort());
+      expect((await maintenanceBatch()).map(row => row.conversationId).sort()).toEqual(chats);
     } finally {
       socket?.terminate();
       vi.useRealTimers();
@@ -6695,7 +7223,7 @@ describe('unattributed activity recovery', () => {
     expect(notices[0].seq).toBeGreaterThan(bootstrap.seq);
   });
 
-  it('replaces one recovery timeline row as the browser attempt fails, retries and succeeds', async () => {
+  it('replaces one recovery timeline row when the single browser attempt fails', async () => {
     vi.useFakeTimers();
     try {
       await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
@@ -6714,7 +7242,7 @@ describe('unattributed activity recovery', () => {
       const handout = await maintenance();
       expect(chatOf(handout)).toBe(PRIME);
       expect((await snapshots()).map((event) => event.message.text)).toEqual([
-        'Trying to reload chat to recover missing connector attribution…'
+        'Checking the page before recovering missing connector attribution…'
       ]);
       // The row names the turn it is repairing, so every reader files it inside that turn —
       // the page paints it among the turn's tool calls rather than between turns.
@@ -6734,19 +7262,9 @@ describe('unattributed activity recovery', () => {
       await vi.advanceTimersByTimeAsync(1);
       await unattributedTurn('timeline-retry');
       await vi.advanceTimersByTimeAsync(openedAt + 300_000 - Date.now());
-      const retry = await maintenance();
-      expect(chatOf(retry)).toBe(PRIME);
+      expect(await maintenance()).toBeNull();
       expect(foldProgress(await snapshots()).map((event) => event.kind === 'progress' ? event.message.text : '')).toEqual([
-        'Trying to reload chat to recover missing connector attribution…'
-      ]);
-
-      await maintenance(retry!.token, 'reloaded');
-      // Replaying the same receipt is harmless: only the still-handed token can update the row.
-      const recorded = (await snapshots()).length;
-      await maintenance(retry!.token, 'reloaded');
-      expect(await snapshots()).toHaveLength(recorded);
-      expect(foldProgress(await snapshots()).map((event) => event.kind === 'progress' ? event.message.text : '')).toEqual([
-        'Reloaded chat to recover missing connector attribution.'
+        'Reload failed while recovering missing connector attribution.'
       ]);
       // Every rewrite of the row keeps the turn the first snapshot named.
       expect((await snapshots()).every((event) => event.turnId === 'turn-reload-note')).toBe(true);
@@ -6757,9 +7275,8 @@ describe('unattributed activity recovery', () => {
 
   /**
    * A browser worker can disappear after collecting a handout but before reporting an action.
-   * Its next plain maintenance pass is the negative acknowledgement: success would have been
-   * reported in the same request, while an action-level exception uses the explicit failure
-   * receipt tested above. Either path must keep the repair retryable.
+   * Its next plain maintenance pass cannot turn that ambiguous receipt into another browser
+   * action; the incident's one-action budget stays spent.
    */
   it('retains an issued unattributed token without issuing another action on polling', async () => {
     vi.useFakeTimers();
@@ -6803,7 +7320,7 @@ describe('unattributed activity recovery', () => {
     }
   });
 
-  it('retries a continuing request once at five minutes after the ordinary activity label expires', async () => {
+  it('keeps the five-minute second pass diagnostic-only after a failed first recovery action', async () => {
     vi.useFakeTimers();
     try {
       await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
@@ -6812,18 +7329,54 @@ describe('unattributed activity recovery', () => {
       const openedAt = Date.now();
       await vi.advanceTimersByTimeAsync(15_000);
       const first = await maintenance(); expect(chatOf(first)).toBe(PRIME);
-      await maintenance(first!.token);
+      expect((await request('POST', '/repairs/claim', { body: { token: first!.token } })).body.allowed).toBe(true);
+      const failed = await request('GET', `/status?repairFailed=${encodeURIComponent(first!.token)}&repairAction=reloaded`);
+      expect(failed.body.repairs).toEqual([]);
       await vi.advanceTimersByTimeAsync(1);
       await unattributedTurn('req-two-attempts');
       await vi.advanceTimersByTimeAsync(openedAt + 300_000 - Date.now() - 1);
       expect(await maintenance()).toBeNull();
+      expect(unattributedRepairEta(Date.now(), 'req-two-attempts')).toBe(1);
       await vi.advanceTimersByTimeAsync(1);
-      const second = await maintenance(); expect(chatOf(second)).toBe(PRIME);
-      expect(second!.token).not.toBe(first!.token);
-      await maintenance(second!.token);
-      await unattributedTurn('req-two-attempts');
+      expect(await maintenance()).toBeNull();
+      expect(unattributedRepairEta(Date.now(), 'req-two-attempts')).toBeNull();
+      expect(getLog().some(entry => entry.message.includes('diagnostic pass 2') && entry.message.includes('no browser action'))).toBe(true);
       await vi.advanceTimersByTimeAsync(600_000);
       expect(await maintenance()).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('shares the recent browser recovery cooldown with a later unattributed incident', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await events(PRIME, [{ kind: 'user_message', time: Date.now(), messageId: 'shared-cooldown-question', text: 'Implement it' },
+        openTurn('shared-cooldown-turn')]);
+      await events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'shared-cooldown-turn',
+        text: 'Connection interrupted', recoverable: true }]);
+      const error = await maintenance();
+      expect(error?.reason).toBe('assistant-error');
+      expect((await request('POST', '/repairs/claim', { body: { token: error!.token } })).body.allowed).toBe(true);
+      await maintenance(error!.token, 'reloaded');
+      const recoveryConfirmedAt = Date.now();
+
+      await unattributedTurn('shared-cooldown-request');
+      const cooldownDue = recoveryConfirmedAt + BROWSER_RECOVERY_COOLDOWN_MS;
+      const cooldownEta = unattributedRepairEta(Date.now(), 'shared-cooldown-request');
+      expect(cooldownEta).toBeLessThanOrEqual(BROWSER_RECOVERY_COOLDOWN_MS / 1000);
+      expect(cooldownEta).toBeGreaterThan(15);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(await maintenance()).toBeNull();
+      await vi.advanceTimersByTimeAsync(Math.max(0, cooldownDue - Date.now() - 1));
+      expect(await maintenance()).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      const attribution = await maintenance();
+      expect(attribution?.reason).toBe('unattributed');
+      // The final action claim repeats the shared cooldown check after the handout.
+      vi.setSystemTime(cooldownDue - 1);
+      expect((await request('POST', '/repairs/claim', { body: { token: attribution!.token } })).body.allowed).toBe(false);
+      vi.setSystemTime(cooldownDue);
+      expect((await request('POST', '/repairs/claim', { body: { token: attribution!.token } })).body.allowed).toBe(true);
     } finally { vi.useRealTimers(); }
   });
 
@@ -6840,7 +7393,8 @@ describe('unattributed activity recovery', () => {
       await vi.advanceTimersByTimeAsync(1); await unattributedTurn('eta-known-request');
       expect(unattributedRepairEta(Date.now(), 'eta-known-request')).toBe(Math.ceil((openedAt + 300_000 - Date.now()) / 1000));
       await vi.advanceTimersByTimeAsync(openedAt + 300_000 - Date.now());
-      const second = await maintenance(); await maintenance(second!.token);
+      expect(await maintenance()).toBeNull();
+      expect(unattributedRepairEta(Date.now(), 'eta-known-request')).toBeNull();
       await events(OTHER, [openTurn('another-incident-chat')]);
       await unattributedTurn('eta-other-request');
       expect(unattributedRepairEta(Date.now(), 'eta-known-request')).toBeNull();
@@ -6866,7 +7420,7 @@ describe('unattributed activity recovery', () => {
       await maintenance(first!.token);
       await vi.advanceTimersByTimeAsync(1); await unattributedTurn('frozen-cohort');
       await vi.advanceTimersByTimeAsync(openedAt + 300_000 - Date.now());
-      expect(chatOf(await maintenance())).toBe(PRIME);
+      expect(await maintenance()).toBeNull();
     } finally { vi.useRealTimers(); }
   });
 
@@ -6993,9 +7547,10 @@ describe('unattributed activity recovery', () => {
       await vi.advanceTimersByTimeAsync(49_999);
       expect(await maintenanceBatch()).toEqual([]);
 
-      // Sixty seconds from the first call, not a renewed budget after the second.
+      // Sixty seconds from the first call, not a renewed budget after the second. The
+      // unresolved two-chat cohort remains ambiguous and spends no browser action.
       await vi.advanceTimersByTimeAsync(1);
-      expect((await maintenanceBatch()).map(row => row.conversationId).sort()).toEqual([PRIME, OTHER].sort());
+      expect(await maintenanceBatch()).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
@@ -7040,7 +7595,7 @@ describe('unattributed activity recovery', () => {
     }
   });
 
-  it('repairs every chat that could be the broken one, not only a lone candidate', async () => {
+  it('withholds the single incident action while two chats remain eligible', async () => {
     vi.useFakeTimers();
     try {
       await pair();
@@ -7048,19 +7603,12 @@ describe('unattributed activity recovery', () => {
       await events(OTHER, [openTurn('turn-other')]);
       await unattributed();
 
-      // Two chats are generating and neither has proved its join, so both are broken until one
-      // of them shows otherwise. Standing down here is what left a whole swarm that lost the
-      // same evidence path at once with no repair at all.
-      //
-      // Two suspects is also a rung up from one: there is now somebody to be told apart from.
+      // Two chats are generating and neither has proved its join. Candidate ordering cannot
+      // supply the missing ownership proof, so this incident must spend no browser action.
       await vi.advanceTimersByTimeAsync(59_999);
       expect(await maintenanceBatch()).toEqual([]);
       await vi.advanceTimersByTimeAsync(1);
-
-      // Both in the one pass. The browser's alarm has a thirty-second floor, so handing these
-      // out one per pass would put a minute between two failures that happened together.
-      const handed = (await maintenanceBatch()).map((entry) => entry.conversationId).sort();
-      expect(handed).toEqual([PRIME, OTHER].sort());
+      expect(await maintenanceBatch()).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
@@ -7264,7 +7812,7 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it.each(['normal', 'pro'] as const)('pauses a manually closed %s chat until a real page return restores recovery', async model => {
+  it.each(['normal', 'pro'] as const)('keeps a manually closed %s chat non-destructive after page return while tab recovery is off', async model => {
     const previous = getConfig();
     await saveConfig({ ...previous, ui: { ...previous.ui, autoContinue: true },
       multiAgent: { ...previous.multiAgent, recoverAgentTabs: false } });
@@ -7311,17 +7859,14 @@ describe('unattributed activity recovery', () => {
       await assertInactive();
       expect(await maintenance()).toBeNull();
       expect(reopened(OTHER)).toEqual([]);
-      // Returning to the page re-enables recovery of this same unfinished source.
-      // It must work without another tool call or a fabricated new turn_start.
+      // Returning to the page restores observation, not browser-reload authority. Auto-Continue
+      // may act after a proven boundary, but recoverAgentTabs remains the explicit opt-in for
+      // automatic page recovery on an ordinary owner chat.
       await request('GET', `/activity?conversationId=${OTHER}`);
       expect((await getSession(session.id))?.browserRecoveryDismissedAt).toBeUndefined();
       await sweepStaleSwarm(Date.now());
-      const repair = await maintenance();
-      expect(repair).toMatchObject({ conversationId: OTHER, reason: 'silence' });
-      expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(true);
-      await maintenance(repair!.token, 'reopened');
-      // The restored page can discover a real final and retire this source's activity.
-      // Outbox/Goal pickup is exercised with the production hooks in input integration.
+      expect(await maintenance()).toBeNull();
+      // The restored page can still discover a real final and retire this source's activity.
       await request('GET', `/activity?conversationId=${OTHER}`);
       await recordFinalForTest(OTHER, turnId);
       await events(OTHER, [endTurn(turnId, 'completed')]);
@@ -7813,11 +8358,44 @@ describe('unattributed activity recovery', () => {
     expect((await maintenance())?.reason).toBe('assistant-error');
   });
 
-  it('reloads for recognized transport errors, once per user turn', async () => {
+  it('keeps an ordinary owner chat intact when agent-tab recovery is on but no active run owns it', async () => {
+    allowPrimeRecoveryFixture = false;
+    const previous = getConfig();
+    await saveConfig({
+      ...previous,
+      goal: { ...previous.goal, enabled: false },
+      multiAgent: { ...previous.multiAgent, recoverAgentTabs: true }
+    });
+    try {
+      await pair();
+      await events(OTHER, [
+        { kind: 'user_message', time: Date.now(), messageId: 'owner-error-question', text: 'Keep working here.' },
+        openTurn('owner-error-turn'),
+        {
+          kind: 'chat_error',
+          time: Date.now(),
+          turnId: 'owner-error-turn',
+          text: 'Connection interrupted. Waiting for the complete answer',
+          recoverable: true
+        }
+      ]);
+
+      expect(await maintenance()).toBeNull();
+      expect(getLog().some(entry =>
+        entry.message.includes('assistant transport failure recorded without automatic browser recovery') &&
+        entry.message.includes(OTHER)
+      )).toBe(true);
+    } finally {
+      await saveConfig(previous);
+    }
+  });
+
+  it('reloads transport errors only while an active run owns the chat', async () => {
+    allowPrimeRecoveryFixture = false;
     vi.useFakeTimers();
     try {
       await pair();
-      spawn({ workers: [{ task: 'hold the run open' }], caller: { conversationId: PRIME } });
+      spawn({ workers: [{ task: 'hold the run open' }], caller: { conversationId: PRIME } }, { deferDelivery: true });
       await events(PRIME, [openTurn('turn-prime')]);
 
       // A top-level failure needs no turn id, but must carry explicit recovery authority.
@@ -7831,9 +8409,13 @@ describe('unattributed activity recovery', () => {
       const first = await maintenance();
       expect(chatOf(first)).toBe(PRIME);
       expect(first?.reason).toBe('assistant-error');
+      expect(currentRunId(PRIME)).not.toBeNull();
       expect(await maintenance(first!.token)).toBeNull();
 
-      // The same turn, another error: its one reload is spent.
+      // Ending the run removes browser-recovery authority immediately. A later error in this
+      // owner Chat must not inherit the run merely because the same conversation has history.
+      resetSwarm();
+      expect(currentRunId(PRIME)).toBeNull();
       await vi.advanceTimersByTimeAsync(BROWSER_RECOVERY_COOLDOWN_MS);
       await events(PRIME, [{
         kind: 'chat_error',
@@ -7844,8 +8426,12 @@ describe('unattributed activity recovery', () => {
       }]);
       expect(await maintenance()).toBeNull();
 
-      // The user's next message is the next turn, and it brings its own reload.
-      await events(PRIME, [endTurn('turn-prime', 'failed'), openTurn('turn-prime-2')]);
+      // A later ordinary owner question remains ordinary too.
+      await events(PRIME, [
+        endTurn('turn-prime', 'failed'),
+        { kind: 'user_message', time: Date.now(), messageId: 'next-prime-question', text: 'Try the next step.' },
+        openTurn('turn-prime-2')
+      ]);
       await events(PRIME, [{
         kind: 'chat_error',
         time: Date.now(),
@@ -7853,7 +8439,8 @@ describe('unattributed activity recovery', () => {
         turnId: 'turn-prime-2',
         recoverable: true
       }]);
-      expect(chatOf(await maintenance())).toBe(PRIME);
+      expect(currentRunId(PRIME)).toBeNull();
+      expect(await maintenance()).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -8718,7 +9305,7 @@ describe('unattributed activity recovery', () => {
     vi.useFakeTimers();
     try {
       await pair();
-      spawn({ workers: [{ task: 'hold the run open' }], caller: { conversationId: PRIME } });
+      ensurePrimeRecoveryFixture(PRIME);
       await events(PRIME, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() }, openTurn('turn-prime-silent')]);
       await attributed(PRIME);
 
@@ -9772,8 +10359,9 @@ describe('unattributed activity recovery', () => {
     expect(await maintenance()).toMatchObject({ conversationId: SOLO, reason: 'no-tab' });
   });
 
-  it('reopens an ordinary chat that uses this connector the moment its last tab closes mid-turn', async () => {
+  it('keeps an ordinary connector chat closed when no active run owns it', async () => {
     const SOLO = 'b2b2b2b2-1111-2222-3333-444444444444';
+    allowPrimeRecoveryFixture = false;
     await pair();
     await events(SOLO, [openTurn('turn-solo-closed')]);
     // One proved call is what makes this chat the app's business at all.
@@ -9781,8 +10369,9 @@ describe('unattributed activity recovery', () => {
 
     await request('POST', '/closed', { body: { conversationId: SOLO } });
 
-    // Nothing is waited out: the close itself is the evidence.
-    expect(chatOf(await maintenance())).toBe(SOLO);
+    // Connector use proves identity, not browser authority. Without Goal/Loop or a current
+    // agent run, the owner closing this tab is final.
+    expect(await maintenance()).toBeNull();
   });
 
   /**
@@ -9814,25 +10403,15 @@ describe('unattributed activity recovery', () => {
     } finally { await saveConfig(previous); }
   });
 
-  it('gives an ordinary solo chat the same one-shot stale-turn reload as Prime', async () => {
+  it('does not give an ordinary solo chat stale-turn reload authority merely because it used the connector', async () => {
     vi.useFakeTimers();
     try {
+      allowPrimeRecoveryFixture = false;
       await pair();
       await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() }, openTurn('turn-solo-silent')]);
       await attributed(OTHER);
 
       await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
-      await sweepStaleSwarm(Date.now());
-      const reload = await maintenance();
-      expect(chatOf(reload)).toBe(OTHER);
-
-      // A receipt proves Chrome carried the reload out. With no new durable observation, the
-      // next sweep abandons this open turn instead of reloading it again forever.
-      expect(await maintenance(reload!.token)).toBeNull();
-      // The reload is the chat's chance; the verdict on it waits the same two minutes the silence did.
-      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
-      await sweepStaleSwarm(Date.now());
-      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS * 2);
       await sweepStaleSwarm(Date.now());
       expect(await maintenance()).toBeNull();
     } finally {
@@ -9840,7 +10419,7 @@ describe('unattributed activity recovery', () => {
     }
   });
 
-  it('opens an exact chat after calls continue while its Chrome tab is gone', async () => {
+  it('opens an exact agent-owned chat after calls continue while its Chrome tab is gone', async () => {
     vi.useFakeTimers();
     try {
       await pair();

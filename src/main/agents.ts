@@ -86,9 +86,11 @@ export const WORKER_SILENCE_MS = 3 * 60_000;
 /**
  * The context a worker chat may reach before it stops being worth reviving.
  *
- * The same 400k figure the app uses for its own context ceiling, and for the same reason: it
- * is where ChatGPT has actually been observed to stop accepting more. Past it a revival would
- * reopen a chat with no room left to work in, so that worker's next stop is its last one.
+ * A worker's own ceiling, deliberately kept at the 400k where ChatGPT has been observed to
+ * stop accepting more rather than following the owner's wider compaction trigger: the two
+ * answer different questions. The trigger chooses when a healthy long chat is worth
+ * re-fronting; this ceiling decides whether a revival would reopen a chat with no room to
+ * work in. Past it, that worker's next stop is its last one.
  *
  * It is never a stop signal. A worker that crosses the line mid-task keeps its slot, keeps its
  * inbox and keeps working until that work is done; all the crossing changes is that the sleep

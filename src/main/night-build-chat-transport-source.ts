@@ -20,6 +20,7 @@ import {
 
 const SESSION_ID = /^[0-9a-z-]{8,64}$/i;
 const CHAT_ID = /^[0-9a-z_-]{8,256}$/i;
+const FALLBACK_MESSAGE_TURN_ID = /^fallback-turn-\d+:\d+:(?:user|assistant)$/;
 const MESSAGE_FILE = /^[0-9a-f]{64}\.json$/;
 const OUTCOMES: readonly NightBuildChatTurnOutcome[] = ['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown'];
 const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
@@ -89,6 +90,7 @@ interface CanonicalMessage {
   text: string;
   truncated: boolean;
   chars: number;
+  attachments?: Array<{ id: string; name: string; size: number; mimeType: string; preview?: string }>;
   state?: 'streaming' | 'final';
   finalContentSeq?: number;
 }
@@ -110,6 +112,17 @@ interface JournalIdentityEvent {
   request?: { requestId: string; conversationId: string };
 }
 
+interface JournalProgress {
+  progressId: string;
+  origin: number;
+  seq: number;
+  time: number;
+  turnId: string;
+  text: string;
+  truncated: boolean;
+  chars: number;
+}
+
 interface JournalSnapshot {
   maxSeq: number;
   activeTurnId: string | null;
@@ -117,6 +130,7 @@ interface JournalSnapshot {
   turnEnds: Array<{ seq: number; time: number; turnId: string; outcome: NightBuildChatTurnOutcome }>;
   handoffs: Array<{ seq: number; handoffId: string }>;
   toolActivity: NightBuildActivityCandidate[];
+  progress: JournalProgress[];
 }
 
 interface CatalogRow { directoryId: string; meta: SessionMeta }
@@ -359,7 +373,9 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
   const origin = event['origin'] === undefined ? seq : safeInt(event['origin'], 'chat_transport_message_origin_invalid', false);
   if (origin > seq) throw new Error('chat_transport_message_origin_invalid');
   const turnId = optionalString(event['turnId'], 'chat_transport_message_turn_invalid');
-  if (turnId && !CHAT_ID.test(turnId)) throw new Error('chat_transport_message_turn_invalid');
+  if (turnId && !CHAT_ID.test(turnId) && !FALLBACK_MESSAGE_TURN_ID.test(turnId)) {
+    throw new Error('chat_transport_message_turn_invalid');
+  }
   const providerMessageId = optionalString(event['providerMessageId'], 'chat_transport_provider_message_invalid');
   const inputId = optionalString(event['inputId'], 'chat_transport_input_id_invalid');
   const inputDelivery = event['inputDelivery'];
@@ -375,6 +391,33 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
   const authoredAt = event['authoredAt'] === undefined
     ? undefined
     : safeInt(event['authoredAt'], 'chat_transport_authored_at_invalid');
+  const attachments = kind === 'user_message' && event['attachments'] !== undefined
+    ? (() => {
+        if (!Array.isArray(event['attachments']) || event['attachments'].length > 10) {
+          throw new Error('chat_transport_attachments_invalid');
+        }
+        return event['attachments'].map((raw) => {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('chat_transport_attachment_invalid');
+          const file = raw as JsonObject;
+          const id = requiredString(file['id'], 'chat_transport_attachment_id_invalid', 100);
+          const name = requiredString(file['name'], 'chat_transport_attachment_name_invalid', 200);
+          // DOM-only screenshot observations intentionally use size=0 because the page proves
+          // rendered pixels, not the provider file byte count. Zero is therefore "unknown",
+          // not malformed. Provider-backed attachments may still carry their exact positive size.
+          const size = safeInt(file['size'], 'chat_transport_attachment_size_invalid');
+          if (size > 512 * 1024 * 1024) throw new Error('chat_transport_attachment_size_invalid');
+          const mimeType = requiredString(file['mimeType'], 'chat_transport_attachment_mime_invalid', 100);
+          if (!/^image\/[a-z0-9.+-]{1,80}$/i.test(mimeType)) throw new Error('chat_transport_attachment_mime_invalid');
+          const preview = file['preview'] === undefined
+            ? undefined
+            : requiredString(file['preview'], 'chat_transport_attachment_preview_invalid', 32_768);
+          if (preview !== undefined && !/^data:image\/webp;base64,[A-Za-z0-9+/]+={0,2}$/.test(preview)) {
+            throw new Error('chat_transport_attachment_preview_invalid');
+          }
+          return { id, name, size, mimeType, ...(preview ? { preview } : {}) };
+        });
+      })()
+    : undefined;
   const base: CanonicalMessage = {
     key, kind, source, messageId, seq, origin,
     time: safeInt(event['time'], 'chat_transport_message_time_invalid'),
@@ -384,6 +427,7 @@ function parseCanonicalMessage(event: JsonObject, key: string): CanonicalMessage
     ...(turnId ? { turnId } : {}),
     ...(providerMessageId ? { providerMessageId } : {}),
     ...(inputId ? { inputId } : {}),
+    ...(attachments?.length ? { attachments } : {}),
     ...(kind === 'user_message' && (inputDelivery === 'offered' || inputDelivery === 'confirmed')
       ? { inputDelivery }
       : {}),
@@ -536,7 +580,7 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
   try { raw = await readBounded(path.join(dir, 'events.jsonl'), MAX_JOURNAL_BYTES, true); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    return { maxSeq: 0, activeTurnId: null, identityEvents: [], turnEnds: [], handoffs: [], toolActivity: [] };
+    return { maxSeq: 0, activeTurnId: null, identityEvents: [], turnEnds: [], handoffs: [], toolActivity: [], progress: [] };
   }
   const lines = raw.split('\n');
   if (lines.at(-1) === '') lines.pop();
@@ -548,6 +592,7 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
   const turnEnds: JournalSnapshot['turnEnds'] = [];
   const handoffs: JournalSnapshot['handoffs'] = [];
   const toolActivity: NightBuildActivityCandidate[] = [];
+  const progress = new Map<string, JournalProgress>();
   for (const line of lines) {
     if (!line) continue;
     if (Buffer.byteLength(line, 'utf8') > MAX_JOURNAL_LINE_BYTES) continue;
@@ -612,6 +657,24 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
           });
           relevant = true;
         }
+      } else if (kind === 'progress' && event['source'] === 'extension') {
+        const progressId = requiredString(event['progressId'], 'chat_transport_progress_id_invalid', 240);
+        if (!/^[A-Za-z0-9._:#-]+$/.test(progressId)) throw new Error('chat_transport_progress_id_invalid');
+        const turnId = requiredString(event['turnId'], 'chat_transport_progress_turn_invalid');
+        if (!CHAT_ID.test(turnId)) throw new Error('chat_transport_progress_turn_invalid');
+        const origin = event['origin'] === undefined
+          ? seq
+          : safeInt(event['origin'], 'chat_transport_progress_origin_invalid', false);
+        if (origin > seq) throw new Error('chat_transport_progress_origin_invalid');
+        const body = parseStoredText(event['message']);
+        const held = progress.get(progressId);
+        if (held && (held.turnId !== turnId || held.origin !== origin)) {
+          throw new Error('chat_transport_progress_identity_conflict');
+        }
+        progress.set(progressId, held
+          ? { ...held, seq, ...body }
+          : { progressId, origin, seq, time, turnId, ...body });
+        relevant = true;
       }
       if (!relevant) continue;
       previousSeq = seq;
@@ -623,7 +686,7 @@ async function readJournal(dir: string, canonicalKeys: Set<string>): Promise<Jou
       continue;
     }
   }
-  return { maxSeq, activeTurnId, identityEvents, turnEnds, handoffs, toolActivity };
+  return { maxSeq, activeTurnId, identityEvents, turnEnds, handoffs, toolActivity, progress: [...progress.values()] };
 }
 
 function positionOf(event: { seq: number; origin?: number }): number {
@@ -1082,6 +1145,13 @@ function projectedTurnOrigin(identity: IdentityState, turnId: string | undefined
   return identity.timelineTurns[responseTurnId(identity.timelineTurns, turnId)]?.origin ?? null;
 }
 
+function projectedQuestionOrigin(identity: IdentityState, messageId: string): number | null {
+  for (const turn of Object.values(identity.timelineTurns)) {
+    if (turn.questionId === messageId) return turn.origin;
+  }
+  return null;
+}
+
 function currentTurn(projection: SelectedProjection): NightBuildChatCurrentTurnV1 {
   const activeTurnId = projection.identitySource === 'rebuilt'
     ? projection.journal.activeTurnId
@@ -1089,26 +1159,54 @@ function currentTurn(projection: SelectedProjection): NightBuildChatCurrentTurnV
   const activeOrigin = activeTurnId
     ? projectedTurnOrigin(projection.identity, activeTurnId)
     : null;
+  if (activeTurnId && activeOrigin !== null && activeOrigin >= projection.lowerBoundOrigin) {
+    const terminal = projection.journal.turnEnds
+      .filter((event) => event.turnId === activeTurnId)
+      .sort((a, b) => b.seq - a.seq)[0];
+    if (terminal) {
+      return {
+        state: 'terminal',
+        outcome: terminal.outcome,
+        endedAt: terminal.time,
+        turnOrigin: activeOrigin
+      };
+    }
+  }
   if (activeOrigin !== null && activeOrigin >= projection.lowerBoundOrigin) {
     return { state: 'generating', turnOrigin: activeOrigin };
   }
-  let latest: { seq: number; time: number; outcome: NightBuildChatTurnOutcome } | null = null;
+  let latest: { seq: number; time: number; outcome: NightBuildChatTurnOutcome; turnOrigin: number } | null = null;
   for (const event of projection.journal.turnEnds) {
     const origin = projectedTurnOrigin(projection.identity, event.turnId);
     if (origin === null || origin < projection.lowerBoundOrigin) continue;
-    if (!latest || event.seq > latest.seq) latest = { seq: event.seq, time: event.time, outcome: event.outcome };
+    if (!latest || event.seq > latest.seq) latest = { seq: event.seq, time: event.time, outcome: event.outcome, turnOrigin: origin };
   }
-  return latest ? { state: 'terminal', outcome: latest.outcome, endedAt: latest.time } : { state: 'idle' };
+  return latest
+    ? { state: 'terminal', outcome: latest.outcome, endedAt: latest.time, turnOrigin: latest.turnOrigin }
+    : { state: 'idle' };
 }
 
 function publicItem(message: CanonicalMessage, projection: SelectedProjection, salt: string): NightBuildChatTranscriptItemV1 {
   const response = assistantResponseKey(message);
-  const projectedOrigin = message.turnId
-    ? projectedTurnOrigin(projection.identity, message.turnId)
-    : response
-      ? projection.assistantResponseOrigins.get(response) ?? null
-      : null;
+  const turnOrigin = message.turnId ? projectedTurnOrigin(projection.identity, message.turnId) : null;
+  const projectedOrigin = turnOrigin ?? (
+    message.kind === 'user_message'
+      ? projectedQuestionOrigin(projection.identity, message.messageId)
+      : response
+        ? projection.assistantResponseOrigins.get(response) ?? null
+        : null
+  );
   const text = visibleUserText(message);
+  let assistantState = message.state ?? 'streaming';
+  if (message.kind === 'assistant_message' && message.turnId) {
+    const ended = projection.journal.turnEnds.some((event) => event.turnId === message.turnId);
+    if (ended) {
+      const latestForTurn = projection.messages
+        .filter((candidate) => candidate.kind === 'assistant_message' && candidate.turnId === message.turnId)
+        .sort((a, b) => b.seq - a.seq)[0];
+      if (latestForTurn?.key === message.key) assistantState = 'final';
+    }
+  }
   return {
     itemId: opaque(salt, 'message', message.key),
     role: message.kind === 'user_message' ? 'user' : 'assistant',
@@ -1119,9 +1217,48 @@ function publicItem(message: CanonicalMessage, projection: SelectedProjection, s
     text,
     truncated: message.truncated,
     chars: message.kind === 'user_message' && text !== message.text ? text.length : message.chars,
+    ...(message.kind === 'user_message' && message.attachments?.length
+      ? { attachments: message.attachments.map((file) => ({
+          attachmentId: opaque(salt, 'attachment', `${message.key}\0${file.id}`),
+          name: file.name,
+          mimeType: file.mimeType,
+          size: file.size,
+          ...(file.preview ? { preview: file.preview } : {})
+        })) }
+      : {}),
     ...(message.kind === 'assistant_message'
-      ? { state: message.state ?? 'streaming', ...(message.finalContentSeq === undefined ? {} : { finalContentSeq: message.finalContentSeq }) }
+      ? { state: assistantState, ...(message.finalContentSeq === undefined ? {} : { finalContentSeq: message.finalContentSeq }) }
       : {})
+  };
+}
+
+/** Public visible commentary, carried as non-final assistant transcript text. */
+function publicProgress(
+  row: JournalProgress,
+  projection: SelectedProjection,
+  salt: string
+): NightBuildChatTranscriptItemV1 | null {
+  const turnOrigin = projectedTurnOrigin(projection.identity, row.turnId);
+  if (turnOrigin === null || turnOrigin < projection.lowerBoundOrigin || row.origin < projection.lowerBoundOrigin) return null;
+  // If the provider later exposes this exact public text canonically, prefer that stronger
+  // identity instead of showing the same visible sentence twice.
+  const duplicate = projection.messages.some((message) =>
+    message.kind === 'assistant_message' &&
+    projectedTurnOrigin(projection.identity, message.turnId) === turnOrigin &&
+    message.text.trim() === row.text.trim()
+  );
+  if (duplicate) return null;
+  return {
+    itemId: opaque(salt, 'progress', `${projection.row.directoryId}\0${row.progressId}`),
+    role: 'assistant',
+    originSeq: row.origin,
+    revisionSeq: row.seq,
+    authoredAt: row.time,
+    turnOrigin,
+    text: row.text,
+    truncated: row.truncated,
+    chars: row.chars,
+    state: 'streaming'
   };
 }
 
@@ -1192,6 +1329,9 @@ export function createNightBuildChatTransportSource(userData: string, salt: stri
         os.homedir()
       );
       const messages = projection.messages.filter((message) => message.origin >= projection.lowerBoundOrigin);
+      const progress = projection.journal.progress
+        .map((row) => publicProgress(row, projection, salt))
+        .filter((row): row is NightBuildChatTranscriptItemV1 => row !== null);
       type PageRow = {
         origin: number;
         revision: number;
@@ -1203,6 +1343,7 @@ export function createNightBuildChatTransportSource(userData: string, salt: stri
           const item = publicItem(message, projection, salt);
           return { origin: item.originSeq, revision: item.revisionSeq, item };
         }),
+        ...progress.map((item) => ({ origin: item.originSeq, revision: item.revisionSeq, item })),
         ...activity.map((row) => ({ origin: row.originSeq, revision: row.revisionSeq, activity: row }))
       ];
       let selected: PageRow[];

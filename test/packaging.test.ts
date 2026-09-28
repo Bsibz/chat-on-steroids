@@ -215,7 +215,7 @@ describe('cross-platform packaging targets', () => {
     expect(macGuiScript).toContain("output.includes('[error] window failed to load')");
     expect(macGuiScript).toContain("output.includes('[error] renderer:')");
     expect(macGuiScript).toContain('minimumSurvivalMs = 10_000');
-    expect(macGuiScript).toContain('startupDeadlineMs = 15_000');
+    expect(macGuiScript).toContain('startupDeadlineMs = 30_000');
     expect(macGuiScript).toContain("child.kill('SIGTERM')");
     expect(macGuiScript).toContain("child.kill('SIGKILL')");
     // The GUI smoke must not *run* Electron as Node. Explicitly deleting a

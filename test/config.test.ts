@@ -227,21 +227,14 @@ describe('settings migration', () => {
     expect(loaded.tunnel.desktopTunnelId).toBe('tunnel_fedcba9876543210fedcba9876543210');
   });
 
-  /**
-   * Automatic compaction ends the chat the user is working in and opens a fresh one, and it
-   * used to start off on the grounds that this is not something to do to somebody who never
-   * asked for it. In use that reasoning turned out to be backwards: the alternative to
-   * compacting is hitting the ceiling mid-thought and losing the thread entirely, which is
-   * the worse thing to have happen to somebody who never asked for it. Since 1.8 the trigger
-   * is edge-based rather than "currently above the line", so the advisory line is safe as
-   * the default and still leaves room to finish the crossing turn and write the handoff.
-   */
-  it('starts with automatic compaction on at the advisory line', async () => {
+  /** The local recorder estimate is not provider context truth, so compaction starts opt-in. */
+  it('starts with automatic compaction off while retaining the local advisory threshold', async () => {
     await saveConfig(defaultConfig());
     const loaded = await loadConfig();
-    expect(loaded.compaction.auto).toBe(true);
+    expect(loaded.compaction.auto).toBe(false);
     expect(loaded.compaction.autoTokens).toBe(loaded.sessions.advisoryTokens);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    // The owner-selected long-chat window, mid-band in the observed 700k–800k range.
+    expect(loaded.compaction.autoTokens).toBe(750_000);
   });
 
   /**
@@ -266,42 +259,48 @@ describe('settings migration', () => {
     const config = defaultConfig();
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: false, autoTokens: 300_000 } });
     const loaded = await loadConfig();
-    expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.auto).toBe(false);
+    expect(loaded.compaction.autoTokens).toBe(750_000);
   });
 
   /**
-   * The window moved to 400k, and the number that has to follow it is the one the app wrote
-   * for itself. Since 1.8 that is `auto: true` at 300k — the shipped default, in every config
-   * written by every install that never opened the panel. Raising the default alone would
-   * reach a fresh install and nothing else, which is the whole reason this file has
-   * migrations at all.
+   * Every shipped threshold moves up with the window, including the 400k from 1.8–2.1.x:
+   * since 1.8 the app wrote `auto: true` at its default for itself, so an exact shipped
+   * number can never be distinguished from a deliberate switch-on and is not treated as one.
+   * The switch itself is preserved either way.
    */
   it('moves the untouched 1.8 automatic default up to the wider window', async () => {
     const config = defaultConfig();
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 300_000 } });
     const loaded = await loadConfig();
-    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 400_000 });
+    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 750_000 });
   });
 
-  /** And nothing moves back down: 400k is the default now, however a config came to hold it. */
-  it('leaves a config already at the wider window alone', async () => {
+  /** The 400k window was also written by the app itself; a threshold somebody typed stays. */
+  it('moves the untouched 400k window and leaves a threshold somebody chose', async () => {
     const config = defaultConfig();
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 400_000 } });
-    const loaded = await loadConfig();
-    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 400_000 });
+    expect((await loadConfig()).compaction).toMatchObject({ auto: true, autoTokens: 750_000 });
+
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 600_000 } });
+    expect((await loadConfig()).compaction).toMatchObject({ auto: true, autoTokens: 600_000 });
   });
 
   /**
-   * The meter's own pair, migrated on the same rule. 300k/400k is what 1.8 wrote for itself,
-   * so it follows the window; anything else in either slot was typed and stays.
+   * The meter's own pair, migrated on the same rule. Both shipped pairs follow the window;
+   * anything else in either slot was typed and stays.
    */
   it('recalibrates an untouched meter pair and leaves a chosen one', async () => {
     const config = defaultConfig();
     await saveConfig({ ...config, sessions: { ...config.sessions, advisoryTokens: 300_000, limitTokens: 400_000 } });
     const moved = await loadConfig();
-    expect(moved.sessions.advisoryTokens).toBe(400_000);
-    expect(moved.sessions.limitTokens).toBe(Math.round((400_000 * 4) / 3));
+    expect(moved.sessions.advisoryTokens).toBe(750_000);
+    expect(moved.sessions.limitTokens).toBe(Math.round((750_000 * 4) / 3));
+
+    await saveConfig({ ...config, sessions: { ...config.sessions, advisoryTokens: 400_000, limitTokens: 533_333 } });
+    const movedAgain = await loadConfig();
+    expect(movedAgain.sessions.advisoryTokens).toBe(750_000);
+    expect(movedAgain.sessions.limitTokens).toBe(1_000_000);
 
     await saveConfig({ ...config, sessions: { ...config.sessions, advisoryTokens: 300_000, limitTokens: 350_000 } });
     const kept = await loadConfig();
@@ -315,6 +314,11 @@ describe('settings migration', () => {
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(false);
     expect(loaded.compaction.autoTokens).toBe(250_000);
+
+    // Explicit Off survives the window move too: only the number follows the shipped default.
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: false, autoTokens: 400_000 } });
+    const moved = await loadConfig();
+    expect(moved.compaction).toMatchObject({ auto: false, autoTokens: 750_000 });
   });
 
   it('keeps an automatic compaction the user configured', async () => {
@@ -351,8 +355,8 @@ describe('settings migration', () => {
     delete older.compaction.autoTokens;
     await saveConfig(older as ReturnType<typeof defaultConfig>);
     const loaded = await loadConfig();
-    expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.auto).toBe(false);
+    expect(loaded.compaction.autoTokens).toBe(750_000);
   });
 
   it('serializes concurrent read-modify-write changes instead of losing one', async () => {

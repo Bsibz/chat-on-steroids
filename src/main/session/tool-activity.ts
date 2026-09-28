@@ -34,6 +34,7 @@ export interface NightBuildActivityCandidate {
   summary: ActivitySummary;
   process?: { completedAt?: number; exitCode?: number | null; durationMs?: number };
   changedFiles?: number;
+  changedPaths?: string[];
 }
 
 export interface NightBuildActivityTurnLookup {
@@ -112,9 +113,18 @@ export function parseNightBuildActivityCandidate(
     };
   }
   let changedFiles: number | undefined;
+  let changedPaths: string[] | undefined;
   if (call['changes'] !== undefined) {
     if (!Array.isArray(call['changes'])) return null;
+    if (call['changes'].length > 100_000) return null;
     changedFiles = call['changes'].length;
+    const paths: string[] = [];
+    for (const value of call['changes']) {
+      const change = object(value);
+      if (!change || typeof change['path'] !== 'string' || !change['path'] || change['path'].length > 4096) return null;
+      if (paths.length < 8 && !paths.includes(change['path'])) paths.push(change['path']);
+    }
+    if (paths.length) changedPaths = paths;
   }
   return {
     authority,
@@ -136,7 +146,8 @@ export function parseNightBuildActivityCandidate(
       ...(metric ? { metric } : {})
     },
     ...(process ? { process } : {}),
-    ...(changedFiles === undefined ? {} : { changedFiles })
+    ...(changedFiles === undefined ? {} : { changedFiles }),
+    ...(changedPaths === undefined ? {} : { changedPaths })
   };
 }
 
@@ -258,6 +269,13 @@ export function projectNightBuildToolActivity(
     if (durationMs !== undefined && durationMs >= 0) item.durationMs = durationMs;
     if (row.changedFiles !== undefined && row.changedFiles > 0 && row.changedFiles <= 100_000) {
       item.changedFiles = row.changedFiles;
+    }
+    if (row.changedPaths?.length) {
+      const paths = row.changedPaths
+        .map((path) => harden(path, homeDirectory, 160))
+        .filter((path, index, all) => Boolean(path) && all.indexOf(path) === index)
+        .slice(0, 8);
+      if (paths.length) item.changedPaths = paths;
     }
     projected.push(item);
   }

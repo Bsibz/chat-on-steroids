@@ -34,6 +34,31 @@ it('redacts pasted credentials from nested browser arguments, protocol results a
   expect(args.fields[0]!.value).toBe(secret);
   expect(result.structuredContent.fields[0]!.value).toBe(secret);
 });
+
+it('records one command body when MCP content and structured output intentionally mirror it', async () => {
+  const conversationId = 'conv-exec-dedup';
+  const id = await sessionForConversation(conversationId);
+  const body = 'Process exited with code 0\nOutput:\nhello-once';
+  for (const tool of ['exec_command', 'write_stdin']) {
+    await recordToolCall({
+      ...call(`${tool}-request`, conversationId),
+      tool,
+      content: [{ type: 'text', text: body }],
+      protocolResult: {
+        content: [{ type: 'text', text: body }],
+        structuredContent: { exit_code: 0, output: 'hello-once' }
+      }
+    });
+  }
+  const events = await readEvents(id!, { kinds: ['tool_call'] });
+  expect(events).toHaveLength(2);
+  for (const event of events) {
+    if (event.kind !== 'tool_call') throw new Error('missing recorded call');
+    expect(event.call.result.text).toBe(body);
+    expect(event.call.result.text.match(/hello-once/g)).toHaveLength(1);
+    expect(event.call.result.text).not.toContain('structuredContent');
+  }
+});
 beforeEach(async () => {
   dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-backend-'));
   initConfigPath(dir); initSessionStore(dir); initDurableStore(dir);

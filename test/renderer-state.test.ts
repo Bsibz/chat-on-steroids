@@ -595,7 +595,7 @@ it('renders companion diagnostics in the native Advanced connection drawer', asy
       tab: 17, isChat: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       bound: true, epoch: 4, terminal: false, recorder: true,
       page: {
-        recorderVersion: 13, runId: 'run-live', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        recorderVersion: 14, runId: 'run-live', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
         generating: true, turnId: 'turn-current-long-id', generations: 2, queued: 0, queueBytes: 0,
         requestId: 'wfr_1234567890abcdef',
         trace: [{ requestId: 'wfr_1234567890abcdef', read: true, sent: true, confirmed: true, app: 'request_id', tool: 'read' }],
@@ -621,7 +621,7 @@ it('renders companion diagnostics in the native Advanced connection drawer', asy
   expect(doc.getElementById('connectionAdvancedApp')!.textContent).toContain('tool matched');
   expect(doc.getElementById('connectionPipelineOwner')!.classList.contains('is-done')).toBe(true);
   expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('companion browser');
-  expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('fiber v13 · run run-live');
+  expect(doc.getElementById('connectionAdvancedGrid')!.textContent).toContain('fiber v14 · run run-live');
 });
 
 it('uses Internal Chromium as the host source when the optional #237 API is present', async () => {
@@ -1167,7 +1167,7 @@ it('reports a staged update in the Activity line and the header bar', async () =
   const doc = mounted.window.document;
   const line = doc.getElementById('updateLine')!;
   expect(line.className).toBe('upline');
-  expect(line.textContent).toContain('2.0.3 is downloaded and ready');
+  expect(line.textContent).toContain('2.0.3 is downloaded and verified');
   expect(doc.getElementById('updateNotice')!.hidden).toBe(false);
   // There is nothing to fetch by hand once it is on disk.
   expect((doc.getElementById('updateGet') as HTMLButtonElement).hidden).toBe(true);

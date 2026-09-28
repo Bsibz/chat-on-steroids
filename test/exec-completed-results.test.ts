@@ -15,11 +15,11 @@ function start(m: UnifiedExecProcessManager, code: string, yieldTimeMs = 10000) 
     hookCommand: 'completed-result fixture', cwd: process.cwd(), displayCwd: '.', env: process.env, tty: false,
     yieldTimeMs, maxOutputTokens: undefined, truncationPolicy: policy });
 }
-function poll(m: UnifiedExecProcessManager, processId: number, input = '') {
-  return m.writeStdin({ processId, input, yieldTimeMs: 1000, maxOutputTokens: undefined, truncationPolicy: policy });
+function poll(m: UnifiedExecProcessManager, processId: number, input = '', rereadRetained = false) {
+  return m.writeStdin({ processId, input, rereadRetained, yieldTimeMs: 1000, maxOutputTokens: undefined, truncationPolicy: policy });
 }
 
-it('rereads an immediately completed command without executing it again or accepting input', async () => {
+it('omits an immediately completed duplicate by default and rereads it only on explicit request', async () => {
   const m = manager();
   const first = await start(m, "console.log('pid=' + process.pid); process.exitCode=7");
   expect(first.exitCode).toBe(7);
@@ -28,17 +28,22 @@ it('rereads an immediately completed command without executing it again or accep
   expect(execCommandStructuredOutput(first)).not.toHaveProperty('session_id');
   expect(execCommandResponseText(first)).toContain(`Completed session ID: ${id}`);
   const [a, b] = await Promise.all([poll(m, id), poll(m, id)]);
-  expect(a.rawOutput.equals(first.rawOutput)).toBe(true);
-  expect(b.rawOutput.equals(first.rawOutput)).toBe(true);
-  expect(a).toMatchObject({ replayed: true, exitCode: 7, processId: null });
-  expect(execCommandStructuredOutput(a)).toMatchObject({ output_replayed: true, exit_code: 7 });
+  expect(a.rawOutput.length).toBe(0);
+  expect(b.rawOutput.length).toBe(0);
+  expect(a).toMatchObject({ replayed: true, replaySuppressed: true, exitCode: 7, processId: null });
+  expect(execCommandStructuredOutput(a)).toMatchObject({ output_replayed: true, duplicate_output_omitted: true, exit_code: 7, output: '' });
+  expect(execCommandResponseText(a)).toContain('duplicate body omitted');
+  expect(execCommandResponseText(a)).not.toContain(first.rawOutput.toString('utf8').trim());
   expect(execCommandStructuredOutput(a)).not.toHaveProperty('benign_exit');
   expect(m.backgroundState(new Set([id]))).toEqual({ running: [], exitedUnread: [] });
   await expect(poll(m, id, 'input')).rejects.toThrow('already completed');
-  expect((await poll(m, id)).rawOutput.equals(first.rawOutput)).toBe(true);
+  const reread = await poll(m, id, '', true);
+  expect(reread.rawOutput.equals(first.rawOutput)).toBe(true);
+  expect(reread.replaySuppressed).toBe(false);
+  expect(String(execCommandStructuredOutput(reread).output)).toContain('pid=');
 });
 
-it('rereads all retained output after automatic delivery and a later receipt', async () => {
+it('suppresses retained output after automatic delivery unless an exact reread is requested', async () => {
   const m = manager();
   const first = await start(m, "console.log('early'); setTimeout(()=>console.log('late'), 700)", 250);
   const id = first.processId!;
@@ -48,7 +53,10 @@ it('rereads all retained output after automatic delivery and a later receipt', a
   await expect.poll(() => m.offerCompletedOutput(owned, published, 1000)).toMatchObject({ output: 'late\n' });
   published.completedAt = 100;
   await m.acknowledgeCompletedOutput(owned, 101);
-  const reread = await poll(m, id);
+  const duplicate = await poll(m, id);
+  expect(duplicate.rawOutput.length).toBe(0);
+  expect(duplicate.replaySuppressed).toBe(true);
+  const reread = await poll(m, id, '', true);
   expect(reread.rawOutput.toString()).toBe('early\nlate\n');
   expect(await m.offerCompletedOutput(owned, { completedAt: null, failed: false }, 1000)).toBeNull();
 });
@@ -58,7 +66,7 @@ it('bounds reread output, releases oldest completed custody, and keeps unread re
   const released = vi.fn(); m.setProcessReleaseListener(released);
   const first = await start(m, `process.stdout.write('a'.repeat(${COMPLETED_EXEC_OUTPUT_BYTES * 2})+'TAIL')`);
   const id = first.completedSessionId!;
-  const output = (await poll(m, id)).rawOutput.toString();
+  const output = (await poll(m, id, '', true)).rawOutput.toString();
   expect(Buffer.byteLength(output)).toBeLessThan(COMPLETED_EXEC_OUTPUT_BYTES + 200);
   expect(output).toContain('omitted'); expect(output.endsWith('TAIL')).toBe(true);
   // Real fast children exercise admission beyond the old active-process cap.
@@ -96,8 +104,8 @@ it('carries the same proven classification through asynchronous completion and r
   await expect(first.completion).resolves.toMatchObject({ exitCode: 1, benignExit: true });
   await expect(poll(m, id)).resolves.toMatchObject({ exitCode: 1, benignExit: true });
   const reread = await poll(m, id);
-  expect(reread).toMatchObject({ exitCode: 1, benignExit: true, replayed: true });
-  expect(execCommandStructuredOutput(reread)).toMatchObject({ exit_code: 1, benign_exit: true, output_replayed: true });
+  expect(reread).toMatchObject({ exitCode: 1, benignExit: true, replayed: true, replaySuppressed: true });
+  expect(execCommandStructuredOutput(reread)).toMatchObject({ exit_code: 1, benign_exit: true, output_replayed: true, duplicate_output_omitted: true, output: '' });
   const random = vi.spyOn(Math, 'random').mockReturnValueOnce((id - 1000) / 99000).mockReturnValueOnce(.99999);
   const next = m.allocateProcessId();
   expect(next).not.toBe(id);

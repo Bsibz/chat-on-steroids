@@ -22,10 +22,11 @@ it('keeps Pro static and identifies token estimates and compaction exclusion', (
   expect(doc.getElementById('contextMeterArc')?.getAttribute('stroke-dasharray')).toBe('0 37.7');
   expect(doc.getElementById('contextMeterInfo')?.textContent).toContain('Auto-compaction off for Pro');
   expect(doc.getElementById('contextMeterInfo')?.textContent).toContain('estimated');
+  expect(doc.getElementById('contextMeterInfo')?.textContent).toContain('provider context occupancy is not exposed');
 });
 it('uses configured limits for ordinary models and supports click and Escape', () => {
   const doc = setup('gpt-5.6-sol-high');
-  expect(doc.getElementById('contextMeterInfo')?.textContent).toContain('50% of configured limit');
+  expect(doc.getElementById('contextMeterInfo')?.textContent).toContain('100,000 locally recorded / 200,000 configured local limit · 50%');
   initContextMeter();
   const button = doc.getElementById('contextMeterButton')!;
   button.click();

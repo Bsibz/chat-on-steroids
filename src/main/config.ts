@@ -57,12 +57,14 @@ import { capabilitiesForPlatform } from './platform.js';
  * widens an older config merely because a field did not exist when that config was written.
  */
 /**
- * Where the pressure meter turns amber and red.
+ * Where the pressure meter turns amber and red, and where an owner-enabled automatic
+ * compaction fires.
  *
  * These are measured in *this app's* units — `estimateTokens`, four characters to a token,
  * over the events it kept — and not in whatever ChatGPT counts. The two are not the same
  * number and never will be: the app cannot see the system prompt, the memory, the file
- * attachments or the model's own reasoning, and ChatGPT's counter is private.
+ * attachments or the model's own reasoning, and ChatGPT's counter is private. Nothing may
+ * present this figure as provider context occupancy; it is the local recorder's own volume.
  *
  * So the thresholds are calibrated against observed behaviour rather than a published
  * context window. The first pair (180k/200k) was set from the published figure, and a real
@@ -74,14 +76,18 @@ import { capabilitiesForPlatform } from './platform.js';
  * 300k/400k put the amber line where there was still comfortable room to compact and the
  * red line at the point that had actually been seen to fail. In use that was still early:
  * chats sat amber and compacted themselves well before anything was wrong with them, and a
- * threshold that fires on a conversation that is fine costs a fresh chat every time. The
- * window is 400k now, at the figure the ceiling has actually been observed near, and the
- * red line follows it a third further on.
+ * threshold that fires on a conversation that is fine costs a fresh chat every time. 400k
+ * moved the line to the figure the ceiling had then been observed near, and that too kept
+ * firing on healthy long chats: on the owner's real workload one conversation recorded well
+ * over a million local units, so automatic compaction was interrupting and re-fronting it a
+ * third of the way in. The current trigger, 750k, sits in the middle of the practical
+ * 700k–800k band the owner picked from that observation; the red line follows it a third
+ * further on, at 1M, the same ×4/3 relation the settings panel derives.
  *
  * All of it remains a setting, because the real ceiling moves with the account, the model
  * and the size of what is attached.
  */
-const DEFAULT_CONTEXT_WINDOW = 400_000;
+const DEFAULT_CONTEXT_WINDOW = 750_000;
 const DEFAULT_SESSIONS: SessionSettings = {
   record: true,
   retainDays: 0,
@@ -93,25 +99,25 @@ const DEFAULT_SESSIONS: SessionSettings = {
 };
 
 /**
- * The 1.7.1 recalibration, applied once to configs that never chose their own numbers.
+ * The superseded shipped token pairs, for the same recalibrations.
  *
  * Raising a default only helps a fresh install: every existing config was written with the
  * old figures spelled out, so it would keep the too-early warning forever. A stored pair
- * that is *exactly* the old defaults was never a decision — it is what the app wrote for
+ * that is *exactly* a shipped default was never a decision — it is what the app wrote for
  * itself — so it moves. Anything else the user typed, and it stays put.
  */
 const OLD_TOKEN_DEFAULTS = [
   { advisoryTokens: 180_000, limitTokens: 200_000 },
-  { advisoryTokens: 300_000, limitTokens: 400_000 }
+  { advisoryTokens: 300_000, limitTokens: 400_000 },
+  { advisoryTokens: 400_000, limitTokens: 533_333 }
 ];
 const DEFAULT_COMPACTION: CompactionSettings = {
-  // On, at the advisory line.
+  // Off until the owner explicitly enables the local recorded-volume heuristic.
   //
-  // Automatic compaction is edge-triggered since 1.8: an old chat that merely opens above
-  // this number does nothing. That is what makes the advisory line usable as the trigger —
-  // the crossing turn still finishes and still writes its handoff, rather than the app
-  // waiting for a chat that is already over the line and compacting it on sight.
-  auto: true,
+  // CoS cannot observe ChatGPT's exact provider-side context occupancy. The local count is
+  // still useful as an owner-selected pressure trigger, but it must not silently end a chat
+  // and create a compacted continuation as though that estimate were provider truth.
+  auto: false,
   autoTokens: DEFAULT_SESSIONS.advisoryTokens
 };
 /**
@@ -578,8 +584,8 @@ function recalibrateTokens(config: Config): Config {
  * A config written before 1.7.5 spells the old answer out, so raising the default alone
  * would only ever reach a fresh install. A stored pair that is *exactly* the old default
  * was never a decision — it is what the app wrote for itself — so it moves. Anything the
- * user actually chose is left alone, including switching it off on purpose, which is why
- * `auto: true` with the old threshold is not touched: that is somebody's own setting.
+ * user actually chose is left alone, including switching it off on purpose; the shipped
+ * `auto: true` population is handled by {@link adoptWiderWindow} below.
  */
 const OLD_AUTO_DEFAULTS = { auto: false, autoTokens: 300_000 };
 
@@ -593,25 +599,23 @@ function adoptAutoCompaction(config: Config): Config {
 }
 
 /**
- * The 1.8 automatic default, moved up with the window.
+ * The shipped automatic thresholds, moved up with the window they were calibrated against.
  *
- * This is the third time a stored number that was never chosen has had to follow a default,
- * and it is the one case where the file's own rule is uncomfortable. `adoptAutoCompaction`
- * above deliberately leaves `auto: true` at the old threshold alone, on the grounds that
- * switching it on was a decision — but that was written when `auto: false` was the shipped
- * default. Since 1.8 the app writes `auto: true` at 300k for itself, so the two populations
- * are no longer distinguishable in the file, and the larger of them never decided anything.
+ * Each of these was written by the app itself as its default at some point: 300k from 1.7/1.8
+ * (with `auto: true` since 1.8, which is why it cannot be distinguished from a deliberate
+ * switch-on and is not treated as one) and 400k from 1.8–2.1.x. A config that still spells
+ * one out exactly never had a threshold decision made about it, so it follows the current
+ * window. A threshold that is any other number was typed by somebody and stays.
  *
- * They move. A threshold that is any other number was typed by somebody and stays.
- *
- * There is no matching migration downward: 400k is what this now defaults to, so a config
- * that already holds it, whether from 1.7 or from a person, simply keeps it.
+ * The switch is preserved verbatim; only the number moves. That keeps an explicit Off off
+ * (the app must not silently start interrupting chats on the strength of a recalibration)
+ * and an explicit On on, now at the owner-selected trigger.
  */
-const SUPERSEDED_AUTO_DEFAULTS = { auto: true, autoTokens: 300_000 };
+const SUPERSEDED_AUTO_THRESHOLDS = [300_000, 400_000];
 
 function adoptWiderWindow(config: Config): Config {
-  const { auto, autoTokens } = config.compaction;
-  if (auto !== SUPERSEDED_AUTO_DEFAULTS.auto || autoTokens !== SUPERSEDED_AUTO_DEFAULTS.autoTokens) return config;
+  const { autoTokens } = config.compaction;
+  if (!SUPERSEDED_AUTO_THRESHOLDS.includes(autoTokens)) return config;
   return {
     ...config,
     compaction: { ...config.compaction, autoTokens: DEFAULT_COMPACTION.autoTokens }

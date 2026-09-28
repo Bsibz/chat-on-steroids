@@ -876,6 +876,31 @@ export async function dispatchContinuationSourceSendNow(token: string): Promise<
 }
 
 /**
+ * Persists the exact-turn refusal for an automatic ticket that is being retired.
+ *
+ * The store's `autoCompactionRefusal` latch is the no-repeat half of the automatic rule:
+ * while the conversation and its source turn still match the refusal, the level check
+ * returns false, so a still-working chat cannot refile the ticket it just lost. Pre-send
+ * abandonment already wrote it; an explicit cancel and an exhausted handover get the same
+ * latch, because otherwise the next activity tick on the unchanged working turn files a
+ * fresh ticket behind the exact decision the user just made.
+ *
+ * Best-effort by contract: a latch that cannot be stored must never keep a user's cancel
+ * from landing. The pre-send path keeps its own awaited write below because there the latch
+ * *is* the record that a restart must not resurrect the abandoned ticket.
+ */
+async function latchAutomaticRefusal(entry: Continuation): Promise<void> {
+  if (!entry.automatic) return;
+  try {
+    await refuseAutomaticCompactionNow(entry.sessionId, entry.from, entry.sourceTurnId);
+  } catch (err) {
+    logWarn(
+      `continuation ${entry.token.slice(0, 8)} could not latch its automatic refusal — ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+/**
  * Terminally abandons a source handoff when the page can still prove no Send happened.
  *
  * This is the source-side counterpart to releasing a lost destination draft, except there is
@@ -1483,6 +1508,11 @@ export function abortContinuation(token: string, reason: string): boolean {
   changed();
   logWarn(`continuation ${entry.token.slice(0, 8)} abandoned — ${reason}`);
   noteAbandoned(entry, reason);
+  // This path has no await to spend (the sweep is synchronous and the abort must be
+  // immediate), so the latch is started here and lands behind it. It fences the next level
+  // check, which can only run from a later activity tick, and a failed write changes nothing
+  // about the abort that already happened.
+  void latchAutomaticRefusal(entry);
   return true;
 }
 
@@ -1500,7 +1530,18 @@ export async function abortContinuationNow(token: string, reason: string): Promi
   const entry = byToken.get(token);
   if (!entry || entry.state === 'committing') return false;
   if (entry.state === 'committed' || entry.state === 'aborted') return false;
-  await transitionNow(entry, (current) => ({ ...current, state: 'aborted', error: reason }));
+  // The exact-turn refusal lands before the ticket can disappear, so the next activity tick
+  // on an unchanged working turn cannot refile a fresh ticket behind the user's cancel.
+  // That write yields to the event loop, so re-read the transaction afterwards: a commit that
+  // began during it holds the synchronous commit lock, and any terminal state still refuses.
+  // This keeps the same abortable boundary the state check had before the latch existed.
+  await latchAutomaticRefusal(entry);
+  const current = byToken.get(token);
+  if (!current || (current.state !== 'awaiting-summary' && current.state !== 'awaiting-chat' && current.state !== 'claimed') ||
+      commitLocks.has(token)) {
+    return false;
+  }
+  await transitionNow(entry, (record) => ({ ...record, state: 'aborted', error: reason }));
   cancelPrimeTransfer(entry.from);
   logWarn(`continuation ${entry.token.slice(0, 8)} durably abandoned — ${reason}`);
   noteAbandoned(entry, reason);

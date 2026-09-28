@@ -222,9 +222,9 @@
         </span>
         <span class="state">
           <button class="btn connect-prompt" id="headerConnect" type="button" hidden>Connect</button>
-          <!-- Only ever visible with a downloaded, digest-checked update waiting. This app
-               lives in the tray and is closed to it, so "installs the next time you start it"
-               can mean days. This is the press that means now. -->
+          <!-- Only ever visible with a downloaded, digest-checked update waiting. This is the
+               explicit owner press required by the local macOS development channel and the
+               immediate-install path for the public self-updating platforms. -->
           <button class="btn btn-install" id="installUpdate" type="button" hidden>
             <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>
             <span>Install update</span>
@@ -993,10 +993,10 @@
                     </div>
                   </details>
                 <div class="context-meter" id="contextMeter">
-                  <button type="button" id="contextMeterButton" aria-label="Estimated session context" aria-expanded="false" aria-controls="contextMeterInfo">
+                  <button type="button" id="contextMeterButton" aria-label="Local recorded text · estimated" aria-expanded="false" aria-controls="contextMeterInfo">
                     <svg viewBox="0 0 16 16" aria-hidden="true"><circle class="context-track" cx="8" cy="8" r="6"/><circle id="contextMeterArc" cx="8" cy="8" r="6" stroke-dasharray="0 37.7"/></svg>
                   </button>
-                  <div id="contextMeterInfo" role="tooltip">Session context · estimated</div>
+                  <div id="contextMeterInfo" role="tooltip">Local recorded text · estimated</div>
                 </div>
                 </div>
                 <details class="composer-menu model-menu" id="modelMenu">

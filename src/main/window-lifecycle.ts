@@ -84,6 +84,21 @@ export function isBackgroundLaunch(argv: readonly string[]): boolean {
   return argv.includes('--background');
 }
 
+/**
+ * A bounded owner-local action used by the dogfood updater.
+ *
+ * This carries no candidate path, version, hash or installer authority. The running primary still
+ * discovers and verifies the fixed LocalUpdateChannel in update.ts. Restrict it to packaged macOS
+ * so a development Electron process or another platform cannot gain update authority from argv.
+ */
+export function isLocalUpdateInstallLaunch(
+  argv: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  packaged = true
+): boolean {
+  return packaged && platform === 'darwin' && argv.includes('--install-local-update');
+}
+
 export function supportsLoginStartup(platform: NodeJS.Platform, packaged: boolean): boolean {
   return platform === 'win32' && packaged;
 }

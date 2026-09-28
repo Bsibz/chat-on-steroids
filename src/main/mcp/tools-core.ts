@@ -194,11 +194,12 @@ const unifiedExecOutputSchema = z
       .number()
       .optional()
       .describe('Session ID while running.'),
-    completed_session_id: z.number().optional().describe('Use as write_stdin session_id to reread completed output.'),
+    completed_session_id: z.number().optional().describe('Completed session ID retained for deliberate reread with write_stdin reread_retained=true.'),
     benign_exit: z.boolean().optional().describe('Non-zero exit is an expected result, not a failure.'),
-    output_replayed: z.boolean().optional().describe('Retained output; command was not run again.'),
+    output_replayed: z.boolean().optional().describe('Retained completed result; command was not run again.'),
+    duplicate_output_omitted: z.boolean().optional().describe('The retained body was already delivered earlier and was omitted from this result.'),
     original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
-    output: z.string().describe('Command output text, possibly truncated.'),
+    output: z.string().describe('Command output text for structured-result consumers such as Code Mode, possibly truncated; empty when a duplicate completed replay was suppressed.'),
     supplemental_context: z.string().optional().describe('App context, not process output.')
   })
   .strict();
@@ -947,6 +948,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           .object({
             session_id: int32Number.describe(WRITE_STDIN_SESSION_ID_DESCRIPTION),
             chars: z.string().optional().describe(WRITE_STDIN_CHARS_DESCRIPTION),
+            reread_retained: z.boolean().optional().describe('Set true only to deliberately replay a completed result body that an earlier tool result already delivered.'),
             yield_time_ms: unsignedIntegerNumber.optional().describe(WRITE_STDIN_YIELD_TIME_DESCRIPTION),
             max_output_tokens: unsignedIntegerNumber.optional().describe(MAX_OUTPUT_TOKENS_DESCRIPTION)
           })
@@ -977,6 +979,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             const output = await unifiedExecManager.writeStdin({
               processId: input.session_id,
               input: input.chars ?? '',
+              rereadRetained: input.reread_retained === true,
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
               maxOutputTokens: undefined,
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY

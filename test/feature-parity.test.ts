@@ -13,7 +13,7 @@ describe('portable browser-backed feature parity', () => {
 
       expect(surfaceIsUseful('core', config.capabilities, platform)).toBe(true);
       expect(config.sessions.record).toBe(true);
-      expect(config.compaction.auto).toBe(true);
+      expect(config.compaction.auto).toBe(false);
       expect(config.compaction.autoTokens).toBe(config.sessions.advisoryTokens);
       // Goal is intentionally off until the user opts in and supplies a key, but that policy is
       // identical on every host. Its only product dependency is recording, not Windows/Desktop.

@@ -39,6 +39,7 @@ const {
   resetSessionStoreForTests
 } = await import('../src/main/session/store.js');
 const { recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { currentRunId, resetSwarm, spawn } = await import('../src/main/agents.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 const CHAT = 'f0f00002-1111-4111-8111-111111111111';
@@ -158,6 +159,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  resetSwarm();
   resetBridgeForTests();
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
@@ -172,6 +174,8 @@ describe('silence after a confirmed assistant-error repair', () => {
     vi.useFakeTimers();
     try {
       await pair();
+      spawn({ workers: [{ task: 'Keep this Prime recovery contract active' }], caller: { conversationId: CHAT } }, { deferDelivery: true });
+      expect(currentRunId(CHAT)).not.toBeNull();
       await events([
         { kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
         { kind: 'turn_start', time: Date.now(), turnId: TURN }

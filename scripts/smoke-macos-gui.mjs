@@ -10,10 +10,11 @@ if (process.platform !== 'darwin') {
 const arch = process.argv[2];
 if (arch !== 'x64' && arch !== 'arm64') throw new Error(`Expected x64 or arm64, got ${arch ?? '(missing)'}`);
 const unpackedDir = arch === 'arm64' ? 'mac-arm64' : 'mac';
+const app = process.argv[3]
+  ? path.resolve(process.argv[3])
+  : path.resolve('release', unpackedDir, 'Chat On Steroids.app');
 const executable = path.resolve(
-  'release',
-  unpackedDir,
-  'Chat On Steroids.app',
+  app,
   'Contents',
   'MacOS',
   'Chat On Steroids'
@@ -43,7 +44,11 @@ const exitPromise = new Promise((resolve) => {
 });
 
 const startedAt = Date.now();
-const startupDeadlineMs = 15_000;
+// A cold macOS Keychain availability probe can legitimately take several seconds before the
+// renderer's first state snapshot completes, especially immediately after code-signing changes.
+// Keep the smoke bounded, but give secure-storage initialization enough headroom to prove the
+// real renderer rather than failing a healthy build on OS wake latency.
+const startupDeadlineMs = 30_000;
 const minimumSurvivalMs = 10_000;
 
 let startupError = null;
@@ -84,7 +89,7 @@ try {
     const failure = startupFailure();
     if (failure) finish(new Error(`macOS GUI startup failed: ${failure}`));
     else if (ready()) finish();
-    else finish(new Error('macOS GUI did not report app started, window loaded and renderer state ready within 15 seconds'));
+    else finish(new Error('macOS GUI did not report app started, window loaded and renderer state ready within 30 seconds'));
   }, startupDeadlineMs);
   });
 } catch (error) {

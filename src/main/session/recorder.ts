@@ -114,6 +114,8 @@ interface LiveConversation {
   endedTurn: { turnId: string; startedAt: number | null; endedAt: number; requestIds: Set<string> } | null;
   /** Visible ChatGPT-native activity rows, updated by the page's stable row identity. */
   pageTools: Map<string, ProgressRecord>;
+  /** Visible public commentary rows, updated in place by generation-scoped page identity. */
+  pageProgress: Map<string, ProgressRecord>;
 }
 
 interface ProgressRecord {
@@ -340,7 +342,8 @@ async function initializeSessionForConversation(
         lastTurnStartedAt: null,
         activeTurnId: null,
         activeTurnStartedAt: null,
-        pageTools: new Map<string, ProgressRecord>()
+        pageTools: new Map<string, ProgressRecord>(),
+        pageProgress: new Map<string, ProgressRecord>()
       };
 
   // `storedHistory()` can take long enough for Compact & Resume to durably move this exact
@@ -374,7 +377,8 @@ async function initializeSessionForConversation(
     lastTurnStartedAt: history.lastTurnStartedAt,
     turnRequestIds: new Set<string>(),
     endedTurn: null,
-    pageTools: history.pageTools
+    pageTools: history.pageTools,
+    pageProgress: history.pageProgress
   });
   if (!known) {
     await appendEvent(summary.id, {
@@ -501,6 +505,8 @@ interface StoredHistory {
   activeTurnStartedAt: number | null;
   /** Latest stable ChatGPT-native activity row by website thought/message identity. */
   pageTools: Map<string, ProgressRecord>;
+  /** Latest visible public commentary row by generation-scoped DOM identity. */
+  pageProgress: Map<string, ProgressRecord>;
 }
 
 /**
@@ -524,9 +530,10 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
   let activeTurnStartedAt: number | null = null;
   const turnStarts = new Map<string, number>();
   const pageTools = new Map<string, ProgressRecord>();
+  const pageProgress = new Map<string, ProgressRecord>();
   try {
     const events = await readRecentEvents(sessionId, 4096, {
-      kinds: ['turn_start', 'turn_end', 'page_tool'],
+      kinds: ['turn_start', 'turn_end', 'page_tool', 'progress'],
       maxBytes: 2 * 1024 * 1024
     });
     // Presentation groups a turn's starts before its end. Lifecycle replay must
@@ -573,12 +580,27 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
           held.text = event.label;
           if (!held.turnId && event.turnId) held.turnId = event.turnId;
         }
+      } else if (event.kind === 'progress' && event.source === 'extension' && event.progressId) {
+        const held = pageProgress.get(event.progressId);
+        if (!held) {
+          pageProgress.set(event.progressId, {
+            seq: event.origin ?? event.seq,
+            time: event.time,
+            updatedAt: event.time,
+            text: event.message.text,
+            ...(event.turnId ? { turnId: event.turnId } : {})
+          });
+        } else {
+          held.updatedAt = Math.max(held.updatedAt, event.time);
+          held.text = event.message.text;
+          if (!held.turnId && event.turnId) held.turnId = event.turnId;
+        }
       }
     }
   } catch (err) {
     logWarn(`could not read stored session history: ${(err as Error).message}`);
   }
-  return { openTurns, knownTurnStarts, knownTurnEnds, lastTurnStartedAt, activeTurnId, activeTurnStartedAt, pageTools };
+  return { openTurns, knownTurnStarts, knownTurnEnds, lastTurnStartedAt, activeTurnId, activeTurnStartedAt, pageTools, pageProgress };
 }
 
 async function ensureUnattributedSession(): Promise<string | null> {
@@ -1347,7 +1369,16 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
     // raw capability out of args/result while still leaking it through that summary to
     // events.jsonl, the renderer and the extension activity feed.
     const authoredResultText = redactResult(input.tool, textParts.join('\n'));
-    const resultText = input.protocolResult === undefined ? authoredResultText : redactResult(input.tool, safeJson(input.protocolResult));
+    // Exec results intentionally carry the command body in both MCP content and
+    // structuredContent.output: ordinary clients read content while ChatGPT Code Mode
+    // reads the declared structured result, so both representations stay. Recording that
+    // whole protocol envelope would store the same command body twice, so these two tools
+    // record the authored text once instead. That removes a redundant local duplicate; the
+    // primary context saving is completed-output replay suppression, where a later empty
+    // poll omits an already-delivered body unless reread_retained=true.
+    const resultText = input.protocolResult === undefined || input.tool === 'exec_command' || input.tool === 'write_stdin'
+      ? authoredResultText
+      : redactResult(input.tool, safeJson(input.protocolResult));
     const assets: AssetRef[] = [...evidence.assets];
     let missingImages = 0;
     const imageRecordingReasons = new Set<string>();
@@ -1682,6 +1713,7 @@ export interface ChatObservation {
     | 'conversation_title'
     | 'user_message'
     | 'assistant_message'
+    | 'progress'
     | 'native_image'
     | 'page_tool'
     | 'turn_start'
@@ -1709,6 +1741,8 @@ export interface ChatObservation {
   messageId?: string;
   /** Raw public provider message UUID, retained as evidence, never used to guess ownership. */
   providerMessageId?: string;
+  /** Stable visible-commentary identity minted by the page DOM adapter for this generation. */
+  progressId?: string;
   /** Exact non-secret provider asset id for a native generated image. */
   providerAssetId?: string;
   providerRole?: 'tool' | 'assistant';
@@ -1886,6 +1920,53 @@ async function recordPageTool(
     text: label,
     turnId: held?.turnId ?? base.turnId,
     contentSeq: event.kind === 'page_tool' ? event.contentSeq : undefined
+  });
+  return true;
+}
+
+/**
+ * Stores one visible public ChatGPT commentary row, revising it at its first position.
+ *
+ * The DOM adapter's progress id is scoped to the local generation and survives React
+ * reparenting/redraws. Revisions therefore keep the first seq/time/turn and only replace text,
+ * matching the session-wide foldProgress contract without treating commentary as final prose.
+ */
+async function recordPageProgress(
+  sessionId: string,
+  live: LiveConversation | undefined,
+  item: ChatObservation,
+  base: { time: number; source: 'extension'; turnId?: string; agent?: string }
+): Promise<boolean> {
+  const id = item.progressId;
+  const text = (item.text ?? '').slice(0, 8000).trim();
+  if (!id || !text) return false;
+  if (!live) {
+    await appendEvent(sessionId, {
+      ...base,
+      kind: 'progress',
+      progressId: id,
+      message: await storeText(sessionId, text, 8000)
+    });
+    return true;
+  }
+
+  const held = live.pageProgress.get(id);
+  if (held && held.text === text) return false;
+  const event = await appendEvent(sessionId, {
+    ...base,
+    ...(held?.turnId ? { turnId: held.turnId } : {}),
+    time: held ? held.time : base.time,
+    kind: 'progress',
+    progressId: id,
+    ...(held ? { origin: held.seq } : {}),
+    message: await storeText(sessionId, text, 8000)
+  });
+  live.pageProgress.set(id, {
+    seq: held ? held.seq : event.seq,
+    time: held ? held.time : base.time,
+    updatedAt: base.time,
+    text,
+    turnId: held?.turnId ?? base.turnId
   });
   return true;
 }
@@ -2233,6 +2314,20 @@ async function recordChatObservationsNow(
         if (terminalActivity || workingActivity) { activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time); }
         if (terminalActivity) activity.terminal = true;
         if (workingActivity) activity.working = true;
+        break;
+      }
+      case 'progress': {
+        if (!item.progressId || !item.turnId) continue;
+        const changed = await recordPageProgress(sessionId, live, item, base);
+        if (!changed) continue;
+        if (await reopenThinkingFailure(sessionId, live, item.time, item.turnId)) {
+          activity.terminal = false;
+        }
+        if (item.turnId === live?.turnId && live.turnStartedAt !== null && item.time >= live.turnStartedAt) {
+          activity.meaningful = true;
+          activity.working = true;
+          activity.at = Math.max(activity.at ?? 0, item.time);
+        }
         break;
       }
       case 'native_image': {
@@ -2613,7 +2708,8 @@ export function rebindConversation(sessionId: string, fromConversationId: string
     lastTurnStartedAt: null,
     turnRequestIds: new Set<string>(),
     endedTurn: null,
-    pageTools: new Map()
+    pageTools: new Map(),
+    pageProgress: new Map()
   });
   lastActiveSessionId = sessionId;
   notifyChanged();

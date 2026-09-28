@@ -246,6 +246,7 @@ interface TurnEvidence {
   turnId: string | null;
   conversationId?: string | null;
   conversationConflict?: boolean;
+  visibleProgress?: boolean;
   endMessageId?: string | null;
   calls: TurnCall[];
   codeModeCalls?: Array<{ messageId: string; requestId: string | null; answered: boolean }>;
@@ -258,7 +259,9 @@ interface TurnEvidence {
     order: number;
     createTime?: number | null;
     rawText: string;
+    renderedText?: string;
     renderedHtml: string;
+    attachments?: Array<{ id: string; name: string; size: number; mimeType: string; preview?: string }>;
   }>;
   activities?: Array<{ messageId: string; label: string; order: number }>;
   thoughtNotifications?: Array<{ messageId: string; kind: 'thought_notification' }>;
@@ -280,10 +283,15 @@ interface TurnFixture {
   messages: Message[];
   tag?: 'section' | 'article' | 'div';
   searchRenderer?: boolean;
+  renderer?: 'search';
+  viewItems?: any[];
+  viewStatus?: string;
   modelMissing?: boolean;
   outerTurnWrapper?: boolean;
   /** A visible `.markdown` block: its text, or markup when the test is about the markup. */
-  rendered?: Array<string | { html: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
+  rendered?: Array<string | { html: string; innerText?: string; nativeId?: string; fiberProps?: Record<string, unknown>; fiber?: Fiber; staleMessageStamp?: string }>;
+  assistantToneRenderer?: boolean;
+  progress?: string;
   activities?: Array<{ label: string; fiber: Fiber; staleThoughtStamp?: string }>;
   images?: Array<{ assetId: string; clones?: number }>;
   staleStamp?: string;
@@ -332,6 +340,54 @@ async function scan(
   const document = window.document;
 
   for (const turn of turnSections) {
+    if (turn.renderer === 'search') {
+      const container = document.createElement('div');
+      container.setAttribute('data-turn-key', turn.id);
+      const user = document.createElement('div');
+      user.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:0:user`);
+      const userItem = turn.viewItems?.find(item => item?.type === 'user-message');
+      if (typeof userItem?.messageId === 'string') {
+        user.setAttribute('data-chatgpt-search-message-ids', userItem.messageId);
+      }
+      if (turn.staleStamp !== undefined) user.setAttribute('data-clf-fiber-turn', turn.staleStamp);
+      if (turn.rect) user.getBoundingClientRect = () => {
+        if (turn.rect === 'throw') throw new Error('unavailable geometry');
+        return turn.rect as DOMRect;
+      };
+      const viewTurn = {
+        items: turn.viewItems ?? [],
+        messageIds: (turn.viewItems ?? []).map(item => item?.messageId)
+          .filter((id): id is string => typeof id === 'string'),
+        status: turn.viewStatus ?? 'complete'
+      };
+      (user as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+        memoizedProps: { conversationId: THREAD },
+        return: { memoizedProps: { conversationId: THREAD, turn: viewTurn }, return: null }
+      } satisfies Fiber;
+
+      const assistant = document.createElement('div');
+      assistant.setAttribute('data-chatgpt-search-unit-key', `${turn.id}:2:assistant`);
+      const assistantItem = turn.viewItems?.find(item => item?.type === 'assistant-message');
+      if (typeof assistantItem?.messageId === 'string') {
+        assistant.setAttribute('data-chatgpt-search-message-ids', assistantItem.messageId);
+      }
+      for (const entry of turn.rendered ?? []) {
+        const block = document.createElement('div');
+        block.setAttribute('data-markdown-text-style', 'assistant-message');
+        if (typeof entry === 'string') block.textContent = entry;
+        else {
+          block.innerHTML = entry.html;
+          if (entry.innerText !== undefined) (block as HTMLElement).innerText = entry.innerText;
+          if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
+          if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
+          if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
+        }
+        assistant.append(block);
+      }
+      container.append(user, assistant);
+      document.body.append(container);
+      continue;
+    }
     const section = document.createElement(turn.searchRenderer ? 'div' : (turn.tag ?? 'section'));
     let mount: Element = section;
     if (turn.searchRenderer) {
@@ -385,17 +441,29 @@ async function scan(
     }
     for (const entry of turn.rendered ?? []) {
       const block = document.createElement('div');
-      if (turn.searchRenderer) block.setAttribute('data-markdown-text-style', 'assistant-message');
+      if (turn.searchRenderer) {
+        block.setAttribute(
+          turn.assistantToneRenderer ? 'data-markdown-text-tone' : 'data-markdown-text-style',
+          'assistant-message'
+        );
+      }
       else block.className = 'markdown';
       if (typeof entry === 'string') block.textContent = entry;
       else {
         block.innerHTML = entry.html;
+        if (entry.innerText !== undefined) (block as HTMLElement).innerText = entry.innerText;
         if (entry.nativeId) block.setAttribute('data-message-id', entry.nativeId);
         if (entry.fiberProps) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = chain(entry.fiberProps);
         if (entry.fiber) (block as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = entry.fiber;
         if (entry.staleMessageStamp) block.setAttribute('data-clf-fiber-message', entry.staleMessageStamp);
       }
       renderedHost.append(block);
+    }
+    if (turn.progress !== undefined) {
+      const progress = document.createElement('div');
+      progress.setAttribute('data-interrupted', 'false');
+      progress.textContent = turn.progress;
+      renderedHost.append(progress);
     }
     for (const entry of turn.activities ?? []) {
       const row = document.createElement('span');
@@ -486,6 +554,168 @@ async function scan(
   };
 }
 
+async function scanCurrentShell(options: { mapping?: boolean; foreignOwner?: boolean } = {}) {
+  const dom = new JSDOM(`<!doctype html><html><body>
+    <main data-app-shell-main-surface>
+      <div data-thread-find-target="conversation">
+        <div data-turn-key="shell-user">
+          <div data-content-search-turn-key="shell-turn">
+            <div data-content-search-unit-key="shell-turn:0:user"><div>Inspect the repository.</div></div>
+            <div><div id="shell-preamble" data-markdown-text-style="assistant-message">I found the first issue; checking the rest now.</div></div>
+            <div data-content-search-unit-key="shell-turn:2:assistant"><div data-markdown-text-style="assistant-message">Final answer later.</div></div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body></html>`, {
+    url: `https://chatgpt.com/c/${THREAD}`,
+    runScripts: 'outside-only',
+    pretendToBeVisual: true
+  });
+  const window = dom.window as unknown as Window & typeof globalThis & Record<string, any>;
+  const document = window.document;
+  const userId = '11111111-1111-4111-8111-111111111111';
+  const preambleId = '77777777-1111-4111-8111-111111111111';
+  const thoughtId = '66666666-1111-4111-8111-111111111111';
+  const callId = '33333333-3333-4333-8333-333333333333';
+  const answerId = '44444444-4444-4444-8444-444444444444';
+  const typedPreamble = {
+    type: 'reasoning',
+    presentation: 'preamble',
+    content: 'I found the first issue; checking the rest now.',
+    completed: false
+  };
+  const typedThought = {
+    type: 'reasoning',
+    presentation: 'thought',
+    content: 'Inspecting the project',
+    completed: false
+  };
+  const entry: any = {
+    id: 'shell-turn',
+    conversationId: THREAD,
+    turn: {
+      status: 'in_progress',
+      messageIds: [userId, thoughtId, preambleId, callId, answerId],
+      items: [
+        { type: 'user-message', messageId: userId, serverMessageId: userId, message: 'Inspect the repository.' },
+        { type: 'chatgpt-reasoning-group', items: [
+          typedThought,
+          typedPreamble,
+          {
+            type: 'mcp-tool-call',
+            callId,
+            completed: false,
+            invocation: {
+              server: APP,
+              tool: `${LINK}/read`,
+              arguments: { secret: 'NEVER_CROSS_PRIVATE_TOOL_ARGUMENTS' }
+            }
+          }
+        ] },
+        {
+          type: 'assistant-message',
+          messageId: answerId,
+          content: 'Final answer later.',
+          phase: 'final_answer',
+          completed: false
+        }
+      ]
+    }
+  };
+  const plain = (id: string, role: string, text: string, channel?: string) => ({
+    id,
+    parent: null as string | null,
+    message: {
+      id,
+      author: { role },
+      channel,
+      content: { content_type: 'text', parts: [text] },
+      metadata: {},
+      create_time: 1_790_000_000
+    }
+  });
+  const mapping: Record<string, any> = {
+    [userId]: plain(userId, 'user', 'Inspect the repository.'),
+    [thoughtId]: {
+      id: thoughtId,
+      parent: userId,
+      message: {
+        id: thoughtId,
+        author: { role: 'assistant' },
+        content: {
+          content_type: 'thoughts',
+          thoughts: [{ summary: 'Inspecting the project', content: 'PRIVATE_REASONING_MUST_NOT_CROSS' }]
+        },
+        metadata: {}
+      }
+    },
+    [preambleId]: plain(
+      preambleId,
+      'assistant',
+      'I found the first issue; checking the rest now.',
+      'commentary'
+    ),
+    [callId]: {
+      id: callId,
+      parent: preambleId,
+      message: {
+        id: callId,
+        author: { role: 'assistant' },
+        recipient: 'api_tool.call_tool',
+        metadata: { request_id: 'wfr_shell_exact' },
+        content: {
+          content_type: 'code',
+          text: `{"path":"/${APP}/${LINK}/read","args":{"secret":"NEVER_CROSS_PRIVATE_TOOL_ARGUMENTS"}}`
+        }
+      }
+    },
+    [answerId]: plain(answerId, 'assistant', 'Final answer later.', 'final')
+  };
+  mapping[preambleId].parent = thoughtId;
+  mapping[answerId].parent = callId;
+  const snapshot = {
+    renderedConversation: { mapping, current_node: answerId },
+    renderedTurns: [{ id: entry.id, turn: entry.turn }]
+  };
+  const owner: Fiber = {
+    memoizedProps: { conversationId: options.foreignOwner ? 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' : THREAD },
+    memoizedState: options.mapping === false ? null : { memoizedState: snapshot, next: null },
+    return: null
+  } as Fiber;
+  const row: Fiber = { memoizedProps: { entry }, return: owner } as Fiber;
+  const shell = document.querySelector('[data-turn-key]') as HTMLElement;
+  (shell as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = row;
+  const preambleNode = document.querySelector('#shell-preamble') as HTMLElement;
+  (preambleNode as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+    memoizedProps: { item: typedPreamble, conversationId: THREAD },
+    return: row
+  } as Fiber;
+  const finalNode = document.querySelector('[data-content-search-unit-key$=":assistant"] [data-markdown-text-style]') as HTMLElement;
+  (finalNode as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = {
+    memoizedProps: { item: entry.turn.items[2], conversationId: THREAD },
+    return: row
+  } as Fiber;
+
+  window.eval(source);
+  const nonce = 'shell-scan';
+  const reply = new Promise<Record<string, any>>((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => reject(new Error('shell helper never answered')), 2000);
+    window.addEventListener('message', (event: any) => {
+      if (event.data?.source !== 'clf-fiber-reply' || event.data.nonce !== nonce) return;
+      globalThis.clearTimeout(timer);
+      resolve(event.data);
+    });
+  });
+  window.dispatchEvent(new window.MessageEvent('message', {
+    data: { source: 'clf-fiber-ask', nonce },
+    source: window
+  }));
+  const data = await reply;
+  dom.window.close();
+  return data.turns as TurnEvidence[];
+}
+
 /** One row whose group sits where the live page puts it. */
 const row = (messages: Message[], collapsed = 0) => chain(group(messages, collapsed) as unknown as Record<string, unknown>);
 const rowInTurn = (messages: Message[], turnMessages: Message[], collapsed = 0) =>
@@ -494,6 +724,114 @@ const rowInTurn = (messages: Message[], turnMessages: Message[], collapsed = 0) 
 // --------------------------------------------------------------------- tests
 
 describe('reading a row out of the page', () => {
+  it('captures current-shell public preamble under its exact provider message identity', async () => {
+    const turns = await scanCurrentShell();
+    expect(turns).toHaveLength(1);
+    const turn = turns[0]!;
+    expect(turn.turnId).toBe('shell-turn');
+    expect(turn.conversationId).toBe(THREAD);
+    expect(turn.calls).toEqual([
+      expect.objectContaining({
+        messageId: '33333333-3333-4333-8333-333333333333',
+        tool: 'read',
+        requestId: 'wfr_shell_exact',
+        answered: false
+      })
+    ]);
+    expect(turn.activities).toEqual([
+      expect.objectContaining({
+        messageId: '66666666-1111-4111-8111-111111111111',
+        label: 'Inspecting the project'
+      })
+    ]);
+    expect(turn.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        rawMessageId: '77777777-1111-4111-8111-111111111111',
+        role: 'assistant',
+        rawText: 'I found the first issue; checking the rest now.'
+      }),
+      expect.objectContaining({
+        rawMessageId: '44444444-4444-4444-8444-444444444444',
+        role: 'assistant',
+        rawText: 'Final answer later.'
+      })
+    ]));
+    expect(JSON.stringify(turn)).not.toMatch(/PRIVATE_REASONING_MUST_NOT_CROSS|NEVER_CROSS_PRIVATE_TOOL_ARGUMENTS/);
+  });
+
+  it.each([
+    ['missing selected mapping', { mapping: false }],
+    ['foreign mapping owner', { foreignOwner: true }]
+  ])('does not mint current-shell commentary identity from text when %s', async (_label, options) => {
+    const turns = await scanCurrentShell(options as { mapping?: boolean; foreignOwner?: boolean });
+    expect(turns).toHaveLength(1);
+    const turn = turns[0]!;
+    expect(turn.messages.some(message =>
+      message.rawText === 'I found the first issue; checking the rest now.'
+    )).toBe(false);
+    expect(turn.activities).toEqual([]);
+    expect(JSON.stringify(turn)).not.toMatch(/PRIVATE_REASONING_MUST_NOT_CROSS|NEVER_CROSS_PRIVATE_TOOL_ARGUMENTS/);
+  });
+
+  it('reads public commentary from the September search-unit turn.items model', async () => {
+    const result = await scan([], [{
+      id: 'search-commentary-turn',
+      messages: [],
+      renderer: 'search',
+      viewItems: [
+        { type: 'user-message', messageId: 'search-user', message: 'Inspect the repository.', sentAtMs: 1_790_000_000_000 },
+        { type: 'assistant-message', messageId: 'search-commentary', content: 'I found the first issue; checking the rest now.',
+          completed: false, phase: 'commentary', sentAtMs: 1_790_000_001_000, turnExchangeId: 'exchange-search' }
+      ],
+      viewStatus: 'in_progress',
+      rendered: ['I found the first issue; checking the rest now.']
+    }]);
+
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({
+      turnId: 'search-commentary-turn',
+      conversationId: THREAD,
+      endMessageId: null,
+      messages: expect.arrayContaining([
+        expect.objectContaining({ rawMessageId: 'search-user', role: 'user', rawText: 'Inspect the repository.' }),
+        expect.objectContaining({
+          rawMessageId: 'search-commentary',
+          role: 'assistant',
+          rawText: 'I found the first issue; checking the rest now.'
+        })
+      ])
+    });
+  });
+
+  it('reads typed search-unit final and allowlisted call identity without tool payloads', async () => {
+    const result = await scan([], [{
+      id: 'search-turn-one',
+      messages: [],
+      renderer: 'search',
+      viewItems: [
+        { type: 'user-message', messageId: 'search-user', message: 'New renderer question', sentAtMs: 1_790_000_000_000 },
+        { type: 'chatgpt-reasoning-group', items: [{
+          type: 'mcp-tool-call', callId: 'search-call',
+          invocation: { server: APP, tool: `${LINK}/read`, arguments: { secret: 'must-not-cross-worlds' } }
+        }] },
+        { type: 'assistant-message', messageId: 'search-assistant', content: 'New renderer answer', completed: true,
+          phase: 'final_answer', sentAtMs: 1_790_000_001_000, turnExchangeId: 'exchange-search' }
+      ],
+      viewStatus: 'complete',
+      rendered: ['New renderer answer']
+    }]);
+
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0]).toMatchObject({
+      turnId: 'search-turn-one',
+      conversationId: THREAD,
+      endMessageId: 'search-assistant',
+      requests: [],
+      calls: [{ messageId: 'search-call', tool: 'read', order: 0, answered: true, requestId: null, createTime: null }]
+    });
+    expect(JSON.stringify(result.turns)).not.toMatch(/must-not-cross-worlds|arguments/);
+  });
+
   it('recognises a native result-only call without inventing its missing request parent', async () => {
     // Observed provider shape: tool/api_tool.call_tool with invoked_resource,
     // but no request message or metadata.parent_id in the rehydrated turn.
@@ -549,8 +887,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(15);
-    expect(rows[0]!.v).toBe(15);
+    expect(version).toBe(16);
+    expect(rows[0]!.v).toBe(16);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -939,6 +1277,79 @@ describe('the calls a turn says it made', () => {
     expect(messageStamps).toEqual(['test-nonce:0:assistant-dom-exact']);
   });
 
+  it('keeps an empty Fiber turn shell only while visible commentary exists', async () => {
+    const live = await scan([], [{
+      id: 'fallback-progress-shell',
+      searchRenderer: true,
+      modelMissing: true,
+      messages: [],
+      progress: 'Visible commentary without a reachable model.'
+    }]);
+    expect(live.turns).toHaveLength(1);
+    expect(live.turns[0]).toMatchObject({
+      turnId: 'fallback-progress-shell',
+      visibleProgress: true,
+      calls: [],
+      requests: [],
+      messages: [],
+      activities: []
+    });
+    expect(live.turnStamps).toEqual(['test-nonce:0', 'test-nonce:0']);
+
+    const empty = await scan([], [{
+      id: 'fallback-empty-shell',
+      searchRenderer: true,
+      modelMissing: true,
+      messages: []
+    }]);
+    expect(empty.turns).toEqual([]);
+    expect(empty.turnStamps).toEqual([null, null]);
+  });
+
+  it('restores whitespace from the exact-id September assistant block when its turn model is unavailable', async () => {
+    const flattened = 'First paragraphSecond paragraphItem oneItem two';
+    const formatted = 'First paragraph\n\nSecond paragraph\n\nItem one\nItem two';
+    const { turns, diagnostics } = await scan([], [{
+      id: 'fallback-dom-layout',
+      searchRenderer: true,
+      modelMissing: true,
+      messages: [authored('assistant-dom-layout', flattened)],
+      rendered: [{
+        html: '<p>First paragraph</p><p>Second paragraph</p><ul><li>Item one</li><li>Item two</li></ul>',
+        innerText: formatted
+      }]
+    }]);
+
+    expect(diagnostics).toMatchObject({ models: 0, modelMessages: 0 });
+    expect(turns[0]!.messages).toEqual([
+      expect.objectContaining({
+        messageId: 'assistant-dom-layout',
+        rawMessageId: 'assistant-dom-layout',
+        rawText: flattened,
+        renderedText: formatted
+      })
+    ]);
+  });
+
+  it('does not upgrade exact-id DOM fallback text when visible characters differ', async () => {
+    const { turns } = await scan([], [{
+      id: 'fallback-dom-layout-mismatch',
+      searchRenderer: true,
+      modelMissing: true,
+      messages: [authored('assistant-dom-layout-mismatch', 'Canonical text')],
+      rendered: [{
+        html: '<p>Visible changed text</p>',
+        innerText: 'Visible changed text\n\nwith extra characters'
+      }]
+    }]);
+
+    expect(turns[0]!.messages[0]).toMatchObject({
+      messageId: 'assistant-dom-layout-mismatch',
+      rawText: 'Visible changed text'
+    });
+    expect(turns[0]!.messages[0]).not.toHaveProperty('renderedText');
+  });
+
   it('takes canonical assistant identity and raw Markdown from the public text message model, not Markdown-node cardinality', async () => {
     const publicText = '**One** canonical update with `code`.';
     const messages = [
@@ -970,6 +1381,47 @@ describe('the calls a turn says it made', () => {
         rawText: publicText,
         renderedHtml: ''
       }
+    ]);
+  });
+
+  it('restores visible layout only when the rendered block has the same non-whitespace authored characters', async () => {
+    const flattened = 'First paragraphSecond paragraphconst x = 1;';
+    const formatted = 'First paragraph\n\nSecond paragraph\n\nconst x = 1;';
+    const { turns } = await scan([], [{
+      id: 'turn-layout',
+      messages: [authored('assistant-layout', flattened)],
+      rendered: [{ html: '<p>First paragraph</p><p>Second paragraph</p><pre><code>const x = 1;</code></pre>', innerText: formatted,
+        nativeId: 'assistant-layout' }]
+    }]);
+
+    expect(turns[0]!.messages).toEqual([
+      expect.objectContaining({
+        messageId: 'assistant-layout',
+        rawText: flattened,
+        renderedText: formatted
+      })
+    ]);
+  });
+
+  it('restores visible layout from the September assistant text-tone renderer', async () => {
+    const flattened = 'First paragraphSecond paragraphThird paragraph';
+    const formatted = 'First paragraph\n\nSecond paragraph\n\nThird paragraph';
+    const { turns } = await scan([], [{
+      id: 'turn-layout-tone',
+      searchRenderer: true,
+      assistantToneRenderer: true,
+      messages: [authored('assistant-layout-tone', flattened)],
+      rendered: [{
+        html: '<p>First paragraph</p><p>Second paragraph</p><p>Third paragraph</p>',
+        innerText: formatted
+      }]
+    }]);
+    expect(turns[0]!.messages).toEqual([
+      expect.objectContaining({
+        messageId: 'assistant-layout-tone',
+        rawText: flattened,
+        renderedText: formatted
+      })
     ]);
   });
 
@@ -1278,6 +1730,39 @@ describe('the calls a turn says it made', () => {
     expect(JSON.stringify(turns)).not.toMatch(/must-not-cross-worlds|private-library-id|private-source/);
     const assistant = await scan([], [{ id: 'not-user', messages: [{ ...message, author: { role: 'assistant' } }] }]);
     expect(assistant.turns).toEqual([]);
+  });
+
+  it('keeps up to ten observed user image attachments without exposing private provider fields', async () => {
+    const attachments = Array.from({ length: 12 }, (_, index) => ({
+      id: `native-file-${index}`,
+      name: `image-${index}.png`,
+      size: 100 + index,
+      mime_type: 'image/png',
+      library_file_id: `private-${index}`,
+      source: 'must-not-cross'
+    }));
+    const parts = attachments.map((_, index) => ({
+      content_type: 'image_asset_pointer',
+      asset_pointer: `must-not-cross-${index}`
+    }));
+    const message: Message = {
+      id: 'ten-native-images',
+      author: { role: 'user' },
+      recipient: 'all',
+      content: { content_type: 'multimodal_text', parts },
+      metadata: { attachments }
+    };
+    const { turns } = await scan([], [{ id: 'ten-image-turn', messages: [message] }]);
+    expect(turns[0]!.messages[0]!.attachments).toHaveLength(10);
+    expect(turns[0]!.messages[0]!.attachments).toEqual(
+      attachments.slice(0, 10).map(file => ({
+        id: file.id,
+        name: file.name,
+        size: file.size,
+        mimeType: file.mime_type
+      }))
+    );
+    expect(JSON.stringify(turns)).not.toMatch(/private-|must-not-cross/);
   });
 
   it('captures the opening user message from the page model before the DOM exposes a message id', async () => {

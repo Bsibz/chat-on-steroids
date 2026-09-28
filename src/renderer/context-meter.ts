@@ -20,12 +20,13 @@ export function paintContextMeter(session: SessionSummary | null, config: Config
   const percent = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
   arc.setAttribute('stroke-dasharray', `${pro ? 0 : percent * 0.377} 37.7`);
   const tokens = new Intl.NumberFormat().format(used);
-  const description = () => [t('Session context · estimated'), pro
-    ? t('{0} tokens used', [tokens])
-    : t('{0} / {1} tokens · {2}% of configured limit', [tokens, new Intl.NumberFormat().format(limit), percent]),
+  const description = () => [t('Local recorded text · estimated'), pro
+    ? t('{0} locally recorded tokens', [tokens])
+    : t('{0} locally recorded / {1} configured local limit · {2}%', [tokens, new Intl.NumberFormat().format(limit), percent]),
     pro ? t('Auto-compaction off for Pro') : config.compaction.auto
       ? t('Auto-compaction at {0} tokens', [new Intl.NumberFormat().format(config.compaction.autoTokens)])
-      : t('Auto-compaction off')].join('\n');
+      : t('Auto-compaction off'),
+    t('ChatGPT provider context occupancy is not exposed here; system prompts, hidden reasoning, tool schemas and provider-side compaction are not included.')].join('\n');
   ui(panel, 'textContent', description);
   ui(button, 'aria-label', () => description().replaceAll('\n', '. '));
 }

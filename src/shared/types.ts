@@ -517,6 +517,56 @@ export interface CompanionTraceEntry {
   tool: string | null;
 }
 
+/**
+ * One wire-only fingerprint of a bounded opaque request-id candidate.
+ *
+ * The browser observer computes the SHA-256 digest while inspecting a request-id property;
+ * the candidate id itself never leaves the MAIN-world observer. The bridge compares the
+ * digest against a bounded process-local registry of recent inbound MCP request-id digests
+ * and then discards it, so a stored or rendered diagnostic never carries a fingerprint.
+ */
+export interface CompanionRequestFingerprint {
+  /** Exact JSON property path the candidate id was found at. */
+  path: string;
+  /** Lowercase SHA-256 hex digest of the bounded opaque id; never a raw id. */
+  digest: string;
+}
+
+/**
+ * One diagnostic-only structural observation of provider transport.
+ *
+ * This exists to answer, from real signed-in ChatGPT traffic, which envelope carries a
+ * request-like id and under what conversation identity. It is deliberately structural:
+ * property paths, transport/envelope names, an author role enum and booleans. It never
+ * carries a request id, conversation id, header, body, payload value or metadata object,
+ * and the app never lets a shape grant request ownership or feed correlation.
+ */
+export interface CompanionRequestShape {
+  transport: 'sse' | 'socket';
+  endpoint: string;
+  envelope: string[];
+  requestPaths: string[];
+  requestStyle: 'snake' | 'camel' | null;
+  conversationPaths: string[];
+  conversationValid: boolean;
+  conversationConsistent: boolean | null;
+  conversationMatch: boolean | null;
+  author: string | null;
+  scope: string | null;
+  occurrences: number;
+  /**
+   * Diagnostic equality result for this shape, present only when the wire record carried
+   * fingerprints. True means at least one candidate digest exactly equaled a recent inbound
+   * MCP request-id digest; null means no comparable fingerprint was observed. This is
+   * evidence for a log line only: it never grants request, conversation or session ownership.
+   */
+  inboundMatch?: boolean | null;
+  /** Request paths whose fingerprint matched, in observation order; empty when none did. */
+  matchedRequestPaths?: string[];
+  /** Coarse age of the newest matched inbound digest, rounded down to whole seconds. */
+  inboundMatchAgeMs?: number | null;
+}
+
 export interface CompanionPageDiagnostics {
   recorderVersion: number | null;
   runId: string | null;
@@ -528,6 +578,7 @@ export interface CompanionPageDiagnostics {
   queueBytes: number;
   requestId: string | null;
   trace: CompanionTraceEntry[];
+  requestShapes: CompanionRequestShape[];
   overwrite: boolean;
   painted: boolean;
   events: number;
@@ -572,9 +623,9 @@ export interface CompanionTabDiagnostics {
  * `stage` says what this installation is doing about it, and the pair reads as:
  * - `latest === null` — up to date, or nothing checked yet.
  * - `latest` set, `stage: 'idle'` — a new version exists that this installation cannot apply
- *   for itself (a Linux `.deb`, macOS, a development tree, an unsupported architecture). It is
- *   a manual download.
- * - `downloading` / `ready` — it is being fetched, or is fetched and installs on the next start.
+ *   for itself (a Linux `.deb`, a public macOS release, a development tree, an unsupported
+ *   architecture). It is a manual download.
+ * - `downloading` / `ready` — a verified artifact is being fetched or is ready for installation.
  * - `failed` — the check or the download stopped; `error` says why, and the next check
  *   tries again. Nothing about the running app is affected either way.
  *

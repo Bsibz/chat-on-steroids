@@ -27,9 +27,9 @@
  * asking for a password during quit is not something this app will do — so a `.deb` install is
  * *told* a new version exists and is given the release page, and nothing is downloaded behind
  * it. That is a real limitation, not parity, and the notice says so rather than implying an
- * update is on its way. macOS is out entirely: those artifacts ship unsigned and unnotarized
- * (see electron-builder.yml), so an app that silently replaced itself there would be handing
- * Gatekeeper a binary the user never chose to trust.
+ * update is on its way. Public macOS artifacts also remain manual because they ship ad-hoc
+ * sealed and unnotarized (see electron-builder.yml). A separate owner-local development channel
+ * may stage a package built on this Mac, but it installs only after an explicit Install press.
  *
  * What this module does **not** own: the version of the browser extension. The bridge already
  * learns that from the authenticated `x-extension-version` header of a paired extension, and
@@ -39,7 +39,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, copyFile, mkdir, rename, rm } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readFile, rename, rm } from 'node:fs/promises';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -51,6 +51,101 @@ import { isNewer, type UpdateStatus } from '../shared/types.js';
 
 const REPO = 'totec448-spec/chat-on-steroids';
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
+const LOCAL_MAC_CHANNEL = 'LocalUpdateChannel';
+const LOCAL_MAC_ARTIFACT_PREFIX = 'Chat-On-Steroids-macOS-';
+const MAC_BUNDLE_ID = 'com.chatonsteroids.app';
+const MAC_BUNDLE_NAME = 'Chat On Steroids.app';
+
+/**
+ * Runs only after the Electron process has begun its normal shutdown. All paths and identities
+ * arrive as positional arguments, never interpolated into this source. The helper rehashes and
+ * validates the archive, extracts it away from the installed app, verifies the Apple Development
+ * seal/team requirement plus identity/version/architecture, swaps by rename, verifies again, and restores the outgoing
+ * app on any post-swap failure. Public macOS releases still do not use this path.
+ */
+const LOCAL_MAC_INSTALLER = String.raw`
+set -u
+wait_pid="$1"
+archive="$2"
+target="$3"
+expected_version="$4"
+expected_digest="$5"
+node_arch="$6"
+expected_team="$7"
+expected_signing_id="$8"
+
+relaunch() {
+  if [[ -d "$target" ]]; then /usr/bin/open -n "$target" >/dev/null 2>&1 || true; fi
+}
+fail() {
+  echo "chat-on-steroids local updater: $*" >&2
+  relaunch
+  exit 1
+}
+
+for _ in {1..300}; do
+  /bin/kill -0 "$wait_pid" >/dev/null 2>&1 || break
+  /bin/sleep 0.1
+done
+/bin/kill -0 "$wait_pid" >/dev/null 2>&1 && fail "timed out waiting for the running app to exit"
+
+actual_digest="$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')"
+[[ "$actual_digest" == "$expected_digest" ]] || fail "staged archive digest changed before install"
+
+tmp="$(/usr/bin/mktemp -d "/tmp/cos-local-update.XXXXXX")" || fail "could not create extraction directory"
+cleanup() { /bin/rm -rf "$tmp"; }
+trap cleanup EXIT
+/usr/bin/ditto -x -k "$archive" "$tmp" || fail "could not extract staged archive"
+candidate="$tmp/${MAC_BUNDLE_NAME}"
+info="$candidate/Contents/Info.plist"
+exe="$candidate/Contents/MacOS/Chat On Steroids"
+[[ -f "$info" && -x "$exe" ]] || fail "candidate bundle is incomplete"
+
+bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info" 2>/dev/null)" || fail "candidate bundle id is unreadable"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info" 2>/dev/null)" || fail "candidate version is unreadable"
+[[ "$bundle_id" == "${MAC_BUNDLE_ID}" ]] || fail "candidate bundle id is not ${MAC_BUNDLE_ID}"
+[[ "$version" == "$expected_version" ]] || fail "candidate version does not match the published local update"
+/usr/bin/codesign --verify --deep --strict "$candidate" >/dev/null 2>&1 || fail "candidate code seal is invalid"
+verify_signing() {
+  local app="$1" dump team signing_id requirement_expr
+  dump="$(/usr/bin/codesign -dv --verbose=4 "$app" 2>&1)" || return 1
+  team="$(printf '%s\n' "$dump" | /usr/bin/sed -n 's/^TeamIdentifier=//p' | /usr/bin/tail -n 1)"
+  signing_id="$(printf '%s\n' "$dump" | /usr/bin/sed -n 's/^Identifier=//p' | /usr/bin/tail -n 1)"
+  printf '%s\n' "$dump" | /usr/bin/grep -q '^Authority=Apple Development:' || return 1
+  [[ "$team" == "$expected_team" && "$signing_id" == "$expected_signing_id" ]] || return 1
+  requirement_expr='identifier "com.chatonsteroids.app" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] and certificate leaf[field.1.2.840.113635.100.6.1.12] and certificate leaf[subject.OU] = '"$expected_team"
+  /usr/bin/codesign --verify --deep --strict "-R=$requirement_expr" "$app" >/dev/null 2>&1
+}
+verify_signing "$candidate" || fail "candidate Apple Development signing identity or designated requirement does not match the published local update"
+expected_arch="$node_arch"
+[[ "$expected_arch" != "x64" ]] || expected_arch="x86_64"
+/usr/bin/lipo -archs "$exe" 2>/dev/null | /usr/bin/grep -qw "$expected_arch" || fail "candidate architecture does not match this app"
+
+[[ -d "$target" ]] || fail "installed app is missing before replacement"
+outgoing="$target.outgoing.$$"
+[[ ! -e "$outgoing" ]] || fail "outgoing rollback path already exists"
+/bin/mv "$target" "$outgoing" || fail "could not move the installed app aside"
+restore() {
+  /bin/rm -rf "$target" >/dev/null 2>&1 || true
+  if [[ -d "$outgoing" ]]; then /bin/mv "$outgoing" "$target" >/dev/null 2>&1 || true; fi
+}
+if ! /bin/mv "$candidate" "$target"; then
+  restore
+  fail "could not move the candidate into the installed app path"
+fi
+
+installed_info="$target/Contents/Info.plist"
+installed_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$installed_info" 2>/dev/null || true)"
+installed_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$installed_info" 2>/dev/null || true)"
+if [[ "$installed_id" != "${MAC_BUNDLE_ID}" || "$installed_version" != "$expected_version" ]] || ! /usr/bin/codesign --verify --deep --strict "$target" >/dev/null 2>&1 || ! verify_signing "$target"; then
+  restore
+  fail "installed candidate failed post-swap identity or seal verification"
+fi
+
+/bin/rm -rf "$outgoing"
+/usr/bin/open -n "$target" >/dev/null 2>&1 || fail "updated app installed but could not be relaunched"
+exit 0
+`;
 
 const CHECK_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
@@ -66,9 +161,9 @@ const RECHECK_MS = 6 * 60 * 60_000;
 /**
  * The artifact this exact installation can apply to itself, or null for one that cannot.
  *
- * Null is a normal answer, not a failure: macOS is out by policy, a Linux `.deb` belongs to the
- * system package manager and would need root to replace, and an architecture with no published
- * artifact has nothing to fetch. Those installations are still told a newer version exists —
+ * Null is a normal answer, not a failure: public macOS releases are manual by policy, a Linux
+ * `.deb` belongs to the system package manager and would need root to replace, and an architecture
+ * with no published artifact has nothing to fetch. Those installations are still told a newer version exists —
  * that is what `latest` with a stage of `idle` means, and the notice turns it into a download
  * link — they are simply not updated for.
  *
@@ -96,6 +191,75 @@ export function stagedArtifact(
   return null;
 }
 
+/**
+ * The packaged macOS bundle this exact process is executing from.
+ *
+ * Local development updates replace only the app that asked for them. Deriving the bundle from
+ * `process.execPath` keeps the channel from naming an arbitrary filesystem target, while
+ * `app.isPackaged` remains the separate fence that keeps development Electron runs out.
+ */
+export function runningMacBundle(execPath: string = process.execPath): string | null {
+  const marker = `${path.sep}Contents${path.sep}MacOS${path.sep}`;
+  const index = execPath.lastIndexOf(marker);
+  if (index <= 0) return null;
+  const bundle = execPath.slice(0, index);
+  return path.basename(bundle) === MAC_BUNDLE_NAME ? bundle : null;
+}
+
+type LocalMacManifest = {
+  schemaVersion: 1;
+  channel: 'local-development';
+  version: string;
+  arch: 'arm64' | 'x64';
+  artifact: string;
+  sha256: string;
+  bundleIdentifier: typeof MAC_BUNDLE_ID;
+  teamIdentifier: string;
+  signingIdentifier: typeof MAC_BUNDLE_ID;
+  designatedRequirement: string;
+};
+
+function localMacManifest(value: unknown): LocalMacManifest {
+  if (!value || typeof value !== 'object') throw new Error('local macOS update manifest is not an object');
+  const item = value as Record<string, unknown>;
+  const version = releaseVersion(item.version);
+  const arch = item.arch;
+  const expectedArtifact =
+    version && typeof arch === 'string' ? `${LOCAL_MAC_ARTIFACT_PREFIX}${arch}-${version}.zip` : '';
+  if (
+    item.schemaVersion !== 1 ||
+    item.channel !== 'local-development' ||
+    !version ||
+    (arch !== 'arm64' && arch !== 'x64') ||
+    item.artifact !== expectedArtifact ||
+    typeof item.sha256 !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(item.sha256) ||
+    item.bundleIdentifier !== MAC_BUNDLE_ID ||
+    typeof item.teamIdentifier !== 'string' ||
+    !/^[A-Z0-9]{10}$/.test(item.teamIdentifier) ||
+    item.signingIdentifier !== MAC_BUNDLE_ID ||
+    typeof item.designatedRequirement !== 'string' ||
+    item.designatedRequirement.length < 20 ||
+    item.designatedRequirement.length > 2_000 ||
+    !item.designatedRequirement.includes(`identifier "${MAC_BUNDLE_ID}"`) ||
+    !item.designatedRequirement.includes(`certificate leaf[subject.OU] = ${item.teamIdentifier}`)
+  ) {
+    throw new Error('local macOS update manifest is malformed or unsupported');
+  }
+  return {
+    schemaVersion: 1,
+    channel: 'local-development',
+    version,
+    arch,
+    artifact: expectedArtifact,
+    sha256: item.sha256,
+    bundleIdentifier: MAC_BUNDLE_ID,
+    teamIdentifier: item.teamIdentifier,
+    signingIdentifier: MAC_BUNDLE_ID,
+    designatedRequirement: item.designatedRequirement
+  };
+}
+
 /** `v2.0.3` -> `2.0.3`, and anything that is not a release tag -> null. */
 export function releaseVersion(tag: unknown): string | null {
   if (typeof tag !== 'string') return null;
@@ -106,7 +270,19 @@ export function releaseVersion(tag: unknown): string | null {
 const CLEAR: UpdateStatus = { current: APP_VERSION, latest: null, stage: 'idle', error: null, checkedAt: null };
 
 let status: UpdateStatus = CLEAR;
-let staged: { version: string; file: string; kind: 'installer' | 'appimage'; target: string; digest: string } | null = null;
+type MacSigningExpectation = {
+  teamIdentifier: string;
+  signingIdentifier: typeof MAC_BUNDLE_ID;
+  designatedRequirement: string;
+};
+let staged: {
+  version: string;
+  file: string;
+  kind: 'installer' | 'appimage' | 'mac-local';
+  target: string;
+  digest: string;
+  macSigning?: MacSigningExpectation;
+} | null = null;
 let pass: Promise<void> | null = null;
 /** Set by `markInstallOnQuit`: the user pressed Install, so bring the app back afterwards. */
 let runAfterInstall = false;
@@ -159,6 +335,7 @@ export function checkForUpdates(): Promise<void> {
 
 async function runPass(): Promise<void> {
   set({ stage: 'checking', error: null });
+  if (await stageLocalMacUpdate()) return;
   const release = { version: await latestVersion() };
   // GitHub answered. From here the UI can tell "current" from "not asked yet", whatever the
   // rest of this pass does with the answer.
@@ -201,6 +378,60 @@ async function runPass(): Promise<void> {
   staged = { version: release.version, file, kind: artifact.kind, target: artifact.target, digest: expected };
   set({ stage: 'ready' });
   logInfo(`update: ${release.version} is downloaded and ready to install`);
+}
+
+/**
+ * Stages a locally published macOS development ZIP, if one exists and is newer.
+ *
+ * Public macOS releases remain manual: they are ad-hoc sealed rather than publisher-signed and
+ * notarized. This separate channel is deliberately local-only and owner-driven. A publishing
+ * script writes an exact-version ZIP plus its SHA-256 under this app's userData; this process
+ * accepts only that fixed folder, exact artifact name, current architecture and bundle id. The
+ * ZIP is rehashed before and after copying into the ordinary versioned update staging area.
+ */
+async function stageLocalMacUpdate(): Promise<boolean> {
+  if (!app.isPackaged || process.platform !== 'darwin') return false;
+  if (process.arch !== 'arm64' && process.arch !== 'x64') return false;
+  const target = runningMacBundle();
+  if (!target) return false;
+
+  const channel = path.join(app.getPath('userData'), LOCAL_MAC_CHANNEL);
+  const manifestFile = path.join(channel, 'manifest.json');
+  if (!existsSync(manifestFile)) return false;
+  const manifest = localMacManifest(JSON.parse(await readFile(manifestFile, 'utf8')));
+  if (manifest.arch !== process.arch) return false;
+  if (!isNewer(manifest.version, APP_VERSION)) return false;
+
+  const source = path.join(channel, manifest.artifact);
+  if (!existsSync(source)) throw new Error(`local macOS update is missing ${manifest.artifact}`);
+  if ((await fileDigest(source)) !== manifest.sha256) throw new Error('local macOS update archive does not match its manifest SHA-256');
+
+  const dir = stagingDir(manifest.version);
+  await rm(path.join(app.getPath('userData'), 'updates'), { recursive: true, force: true });
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, manifest.artifact);
+  const part = `${file}.part`;
+  await copyFile(source, part);
+  if ((await fileDigest(part)) !== manifest.sha256) {
+    await rm(part, { force: true });
+    throw new Error('local macOS update archive changed while being staged');
+  }
+  await rename(part, file);
+  staged = {
+    version: manifest.version,
+    file,
+    kind: 'mac-local',
+    target,
+    digest: manifest.sha256,
+    macSigning: {
+      teamIdentifier: manifest.teamIdentifier,
+      signingIdentifier: manifest.signingIdentifier,
+      designatedRequirement: manifest.designatedRequirement
+    }
+  };
+  set({ checkedAt: Date.now(), latest: manifest.version, stage: 'ready', error: null });
+  logInfo(`update: local macOS development build ${manifest.version} is verified and ready to install`);
+  return true;
 }
 
 /** Where one release's artifact is kept. Versioned, so no build is ever taken for another. */
@@ -371,6 +602,11 @@ export function markInstallOnQuit(): boolean {
  * sets `perMachine: false`), so `/S` needs no elevation and shows no prompt. Detached, because
  * this process is about to stop existing.
  *
+ * A local macOS development update is different from a public release: it may only run after the
+ * user explicitly pressed Install. The detached helper waits for this process to exit, rechecks
+ * the archive and candidate identity/seal, swaps the exact running bundle with rollback, then
+ * relaunches that exact path. An ordinary quit leaves the local candidate staged for later.
+ *
  * An AppImage has no installer: the file that is running is the whole application, so the update
  * is a rename over it. A rename rather than a copy, because the running AppImage is mounted from
  * that path — writing through it would corrupt the process that is still shutting down, while a
@@ -384,7 +620,32 @@ export async function applyStagedUpdate(): Promise<void> {
   if (!ready) return;
   try {
     if ((await fileDigest(ready.file)) !== ready.digest) throw new Error('the staged artifact changed after verification');
-    if (ready.kind === 'installer') {
+    if (ready.kind === 'mac-local') {
+      if (!relaunch) {
+        logInfo(`update: local macOS development build ${ready.version} remains staged until the user presses Install`);
+        return;
+      }
+      if (!ready.macSigning) throw new Error('local macOS update is missing its Apple Development signing expectation');
+      const installer = spawn(
+        '/bin/zsh',
+        [
+          '-c',
+          LOCAL_MAC_INSTALLER,
+          'cos-local-update',
+          String(process.pid),
+          ready.file,
+          ready.target,
+          ready.version,
+          ready.digest,
+          process.arch,
+          ready.macSigning.teamIdentifier,
+          ready.macSigning.signingIdentifier
+        ],
+        { detached: true, stdio: 'ignore' }
+      );
+      installer.on('error', (err: Error) => logWarn(`the local macOS ${ready.version} updater did not start: ${err.message}`));
+      installer.unref();
+    } else if (ready.kind === 'installer') {
       // `--updated` tells the assisted NSIS installer this is an upgrade of the install it
       // already owns, so it keeps the location and the shortcuts instead of asking about them.
       // `--force-run` is added only when the user pressed Install and is waiting for the app to

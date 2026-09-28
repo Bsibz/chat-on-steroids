@@ -14,23 +14,23 @@ it('persists an unacknowledged reminder across reloads and rearms only for anoth
   let { paintPluginRefreshReminder: paint } = await import('../src/renderer/plugin-refresh-reminder.js');
   const notice = document.getElementById('pluginRefreshReminder')!;
   const dismiss = document.getElementById('dismissPluginRefreshReminder')!;
-  paint('2.0.9');
+  paint('2.0.9', false);
   expect(notice.hidden).toBe(false);
   vi.resetModules();
   ({ paintPluginRefreshReminder: paint } = await import('../src/renderer/plugin-refresh-reminder.js'));
-  paint('2.0.9');
+  paint('2.0.9', false);
   expect(notice.hidden).toBe(false);
   dismiss.click();
-  paint('2.0.9');
+  paint('2.0.9', false);
   expect(notice.hidden).toBe(true);
   vi.resetModules();
   ({ paintPluginRefreshReminder: paint } = await import('../src/renderer/plugin-refresh-reminder.js'));
-  paint('2.0.9');
+  paint('2.0.9', false);
   expect(notice.hidden).toBe(true);
-  paint('2.0.10');
+  paint('2.0.10', false);
   expect(notice.hidden).toBe(false);
   dismiss.click();
-  paint('2.0.10');
+  paint('2.0.10', false);
   expect(notice.hidden).toBe(true);
 });
 
@@ -38,8 +38,17 @@ it('dismisses only the reminder and leaves simultaneous extension or update noti
   const { paintPluginRefreshReminder } = await import('../src/renderer/plugin-refresh-reminder.js');
   const update = document.getElementById('updateNotice')!;
   update.hidden = false;
-  paintPluginRefreshReminder('2.0.9');
+  paintPluginRefreshReminder('2.0.9', false);
   document.getElementById('dismissPluginRefreshReminder')!.click();
   expect(document.getElementById('pluginRefreshReminder')!.hidden).toBe(true);
   expect(update.hidden).toBe(false);
+});
+
+it('hides the manual reminder while automatic connector refresh is enabled', async () => {
+  const { paintPluginRefreshReminder } = await import('../src/renderer/plugin-refresh-reminder.js');
+  paintPluginRefreshReminder('2.1.39', true);
+  expect(document.getElementById('pluginRefreshReminder')!.hidden).toBe(true);
+
+  paintPluginRefreshReminder('2.1.39', false);
+  expect(document.getElementById('pluginRefreshReminder')!.hidden).toBe(false);
 });

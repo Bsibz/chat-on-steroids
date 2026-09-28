@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import {
   applyLoginStartup,
   isBackgroundLaunch,
+  isLocalUpdateInstallLaunch,
   supportsLoginStartup,
   createWindowActivationGate,
   ownsAppRuntime,
@@ -180,12 +181,30 @@ describe('Windows login startup', () => {
     const handler = source.slice(start, source.indexOf('\n});', start) + 4);
     let received!: (event: unknown, argv: string[]) => void;
     const request = vi.fn();
-    vm.runInNewContext(handler, { app: { on: (_: string, listener: typeof received) => { received = listener; } }, windowActivation: { request }, isBackgroundLaunch });
+    const requestLocalUpdateInstall = vi.fn(() => false);
+    vm.runInNewContext(handler, {
+      app: { on: (_: string, listener: typeof received) => { received = listener; } },
+      windowActivation: { request },
+      isBackgroundLaunch,
+      requestLocalUpdateInstall
+    });
     received({}, ['app.exe', '--background']);
     expect(request).not.toHaveBeenCalled();
     received({}, ['app.exe']);
     expect(request).toHaveBeenCalledOnce();
+    requestLocalUpdateInstall.mockReturnValue(true);
+    received({}, ['app.exe', '--install-local-update']);
+    expect(request).toHaveBeenCalledOnce();
     expect(isBackgroundLaunch(['app.exe', '--background=false'])).toBe(false);
     expect(source).toContain('if (!isBackgroundLaunch(process.argv)) windowActivation.request();');
+  });
+});
+
+describe('local updater launch intent', () => {
+  it('accepts only the fixed packaged macOS command', () => {
+    expect(isLocalUpdateInstallLaunch(['Chat On Steroids', '--install-local-update'], 'darwin', true)).toBe(true);
+    expect(isLocalUpdateInstallLaunch(['Chat On Steroids', '--install-local-update'], 'darwin', false)).toBe(false);
+    expect(isLocalUpdateInstallLaunch(['Chat On Steroids', '--install-local-update'], 'win32', true)).toBe(false);
+    expect(isLocalUpdateInstallLaunch(['Chat On Steroids'], 'darwin', true)).toBe(false);
   });
 });

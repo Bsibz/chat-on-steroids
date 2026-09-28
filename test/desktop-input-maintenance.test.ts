@@ -539,6 +539,42 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect((await h.desktopInput({ id: firstId, owner: '7:planner:1', lifetime: 'temporary-planner', response: 'Plan complete' }, sender, owner)).ok).toBe(true);
     expect(h.remove).toHaveBeenCalledWith(7);
   });
+  it('never closes a borrowed ordinary owner conversation after a worker answer is accepted', async () => {
+    const h = await worker([], undefined, {
+      inputOpenings: { [firstId]: { tab: 7, stage: 'ready', conversationId: secondId } }
+    });
+    const url = `https://chatgpt.com/c/${secondId}`;
+    h.tabs.push({ id: 7, url, active: true });
+    const sender = { tab: { id: 7 }, documentId: 'owner-chat', frameId: 0, url };
+    const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    h.sendMessage.mockResolvedValue({ safe: true, conversationId: secondId, navigationEpoch: 1 } as never);
+
+    expect((await h.desktopInput({
+      id: firstId,
+      owner: '7:owner-chat:1',
+      conversationId: secondId,
+      response: 'Worker complete'
+    }, sender, source)).ok).toBe(true);
+    expect(h.remove).not.toHaveBeenCalled();
+  });
+  it('may close an ordinary helper only when that exact input opening created its tab', async () => {
+    const h = await worker([], undefined, {
+      inputOpenings: { [firstId]: { tab: 7, stage: 'ready', conversationId: secondId, openedByApp: true } }
+    });
+    const url = `https://chatgpt.com/c/${secondId}`;
+    h.tabs.push({ id: 7, url });
+    const sender = { tab: { id: 7 }, documentId: 'owned-helper', frameId: 0, url };
+    const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    h.sendMessage.mockResolvedValue({ safe: true, conversationId: secondId, navigationEpoch: 1 } as never);
+
+    expect((await h.desktopInput({
+      id: firstId,
+      owner: '7:owned-helper:1',
+      conversationId: secondId,
+      response: 'Worker complete'
+    }, sender, source)).ok).toBe(true);
+    expect(h.remove).toHaveBeenCalledWith(7);
+  });
   it.each(['draft', 'pinned', 'pinned-during-proof', 'navigation', 'document', 'rejected'])('keeps a temporary helper after answer publication when %s prevents closing', async reason => {
     const h = await worker([]);
     const url = `https://chatgpt.com/?temporary-chat=true&cos-input=${firstId}`;

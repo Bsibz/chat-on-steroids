@@ -61,6 +61,38 @@ it('materializes a packaged extension into a stable per-user folder', async () =
   expect(await fs.readFile(path.join(first!, 'background.js'), 'utf8')).toBe('updated package');
 });
 
+it('authorizes automatic companion reload only for a complete stable copy matching this exact app version', async () => {
+  base = await makeTempDir('clf-extension-reload-proof-');
+  const resources = path.join(base, 'resources');
+  const bundled = path.join(resources, 'extension');
+  const userData = path.join(base, 'user-data');
+  await fs.mkdir(bundled, { recursive: true });
+  const { APP_VERSION } = await import('../src/main/version.js');
+  await fs.writeFile(path.join(bundled, 'manifest.json'), JSON.stringify({ version: APP_VERSION }));
+  await fs.writeFile(path.join(bundled, 'background.js'), 'verified package');
+
+  Object.defineProperty(process, 'resourcesPath', {
+    configurable: true,
+    writable: true,
+    value: resources
+  });
+  vi.doMock('electron', () => ({
+    app: {
+      isPackaged: true,
+      getPath: (name: string) => (name === 'userData' ? userData : ''),
+      getAppPath: () => path.join(base!, 'not-used')
+    }
+  }));
+
+  const { extensionDir, packagedExtensionReloadVersion } = await import('../src/main/extension-path.js');
+  expect(packagedExtensionReloadVersion()).toBeNull();
+  expect(extensionDir()).toBe(path.join(userData, 'extension'));
+  expect(packagedExtensionReloadVersion()).toBe(APP_VERSION);
+
+  await fs.writeFile(path.join(userData, 'extension', 'manifest.json'), JSON.stringify({ version: '0.0.1' }));
+  expect(packagedExtensionReloadVersion()).toBeNull();
+});
+
 it('repairs a stale destination shape with a complete staged extension instead of failing mid-copy', async () => {
   base = await makeTempDir('clf-extension-repair-');
   const resources = path.join(base, 'resources');

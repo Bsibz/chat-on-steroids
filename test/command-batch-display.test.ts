@@ -36,16 +36,21 @@ async function start(script: string) {
   return { manager, output };
 }
 
-it('keeps framing internal before retention and token truncation in both result representations', async () => {
+function modelOutput(output: Parameters<typeof execCommandResponseText>[0]): string {
+  return execCommandResponseText(output).split('\nOutput:\n').at(-1) ?? '';
+}
+
+it('keeps framing internal before retention and token truncation in the model-visible result', async () => {
   const { output } = await start(`process.stdout.write(${JSON.stringify(wire)}); process.stdout.write('x'.repeat(2_200_000)); process.stdout.write(${JSON.stringify(wire)});`);
   expect(output.rawOutput.toString()).toContain(suffix);
   expect(output.displayOutput?.toString()).not.toContain('clf-batch:');
   expect(output.outputOmittedBytes).toBeGreaterThan(0);
   const text = execCommandResponseText(output);
   const structured = execCommandStructuredOutput(output);
-  expect(text).toContain(structured.output);
   expect(text).not.toContain(marker);
-  expect(structured.output).not.toContain('clf-batch:');
+  expect(modelOutput(output)).not.toContain('clf-batch:');
+  expect(String(structured.output)).toBe(modelOutput(output));
+  expect(String(structured.output)).not.toContain('clf-batch:');
 });
 
 it('projects a delimiter split between initial output and a later stdin poll exactly once', async () => {
@@ -53,12 +58,12 @@ it('projects a delimiter split between initial output and a later stdin poll exa
   const rest = `${suffix.slice(15)}\nhello\n--- exit code 7 ---${suffix}\n`;
   const { manager, output } = await start(`process.stdout.write(${JSON.stringify(first)}); setTimeout(() => { process.stdout.write(${JSON.stringify(rest)}); process.exitCode = 7; }, 900);`);
   expect(output.processId).not.toBeNull();
-  const displays = [String(execCommandStructuredOutput(output).output)];
+  const displays = [modelOutput(output)];
   let current = output;
   while (current.processId !== null) {
     current = await manager.writeStdin({ processId: current.processId, input: '', yieldTimeMs: 1_000, maxOutputTokens: undefined, truncationPolicy: { kind: 'tokens', tokens: 100 } });
-    expect(execCommandResponseText(current)).toContain(execCommandStructuredOutput(current).output);
-    displays.push(String(execCommandStructuredOutput(current).output));
+    expect(String(execCommandStructuredOutput(current).output)).toBe(modelOutput(current));
+    displays.push(modelOutput(current));
   }
   expect(displays.join('')).toBe('--- command 1/1 ---\nhello\n--- exit code 7 ---\n');
   expect(current.exitCode).toBe(7);

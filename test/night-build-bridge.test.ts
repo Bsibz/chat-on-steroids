@@ -78,6 +78,11 @@ function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
 
 function fixtureSource(): NightBuildBridgeDataSource {
   const config = defaultConfig();
+  // This projection counts sessions against the configured local-estimate lines, whatever
+  // those lines currently are. Pin them below the fixture's 450k session so the test proves
+  // the counting itself rather than depending on the shipped calibration of the day.
+  config.sessions.advisoryTokens = 300_000;
+  config.compaction.autoTokens = 300_000;
   config.goal.enabled = true;
   config.goal.mode = 'loop';
   config.multiAgent.enabled = true;

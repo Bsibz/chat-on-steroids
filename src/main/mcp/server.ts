@@ -19,6 +19,8 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createInboundTiming, formatInboundTiming, requestIdFromHeader, withInboundRequestId } from './inbound.js';
+import { rememberInboundRequestOrigin } from '../request-origin-diagnostic.js';
+import { rememberInboundRequestId } from '../request-origin.js';
 import http from 'node:http';
 import type { Socket } from 'node:net';
 import { createMcpHandler } from '@modelcontextprotocol/server';
@@ -422,6 +424,17 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     // The tool dispatch reads this back to join the call to the page request that issued
     // it; see inbound.ts for why it cannot be taken from the MCP call context.
     const requestId = requestIdFromHeader(req.headers['x-request-id']);
+    // Diagnostic-only digest for the bridge's shape comparison on every real surface, plus
+    // the production raw id a direct-A SSE candidate must exactly equal before it may enter
+    // ownership evidence. The approved ownership contract scopes that exact-equality evidence
+    // to Core; Desktop and Plugins keep their existing Fiber/page-model attribution path.
+    // Self-test and tunnel probes are our own traffic, not provider requests, so they are
+    // not recorded as inbound evidence. Both registries are bounded, synchronous and
+    // process-local; nothing here is persisted and no handler waits on either.
+    if (requestId && !selfTest && !tunnelProbe) {
+      rememberInboundRequestOrigin(requestId);
+      if (route.id === 'core') rememberInboundRequestId(requestId);
+    }
     const dispatch = (body?: unknown): void => {
       if (stopping || res.destroyed) {
         if (!res.destroyed) {

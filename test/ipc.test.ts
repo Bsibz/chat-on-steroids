@@ -448,6 +448,26 @@ describe('explicit settings replace the published tool contract', () => {
 });
 
 describe('startup state without secure storage', () => {
+  it('shares one cold secure-storage probe across the whole initial state snapshot', async () => {
+    resetSecretsCacheForTests();
+    await fs.rm(path.join(dir, 'secrets.bin'), { force: true });
+    vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockClear();
+    let release!: (available: boolean) => void;
+    vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockImplementationOnce(
+      () => new Promise<boolean>(resolve => { release = resolve; })
+    );
+
+    const pending = handlers.get('state:get')!(null, undefined) as Promise<any>;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(safeStorage.isAsyncEncryptionAvailable).toHaveBeenCalledTimes(1);
+
+    release(true);
+    const reply = await pending;
+    expect(reply.ok).toBe(true);
+    expect(safeStorage.isAsyncEncryptionAvailable).toHaveBeenCalledTimes(1);
+  });
+
   it('still returns a usable app/bridge state instead of crashing state discovery', async () => {
     resetSecretsCacheForTests();
     vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(false);

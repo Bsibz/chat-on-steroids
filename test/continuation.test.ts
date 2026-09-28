@@ -53,6 +53,7 @@ const {
   CONTINUATION_PRO_WRITING_TTL_MS,
   CONTINUATION_TTL_MS,
   abortContinuation,
+  abortContinuationNow,
   abortContinuationSourceBeforeSendNow,
   attachSummary,
   beginContinuationDestinationSendNow,
@@ -184,16 +185,43 @@ describe('capturing the brief', () => {
   );
 
   it('keeps a pre-send automatic refusal across restart, scoped to its original turn', async () => {
-    const summary = await createSession({ title: 'refused turn', conversationId: CHAT_A });
-    await store.appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'refused' });
-    const ticket = await openContinuationNow(summary.id, CHAT_A, true);
-    expect(await abortContinuationSourceBeforeSendNow(ticket.token, 'handoff_never_sent')).toBe(true);
-    await store.flushSessions();
-    await resetSessionStoreForTests();
-    const restored = (await getSession(summary.id))!;
-    expect(store.autoCompactionReady({ ...restored, contextTokens: 1_000_000 })).toBe(false);
-    await store.appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 'next' });
-    expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_000_000 })).toBe(true);
+    const config = defaultConfig();
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true } });
+    try {
+      const summary = await createSession({ title: 'refused turn', conversationId: CHAT_A });
+      await store.appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'refused' });
+      const ticket = await openContinuationNow(summary.id, CHAT_A, true);
+      expect(await abortContinuationSourceBeforeSendNow(ticket.token, 'handoff_never_sent')).toBe(true);
+      await store.flushSessions();
+      await resetSessionStoreForTests();
+      const restored = (await getSession(summary.id))!;
+      expect(store.autoCompactionReady({ ...restored, contextTokens: 1_000_000 })).toBe(false);
+      await store.appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 'next' });
+      expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_000_000 })).toBe(true);
+    } finally {
+      await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: true, maxWorkers: 3 } });
+    }
+  });
+
+  it('latches an explicitly cancelled automatic ticket to its exact turn', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true } });
+    try {
+      const summary = await createSession({ title: 'cancelled turn', conversationId: CHAT_A });
+      await store.appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'cancel-turn' });
+      const ticket = await openContinuationNow(summary.id, CHAT_A, true);
+      expect(await abortContinuationNow(ticket.token, 'cancelled')).toBe(true);
+      expect(continuationByToken(ticket.token)).toMatchObject({ state: 'aborted' });
+      await store.flushSessions();
+      await resetSessionStoreForTests();
+      // Cancel means cancel: the unchanged working turn must not refile behind the decision,
+      // even at the long-chat volume where the trigger would otherwise be well passed.
+      expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_300_000 })).toBe(false);
+      await store.appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 'next' });
+      expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_300_000 })).toBe(true);
+    } finally {
+      await saveConfig({ ...config, multiAgent: { ...config.multiAgent, enabled: true, maxWorkers: 3 } });
+    }
   });
 
   it('aborts only while the source checkpoint still proves no prompt was sent', async () => {

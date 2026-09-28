@@ -207,7 +207,7 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     });
     expect(transcript.currentTurn).toEqual({ state: 'generating', turnOrigin: 2 });
     expect(transcript.items.map((item) => [item.role, item.revisionSeq, item.turnOrigin, item.state])).toEqual([
-      ['user', 1, null, undefined],
+      ['user', 1, 2, undefined],
       ['assistant', 8, 2, 'streaming']
     ]);
     const encoded = JSON.stringify(transcript);
@@ -217,6 +217,40 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     expect(encoded).not.toContain('requestTurns');
     expect(encoded).not.toContain('providerMessageId');
     expect(encoded).not.toContain('renderedHtml');
+  });
+
+  it('projects revised visible commentary once at its first chronological position', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root);
+    await writeCanonical(fixture.dir, {
+      seq: 8, origin: 6, time: 600, source: 'extension', kind: 'assistant_message',
+      turnId: 'turn-0000001', messageId: 'message-assistant-0001',
+      providerMessageId: 'provider-message-0001',
+      message: stored('Streaming answer'), state: 'streaming', final: false
+    });
+    await writeJournal(fixture.dir, [
+      { seq: 2, time: 200, source: 'extension', kind: 'turn_start', turnId: 'turn-0000001' },
+      { seq: 3, time: 300, source: 'extension', kind: 'progress', turnId: 'turn-0000001',
+        progressId: 'g-live-1#p0', message: stored('Checking the bridge') },
+      { seq: 5, origin: 3, time: 300, source: 'extension', kind: 'progress', turnId: 'turn-0000001',
+        progressId: 'g-live-1#p0', message: stored('Checking the bridge and recorder') },
+      { seq: 7, time: 700, source: 'extension', kind: 'progress', turnId: 'turn-0000001',
+        progressId: 'g-live-1#p1', message: stored('Streaming answer') }
+    ]);
+
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.items.map((item) => [item.text, item.originSeq, item.revisionSeq, item.state])).toEqual([
+      ['Hello from ordinary ChatGPT', 1, 1, undefined],
+      ['Checking the bridge and recorder', 3, 5, 'streaming'],
+      ['Streaming answer', 6, 8, 'streaming']
+    ]);
+    const commentary = transcript.items[1]!;
+    expect(commentary).toMatchObject({ role: 'assistant', authoredAt: 300, turnOrigin: 2 });
+    expect(commentary.itemId).not.toContain('g-live-1#p0');
+    // Exact provider prose is stronger than the DOM fallback and suppresses its duplicate.
+    expect(transcript.items.filter((item) => item.text === 'Streaming answer')).toHaveLength(1);
   });
 
   it('excludes worker, helper and malformed internal origins from the ordinary Chat catalog', async () => {
@@ -280,7 +314,7 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     ].join('\n') + '\n');
     const poisoned = await source.transcript({ conversation: conversation!.handle, limit: 100 });
     expect(poisoned.projection.observedHighWaterSeq).toBe(10);
-    expect(poisoned.currentTurn).toEqual({ state: 'terminal', outcome: 'stopped', endedAt: 900 });
+    expect(poisoned.currentTurn).toEqual({ state: 'terminal', outcome: 'stopped', endedAt: 900, turnOrigin: 2 });
   });
 
   it('uses revision seq as incremental cursor while preserving first-appearance origin', async () => {
@@ -311,7 +345,7 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     expect(delta.items[0]).toMatchObject({
       role: 'assistant', originSeq: 3, revisionSeq: 9, state: 'final', finalContentSeq: 9, text: 'Final answer'
     });
-    expect(delta.currentTurn).toEqual({ state: 'terminal', outcome: 'completed', endedAt: 900 });
+    expect(delta.currentTurn).toEqual({ state: 'terminal', outcome: 'completed', endedAt: 900, turnOrigin: 2 });
   });
 
   it('rebuilds installed 2.1.14 turn identity in memory when debounced metadata lags durable history', async () => {
@@ -400,6 +434,66 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     const [conversation] = await source.list();
     const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
     expect(transcript.items.find((item) => item.role === 'user')?.authoredAt).toBe(77);
+  });
+
+  it('accepts the September search-renderer fallback turn id on canonical messages without broadening chat ids', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root);
+    await writeCanonical(fixture.dir, {
+      seq: 1, time: 100, source: 'extension', kind: 'user_message',
+      turnId: 'fallback-turn-7:0:user',
+      messageId: 'message-user-0001', message: stored('Hello from ordinary ChatGPT')
+    });
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.items.find((item) => item.role === 'user')).toMatchObject({
+      text: 'Hello from ordinary ChatGPT',
+      turnOrigin: 2
+    });
+
+    await writeCanonical(fixture.dir, {
+      seq: 1, time: 100, source: 'extension', kind: 'user_message',
+      turnId: 'fallback-turn-7:0:owner',
+      messageId: 'message-user-0001', message: stored('Hello from ordinary ChatGPT')
+    });
+    await expect(source.transcript({ conversation: conversation!.handle, limit: 100 }))
+      .rejects.toThrow('chat_transport_message_turn_invalid');
+  });
+
+  it('projects DOM-only screenshot attachments whose byte size is unknown without 500ing the transcript', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root);
+    await writeCanonical(fixture.dir, {
+      seq: 1, time: 100, source: 'extension', kind: 'user_message',
+      turnId: 'fallback-turn-7:0:user',
+      messageId: 'message-user-0001',
+      message: stored('Two screenshots'),
+      attachments: [
+        {
+          id: 'visible:message-user-0001:0',
+          name: 'Image 1',
+          size: 0,
+          mimeType: 'image/webp',
+          preview: 'data:image/webp;base64,QUJDRA=='
+        },
+        {
+          id: 'visible:message-user-0001:1',
+          name: 'Image 2',
+          size: 0,
+          mimeType: 'image/webp',
+          preview: 'data:image/webp;base64,RUZHSA=='
+        }
+      ]
+    });
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.items.find((item) => item.role === 'user')?.attachments).toEqual([
+      expect.objectContaining({ name: 'Image 1', mimeType: 'image/webp', size: 0, preview: 'data:image/webp;base64,QUJDRA==' }),
+      expect.objectContaining({ name: 'Image 2', mimeType: 'image/webp', size: 0, preview: 'data:image/webp;base64,RUZHSA==' })
+    ]);
+    expect(JSON.stringify(transcript)).not.toContain('visible:message-user-0001');
   });
 
   it('fails closed on a multi-chat lineage without a proven current RESUME boundary', async () => {
@@ -510,7 +604,45 @@ describe('Night Build Chat Transport v1 durable projection', () => {
     const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
     const [conversation] = await source.list();
     const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
-    expect(transcript.currentTurn).toEqual({ state: 'terminal', outcome: 'stopped', endedAt: 900 });
+    expect(transcript.currentTurn).toEqual({ state: 'terminal', outcome: 'stopped', endedAt: 900, turnOrigin: 2 });
+  });
+
+  it('lets durable turn_end settle stale active metadata and only the latest assistant row', async () => {
+    const root = await tempRoot();
+    const fixture = await writeFixture(root, { active: true, historySeq: 12 });
+    await writeCanonical(fixture.dir, {
+      seq: 8, origin: 3, time: 300, source: 'extension', kind: 'assistant_message',
+      turnId: 'turn-0000001', messageId: 'message-assistant-0001',
+      message: stored('Interim answer'), state: 'streaming', final: false
+    });
+    await writeCanonical(fixture.dir, {
+      seq: 11, origin: 9, time: 700, source: 'extension', kind: 'assistant_message',
+      turnId: 'turn-0000001', messageId: 'message-assistant-0002',
+      message: stored('Completed answer'), state: 'streaming', final: false
+    });
+    await writeJournal(fixture.dir, [
+      { seq: 2, time: 200, source: 'extension', kind: 'turn_start', turnId: 'turn-0000001' },
+      { seq: 12, time: 900, source: 'extension', kind: 'turn_end', turnId: 'turn-0000001', outcome: 'completed' }
+    ]);
+    fixture.meta['activeTurnId'] = 'turn-0000001';
+    fixture.meta['__historySeq'] = 12;
+    fixture.meta['updatedAt'] = 1_100;
+    await fs.writeFile(path.join(fixture.dir, 'meta.json'), JSON.stringify(fixture.meta));
+
+    const source = createNightBuildChatTransportSource(root, 'test-generation-secret');
+    const [conversation] = await source.list();
+    const transcript = await source.transcript({ conversation: conversation!.handle, limit: 100 });
+    expect(transcript.currentTurn).toEqual({
+      state: 'terminal',
+      outcome: 'completed',
+      endedAt: 900,
+      turnOrigin: 2
+    });
+    const assistants = transcript.items.filter((item) => item.role === 'assistant');
+    expect(assistants.map((item) => [item.text, item.state])).toEqual([
+      ['Interim answer', 'streaming'],
+      ['Completed answer', 'final']
+    ]);
   });
 
   it('collapses provider aliases with first identity and latest terminal content', async () => {
@@ -1306,7 +1438,8 @@ describe('Night Build Chat Transport v1 local server', () => {
       phase: 'finished',
       metric: '✓ 4.2s',
       title: 'Running focused tests',
-      changedFiles: 1
+      changedFiles: 1,
+      changedPaths: ['~/secret.ts']
     });
     expect(recent.activity[0]!.activityId).not.toContain('call-CANARY-proc');
     const encoded = JSON.stringify(recent);

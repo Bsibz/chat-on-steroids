@@ -19,6 +19,7 @@ interface DomApi {
   send(options?: { acceptanceTimeoutMs?: number; stillCurrent?: () => boolean; beforeSend?: () => Promise<boolean> }): Promise<boolean>;
   selectModelSettings(model: string | null, effort: string | null, current?: () => boolean): Promise<boolean>;
   uploadImages(images: Array<{ name: string; dataUrl: string }>, current?: () => boolean, draft?: ReturnType<DomApi['captureComposerDraft']>, files?: File[]): Promise<boolean>;
+  messages(): Array<{ id: string; role: 'user' | 'assistant'; text: string; turnId: string | null }>;
 }
 let dom: JSDOM;
 let document: Document;
@@ -696,6 +697,50 @@ describe('rendered temporary-chat state independent of language', () => {
 
 
 describe('locale-independent provider composer evidence', () => {
+  it('reads exact stamped messages and busy state from the current ChatGPT shell', () => {
+    document.body.innerHTML = `
+      <main data-app-shell-main-surface>
+        <div data-thread-find-target="conversation">
+          <div data-turn-key="shell-user" data-clf-shell-running="/" data-clf-fiber-turn="scan:0">
+            <div data-content-search-turn-key="shell-turn">
+              <div data-content-search-unit-key="shell-turn:0:user"
+                data-clf-fiber-turn="scan:0" data-clf-fiber-message="scan:0:shell-user-message">
+                <div>Shell question</div>
+              </div>
+              <div><div data-markdown-text-style="assistant-message">Public preamble without DOM identity</div></div>
+              <div data-content-search-unit-key="shell-turn:2:assistant"
+                data-clf-fiber-turn="scan:0" data-clf-fiber-message="scan:0:shell-answer-message">
+                <div data-markdown-text-style="assistant-message">Shell answer</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <form data-chatgpt-composer>
+          <div contenteditable="true" role="textbox" data-composer-markdown></div>
+          <button type="submit">Send</button>
+        </form>
+      </main>`;
+    expect(api.messages()).toEqual([
+      expect.objectContaining({
+        id: 'shell-user-message',
+        role: 'user',
+        text: 'Shell question',
+        turnId: 'shell-turn'
+      }),
+      expect.objectContaining({
+        id: 'shell-answer-message',
+        role: 'assistant',
+        text: 'Shell answer',
+        turnId: 'shell-turn'
+      })
+    ]);
+    expect(api.messages().some(message => message.text.includes('Public preamble'))).toBe(false);
+    expect(api.generating()).toBe(true);
+    document.querySelector('[data-turn-key]')!.removeAttribute('data-clf-shell-running');
+    expect(api.generating()).toBe(false);
+    expect(api.sendButton()?.getAttribute('type')).toBe('submit');
+  });
+
   it.each([['ja', '送信', '回答を停止'], ['ar', 'إرسال', 'إيقاف الإجابة']])('uses provider Send and Stop identities in %s', (language, sendLabel, stopLabel) => {
     document.documentElement.lang = language;
     document.documentElement.dir = language === 'ar' ? 'rtl' : 'ltr';

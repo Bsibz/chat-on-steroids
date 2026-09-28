@@ -177,7 +177,7 @@ describe('Codex unified exec runtime parity', () => {
     expect(env.CODEX_CI).toBe('1');
   });
 
-  it('keeps structured exec output under the same model budget as the text representation', () => {
+  it('keeps structured Code Mode output under the same model budget as the text representation', () => {
     const output: ExecCommandToolOutput = {
       chunkId: 'cap-test',
       wallTimeMs: 1,
@@ -191,6 +191,8 @@ describe('Codex unified exec runtime parity', () => {
     };
     const text = execCommandResponseText(output);
     const structured = execCommandStructuredOutput(output) as { output: string };
+    expect(text.length).toBeLessThan(output.rawOutput.length);
+    expect(text).toContain('truncated');
     expect(structured.output.length).toBeLessThan(output.rawOutput.length);
     expect(structured.output).toContain('truncated');
     expect(text).toContain(structured.output);

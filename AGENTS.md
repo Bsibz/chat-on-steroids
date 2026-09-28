@@ -189,7 +189,7 @@ define the tool/config/wire contract. README and worklogs are secondary and can 
 | Roots | None. | Root-requiring capabilities cannot be published usefully until a root is approved. |
 | Tool capabilities | Current `defaultConfig()` starts all Core capability flags on; read-only off. | Omitted legacy flags use conservative `DEFAULT_CAPABILITIES`. Malformed existing config is conservative recovery, not fresh consent. |
 | Recording | On, 30-day retention. | Explicit Off stays Off; retention still applies to old history. |
-| Context / compaction | Advisory 400,000; limit rounded from advisory × 4/3; auto-compaction on at advisory. | Estimated local units. Automatic execution additionally requires live work, current ownership and eligible model/role. |
+| Context / compaction | Advisory 750,000; limit rounded from advisory × 4/3 (1,000,000); automatic compaction is off until the owner enables it, then fires at the advisory. | Estimated local units — a local recorder heuristic, never provider context occupancy. Automatic execution additionally requires live work, current ownership and eligible model/role. |
 | Multi-agent | On, 2 simultaneous slot-holding workers **per family**, configured hard max 8. | Legacy absent enabled/allow-unattributed fields remain false. Existing choices stay exact. |
 | Unattributed allowance | True on first launch. | Relaxes ambiguity fences only; known blocked/retired/superseded ownership stays enforced. |
 | Recover ordinary/agent tabs | Off. | Goal/Loop can independently justify recovery; history alone cannot. |
@@ -485,17 +485,32 @@ For a reserved New Chat opening, the shared `/input/bind` route commits its exac
 only that claim retires, and its promoted conversation/document epoch precedes correlation or event publication.
 Ownership acknowledgement is separate from slow transcript/image writes.
 
-`usage.js` can also project an exact conversation/request pair from a complete live POST
-conversation SSE event before Fiber exposes it. Reads are bounded to 4 MiB / 15 minutes,
-two simultaneous clones and 16 request ids per stream; only server metadata is accepted.
-The native WebSocket `conversation-turn-stream` handoff uses the same complete-event parser,
-requiring its outer conversation to match the inner event. It observes existing messages on
-ChatGPT secure sockets without sending, subscribing or polling; envelopes and frames are bounded.
-A 64-pair document cache deduplicates both transports and replays IDs at content readiness.
-Content requires the matching route and document epoch, retaining one-shot stream proof through
-temporary ACK failures for at most 15 minutes using the existing observer/backoff. Missing stream
-metadata retains the Fiber path. Fetch reattachment at DOM readiness captures each downstream
-wrapper separately and deduplicates responses to avoid recursion through page instrumentation.
+Request ownership accepts the normalized inbound HTTP `x-request-id` joined to
+`message.metadata.request_id` in ChatGPT's page model, observed through bounded Fiber evidence.
+A second exact join covers the provider's own conversation stream: a successful, unredirected,
+same-origin HTTPS `/backend-api/conversation` POST whose parsed `text/event-stream` frame carries
+`input_message.metadata.request_id` under a valid root `conversation_id` equal to the current
+`/c/<id>` route, with `input_message.author.role === "user"`. That observation is matching
+evidence only: the bridge first prepares a short-lived one-shot commit only after its scalar id
+exactly equals a fresh normalized inbound Core MCP request id. The extension then re-reads the
+real Chrome route/document while holding that tab's serialized operation and only redeems the
+commit if the same tab, document, conversation and navigation epoch still own it at that final
+browser authorization point; a navigation that starts afterwards cannot retroactively change
+the historical owner of the already-proved request. Preparation alone never records a durable
+owner. Matching facts live in bounded five-minute process-local
+registries that grant nothing by themselves. `usage.js` also records bounded, value-free
+request-envelope shapes — transport, endpoint class,
+envelope type names, request-id property paths and casing, conversation-path agreement, an
+author role enum, and a one-way SHA-256 fingerprint per bounded candidate id tied to its property
+path when page crypto is available — as diagnostic evidence for local dogfood. Those shape records
+are quarantined from ownership: the bridge compares each fingerprint only for exact equality
+against a bounded five-minute process-local registry of recent inbound request-id digests, logs
+`inbound_match`/`matched_request_path` as structure, discards the fingerprint before storing or
+rendering, and the result feeds no correlation, no trace stage and no identity decision; only the
+narrow direct-A parser above may feed a request id into the equality gate, and a shape replay can
+never do so. Missing page-model metadata leaves ownership unresolved. Fetch reattachment at DOM
+readiness captures each downstream wrapper separately and deduplicates responses to avoid
+recursion through page instrumentation.
 Popup request diagnostics derive from the newest exact native/Fiber turn; older scanned turns
 cannot leave a stale current-ID success. Worker queue custody, app receipt, owner confirmation
 and actual recorded tool activity remain distinct facts.
@@ -669,8 +684,11 @@ returns output and a process id; `write_stdin` continues that same process, send
 or drains output. Caller isolation is in `ownership.ts`, not separate managers per request.
 
 Every successful launch also returns a session id when it finishes immediately. Empty
-`write_stdin` calls can reread completed output after direct polling or automatic delivery;
-structured results keep `session_id` for running work and use `completed_session_id` for
+`write_stdin` calls poll a running session and drain its unread output. Completed exec output
+replay is suppressed by default: an empty poll omits a body an earlier result already
+delivered, and exact retained recovery requires `reread_retained=true`. Rereading retained
+output never reruns the command, and `duplicate_output_omitted` marks the omitted duplicate.
+Structured results keep `session_id` for running work and use `completed_session_id` for
 finished work, so existing polling loops still stop. Either id is the `write_stdin` input.
 On every OS, structured `output_replayed` marks a retained reread and `benign_exit` marks a
 proven expected non-zero result; raw exit codes remain intact.
@@ -734,7 +752,8 @@ Completed results can follow automatically in later exact-owner **outer** tool r
 one bounded UTF-8-safe page within remaining response space. An offer does not drain bytes.
 Successful local publication followed by a later exact-owner invocation acknowledges the page,
 even if both calls share a generation request id; older concurrent calls cannot. Failed
-publication reoffers it. Explicit `write_stdin` can drain the remaining unacknowledged suffix.
+publication reoffers it. Explicit `write_stdin` can drain the remaining unacknowledged suffix;
+once the result is retained, exact recovery uses `reread_retained=true`.
 After 120 seconds without attendance, a running process can contribute one owner-scoped
 reminder; reading diagnostic state does not consume it. Blocked/compacting/superseded sources
 and nested code-mode calls do not receive or acknowledge these automatic pages.
@@ -1390,7 +1409,7 @@ while leaving ChatGPT's messages, model execution and account permissions with t
 | --- | --- |
 | `chatgpt-dom.js` | All provider selectors and DOM-shape assumptions, composer/upload/model/turn primitives. |
 | `fiber.js` | Bounded MAIN-world React evidence: messages, request ids, generation/model state and installed connector declarations. |
-| `usage.js` | Bounded account-usage and exact live stream request-origin observation. |
+| `usage.js` | Bounded allowlisted account-usage observation, value-free request-envelope diagnostics and the exact direct-A SSE candidate. |
 | `content.js` | Isolated-world recording, exact turn/navigation ownership, input/command execution, native-page companion UI. |
 | `background.js` | MV3 journal and HTTP transport, tab/document registry, command elections and durable ACK custody. |
 | `popup.*`, `overlay.css` | Pair/reconnect status and extension-owned presentation; no local tool authority. |
@@ -1896,18 +1915,26 @@ chats retain their no-reload behavior for these blocking notices; no new grant c
 Unattributed recovery keeps a bounded incident per exact unresolved request id, with one
 shared timer. At the first filed unattributed call it freezes the chats then shown Active,
 using the same shared activity predicate as the renderer. One candidate is eligible after 15 seconds;
-multiple candidates get a fixed one-minute window. The second and final attempt is due five
-minutes after that incident began, only if new unattributed work on that same request started
-after the first browser attempt and the request remains unresolved. Another request cannot
-renew this budget. Headerless activity cannot prove the same request and gets no second attempt.
+multiple candidates get a fixed one-minute window. The incident can authorize an action only
+when exactly one candidate remains eligible after revalidation; an ambiguous cohort spends no
+browser action. Each incident can authorize at most one browser action total. An explicit
+repair-check reply grants observer/helper repair only after two checks prove the same current
+responsive state (safe/generating flags, revision, nullable turn/question ids, conversation and
+page epoch) and the tab URL/document identity still match. Any incomplete or vetoed reply blocks
+action; only a missing reply retains bounded reload recovery. A positively identified responsive
+page, including an active generation, is never reloaded. The five-minute pass only
+diagnoses an unresolved request and cannot authorize another browser action. Unattributed recovery
+respects the shared browser-action cooldown both before handout and again at the final claim.
+Another request cannot renew this budget. Headerless activity cannot prove the same request.
 Exactly attributed current-owner MCP calls remove their chat from the original cohort; exact
 correlation resolves the matching request. The cohort survives activity-label expiry, but never
 Stop, block, a completed/replaced turn, session rebind or supersession. Later active chats do not
 join it. These deadlines follow the recorder's separate 20-second request-id grace.
 Attribution repair handouts retain their token after an absent acknowledgement. The extension
 claims the server-held attempt after its tab scan and immediately before its browser action;
-late attribution or lost owner authority denies that claim. A reload receipt proves the action,
-not that attribution recovered. Other repair reasons retain their own delivery policy.
+late attribution or lost owner authority denies that claim. A reload receipt proves the action;
+an observer-repair receipt proves only that the helpers attached. Neither proves that request
+attribution recovered. Other repair reasons retain their own delivery policy.
 Silence, missing-tab, stalled-tab and queued/Goal repairs also use that exact pre-action claim. Unclaimed
 offers retain one token; a claimed action is not reissued merely because its ACK is absent.
 A responsive page flushes native progress and Stop before the main claim, then rechecks its
@@ -2010,7 +2037,10 @@ awaiting-summary -> awaiting-chat -> claimed -> committing -> committed
    chat has live work. Recent MCP activity attributed to this exact current session/frontend
    qualifies through the existing activity grant even when the page reports no turn. Recheck
    that grant after reads; expired/future grants, canonical finals, Stop, dismissed pages and
-   superseded frontends cannot earn a ticket. Idle old history does not start it. Workers and exact Pro are excluded
+   superseded frontends cannot earn a ticket. Idle old history does not start it. An automatic
+   ticket lost before its prompt is sent, explicitly cancelled, or given up after its handover
+   deadline persists one exact-turn refusal, so the unchanged working turn cannot refile behind
+   that decision; a later turn or frontend lifts it. Workers and exact Pro are excluded
    from automatic compaction; workers do not self-compact, and Pro may compact manually.
    A transport error may also trigger it for the exact latest failed turn above the threshold.
    The failure must remain the latest work boundary, without a final, new question or reopened
@@ -2123,6 +2153,18 @@ mistaken for B's completed turn (§21 records the remaining ledger gap).
 
 Legacy shadow repair requires exact old continuation proof. It may repair missing projections;
 it must not guess a new rebind, delete history or become the path for new continuations.
+
+The cross-app owner-control lane (`night-build-chat-owner-control-v1`, a separate authenticated
+loopback generation beside the frozen `night-build-chat-control-v3`) exposes this transaction to
+Night Build without a parallel ledger. A request names the existing opaque conversation handle;
+CoS resolves it and revalidates the exact session/frontend around every awaited owner call, and
+fails closed for stale, superseded, worker, helper or blocked chats. Mutations reuse the same
+owners the app's controls do: `updateConfig` plus automatic-ticket cancellation for the app-wide
+switch, the per-chat Goal/Loop switch, `compactSession`, and the durable cancellation
+(`cancelled:false` once the commit barrier crossed). State separates the configured app-wide
+switch from the exact chat's effective answer (the exact-Pro exemption), reports the local
+recorder trigger threshold — never provider context occupancy — and one mode plus one compaction
+wall. v3's discovery file, header and capability list stay exact for installed clients.
 
 ## 16. Multiple prime families and reusable workers
 
@@ -2534,9 +2576,8 @@ suppress the Goal/Loop lifecycle. A new native question or turn retires the prec
 receipt from the composer fallback; its recorded history remains available in developer mode.
 After attribution's first attempt, every still-unproven member of its original cohort keeps
 the countdown to the incident's existing five-minute end, even without another unknown call.
-That row remains visible and says awaiting attribution/check unless the original second-attempt
-conditions already permit a reload. Its label then names the reload without changing its schedule.
-Exact MCP proof removes only its chat; later chats stay out.
+That row remains visible and says awaiting attribution/check through the diagnostic pass; it
+never becomes a second reload countdown. Exact MCP proof removes only its chat; later chats stay out.
 
 Session metadata owns `titleSource` (authored fallback, provider, manual). The preview uses only
 the first authored user message, at one 80-character bound; injected instructions/AGENTS frames
@@ -2946,9 +2987,18 @@ insufficient. A dirty-tree snapshot request does not authorize exposing all loca
 
 `update.ts` checks immediately and every six hours with one in-flight pass. Download to a
 partial file, verify SHA-256 before staging/adoption, and rehash at ordinary quit before handing
-off. Windows NSIS/Linux AppImage can apply automatically; macOS/DEB present the supported manual
-path, development does not stage. Explicit install may relaunch; ordinary quit does not force
-relaunch. Failed checks never replace a verified staged candidate with unverified bytes.
+off. Windows NSIS/Linux AppImage can apply automatically; public macOS/DEB releases present the
+supported manual path. A packaged macOS app may additionally consume the fixed owner-local
+`LocalUpdateChannel`: exact versioned ZIP name, architecture, bundle id and manifest SHA-256 are
+required. Owner-local publish signs a temporary dogfood copy with an Apple Development Team-bound
+designated requirement; public macOS artifacts remain ad-hoc/unnotarized. Only an explicit Install
+press or the fixed controller command launches the post-quit helper, which rehashes, verifies
+bundle seal/team/requirement/id/version/architecture, swaps the exact running bundle with rollback,
+and relaunches that same path. Packaged macOS also accepts the fixed `--install-local-update` owner command from
+startup or a losing second instance; it carries no candidate identity and may only request the
+same verified local-channel install after normal bootstrap. `scripts/publish-local-macos-update.mjs`
+verifies/package-smokes the candidate and publishes the local artifact without touching the
+installed app. Failed checks never replace a verified staged candidate with unverified bytes.
 
 CI verifies supported OS families; native `release.yml` builds/smokes all six targets, then
 assembles installers, extension ZIP, native-sources archive and `SHA256SUMS.txt`. `publish.yml`

@@ -372,18 +372,43 @@ function resolvedBinary(config: Config): string | null {
 
 async function buildState(): Promise<AppState> {
   const config = getConfig();
+  const debugStartupState = process.env.CLF_DEBUG === '1';
+  const observe = async <T>(label: string, promise: Promise<T>): Promise<T> => {
+    const startedAt = Date.now();
+    try {
+      const value = await promise;
+      if (debugStartupState) logInfo(`renderer state probe ${label} ready in ${Date.now() - startedAt}ms`);
+      return value;
+    } catch (error) {
+      if (debugStartupState) logInfo(`renderer state probe ${label} failed in ${Date.now() - startedAt}ms`);
+      throw error;
+    }
+  };
+  // These are independent read-only snapshots. Start them together so the secret reads and
+  // bridge status all share secrets.ts's one in-flight OS-keychain availability probe. Awaiting
+  // them one-by-one defeats that single-flight on a cold macOS profile: the first probe settles,
+  // clears its flight, then each later read can wake Keychain again before the renderer gets its
+  // first state. Packaged startup proved that sequence could exceed the GUI readiness bound even
+  // though the renderer itself was healthy.
+  const [secureStorage, hasApiKey, hasGoalKey, hasCustomProviderKey, bridge] = await Promise.all([
+    observe('secure-storage', secureStorageStatus()),
+    observe('setup-key', hasSecret(setupApiKeySlot(config.tunnel.profileId))),
+    observe('goal-key', hasSecret('openRouterApiKey')),
+    observe('custom-key', hasSecret('customProviderApiKey')),
+    observe('bridge', bridgeStatus())
+  ]);
   return {
     config,
     status: getStatus(),
     platform: hostPlatformInfo(),
     loginStartupAvailable: supportsLoginStartup(process.platform, app.isPackaged),
-    secureStorage: await secureStorageStatus(),
-    hasApiKey: await hasSecret(setupApiKeySlot(config.tunnel.profileId)),
-    hasGoalKey: await hasSecret('openRouterApiKey'),
-    hasCustomProviderKey: await hasSecret('customProviderApiKey'),
+    secureStorage,
+    hasApiKey,
+    hasGoalKey,
+    hasCustomProviderKey,
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
-    bridge: await bridgeStatus(),
+    bridge,
     update: updateStatus(),
     desktopAccess: getMacOSDesktopAccess()
   };
@@ -435,6 +460,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   registerPluginIpc(handle, getWindow);
   handle('usage:get', () => usageOverview());
   handle('state:get', async () => {
+    if (process.env.CLF_DEBUG === '1') logInfo('renderer state requested');
     const state = await buildState();
     // Native package smoke uses this as the end-to-end renderer readiness barrier. Unlike
     // `did-finish-load`, it can only happen after the renderer's first IPC request has completed

@@ -1,6 +1,6 @@
 {
   "name": "chat-on-steroids",
-  "version": "2.1.27",
+  "version": "2.1.44",
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",
   "author": "Chat On Steroids",
@@ -46,6 +46,9 @@
     "dist:dir:linux:x64": "node scripts/package.mjs --platform linux --arch x64 --dir",
     "dist:dir:linux:arm64": "node scripts/package.mjs --platform linux --arch arm64 --dir",
     "dist:dir:linux": "node scripts/package.mjs --platform linux --arch x64,arm64 --dir",
+    "local:update:mac": "node scripts/publish-local-macos-update.mjs --build",
+    "local:update:mac:publish": "node scripts/publish-local-macos-update.mjs",
+    "local:update:mac:install": "open -n \"/Applications/Chat On Steroids.app\" --args --install-local-update",
     "test:kill": "node scripts/kill-stray-vitest.mjs"
   },
   "dependencies": {

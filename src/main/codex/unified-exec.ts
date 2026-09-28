@@ -574,6 +574,7 @@ export interface ProcessCompletion {
 export interface ExecCommandToolOutput {
   completedSessionId?: number;
   replayed?: boolean;
+  replaySuppressed?: boolean;
   benignExit?: boolean;
   /** Exact process lifetime for recording; never serialized into the MCP response. */
   completion?: Promise<ProcessCompletion>;
@@ -623,11 +624,17 @@ export function execCommandResponseText(output: ExecCommandToolOutput): string {
   if (output.exitCode !== null) sections.push(`Process exited with code ${output.exitCode}`);
   if (output.processId !== null) sections.push(`Process running with session ID ${output.processId}`);
   if (output.completedSessionId !== undefined) sections.push(`Completed session ID: ${output.completedSessionId}`);
-  if (output.replayed) sections.push('Retained output (already completed; command was not run again):');
+  if (output.replayed) {
+    sections.push(output.replaySuppressed
+      ? 'Retained output was already delivered by an earlier tool result; duplicate body omitted. Set reread_retained=true only when an exact reread is genuinely needed.'
+      : 'Retained output (already completed; command was not run again):');
+  }
   if (output.benignExit) sections.push('This non-zero exit is an expected command result, not a failure.');
   if (output.originalTokenCount !== null) sections.push(`Original token count: ${output.originalTokenCount}`);
-  sections.push('Output:');
-  sections.push(truncatedOutput(output, modelOutputMaxTokens(output)));
+  if (!output.replaySuppressed) {
+    sections.push('Output:');
+    sections.push(truncatedOutput(output, modelOutputMaxTokens(output)));
+  }
   return sections.join('\n');
 }
 
@@ -641,11 +648,15 @@ export function execCommandStructuredOutput(output: ExecCommandToolOutput): Reco
     ...(output.completedSessionId === undefined ? {} : { completed_session_id: output.completedSessionId }),
     ...(output.benignExit ? { benign_exit: true } : {}),
     ...(output.replayed ? { output_replayed: true } : {}),
+    ...(output.replaySuppressed ? { duplicate_output_omitted: true } : {}),
     ...(output.originalTokenCount === null ? {} : { original_token_count: output.originalTokenCount }),
-    // This adapter emits structuredContent beside the text result, so both representations
-    // must obey the same policy/default budget. Returning the retained raw buffer here made
-    // the schema path bypass the model-visible truncation entirely.
-    output: truncatedOutput(output, modelOutputMaxTokens(output))
+    // This is intentionally also present in the ordinary text result. MCP hosts do not
+    // necessarily consume both representations: ChatGPT Code Mode reads the declared
+    // structured result while ordinary MCP clients can read content. Live 2.1.40 dogfood
+    // proved that removing this field made nested exec_command calls succeed but hid stdout
+    // from Code Mode. Keep both transport representations under the same truncation budget;
+    // replay suppression still makes a completed duplicate body empty unless explicitly reread.
+    output: output.replaySuppressed ? '' : truncatedOutput(output, modelOutputMaxTokens(output))
   };
 }
 
@@ -671,6 +682,7 @@ export interface ExecCommandRequest {
 export interface WriteStdinRequest {
   processId: number;
   input: string;
+  rereadRetained?: boolean;
   yieldTimeMs: number;
   maxOutputTokens: number | undefined;
   truncationPolicy: TruncationPolicy;
@@ -881,9 +893,14 @@ export class UnifiedExecProcessManager {
       const saved = this.completed.get(request.processId);
       if (!saved) return null;
       if (identity && saved.identity !== identity) throw UnifiedExecError.unknownProcessId(request.processId);
-      if (request.input !== '') throw UnifiedExecError.processFailed('Process already completed; no input was sent. Use empty chars to read its retained output.');
-      return { ...saved, chunkId: generateChunkId(), wallTimeMs: 0, processId: null,
-        completedSessionId: request.processId, replayed: true, originalTokenCount: approxTokenCount((saved.displayOutput ?? saved.rawOutput).toString('utf8')),
+      if (request.input !== '') throw UnifiedExecError.processFailed('Process already completed; no input was sent. Use empty chars with reread_retained=true to deliberately reread its retained output.');
+      const retained = saved.displayOutput ?? saved.rawOutput;
+      const expose = request.rereadRetained === true;
+      return { ...saved, rawOutput: expose ? saved.rawOutput : Buffer.alloc(0),
+        ...(expose && saved.displayOutput ? { displayOutput: saved.displayOutput } : { displayOutput: undefined }),
+        chunkId: generateChunkId(), wallTimeMs: 0, processId: null,
+        completedSessionId: request.processId, replayed: true, replaySuppressed: !expose,
+        originalTokenCount: approxTokenCount(retained.toString('utf8')),
         outputOmittedBytes: null, truncationPolicy: request.truncationPolicy, maxOutputTokens: request.maxOutputTokens };
     };
     const saved = replay();
@@ -903,7 +920,7 @@ export class UnifiedExecProcessManager {
 
       let statusAfterWrite: ProcessStatus | null = null;
       if (request.input !== '') {
-        if (process.hasExited()) throw UnifiedExecError.processFailed('Process already completed; no input was sent. Use empty chars to read its retained output.');
+        if (process.hasExited()) throw UnifiedExecError.processFailed('Process already completed; no input was sent. Use empty chars with reread_retained=true to deliberately reread its retained output.');
         if (!tty) {
           if (request.input === INTERRUPT) {
             await process.interrupt();

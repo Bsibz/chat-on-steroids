@@ -46,8 +46,17 @@ export interface NightBuildChatTranscriptItemV1 {
   text: string;
   truncated: boolean;
   chars: number;
+  attachments?: NightBuildChatAttachmentV1[];
   state?: 'streaming' | 'final';
   finalContentSeq?: number;
+}
+
+export interface NightBuildChatAttachmentV1 {
+  attachmentId: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  preview?: string;
 }
 
 export type NightBuildChatActivityKindV1 =
@@ -95,12 +104,14 @@ export interface NightBuildChatActivityItemV1 {
   exitCode?: number;
   durationMs?: number;
   changedFiles?: number;
+  /** Sanitized changed paths only; raw tool args/results never cross this contract. */
+  changedPaths?: string[];
 }
 
 export type NightBuildChatCurrentTurnV1 =
   | { state: 'idle' }
   | { state: 'generating'; turnOrigin: number | null }
-  | { state: 'terminal'; outcome: NightBuildChatTurnOutcome; endedAt: number | null };
+  | { state: 'terminal'; outcome: NightBuildChatTurnOutcome; endedAt: number | null; turnOrigin?: number | null };
 
 export interface NightBuildChatTranscriptV1 {
   protocolVersion: typeof NIGHT_BUILD_CHAT_TRANSPORT_V1_PROTOCOL;

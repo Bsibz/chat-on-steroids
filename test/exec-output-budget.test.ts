@@ -134,7 +134,7 @@ describe('exec output budget', () => {
     expect(huge.length).toBeLessThanOrEqual(UNIFIED_EXEC_OUTPUT_MAX_BYTES + 1_000);
   });
 
-  it('applies the same budget to structuredContent as to the text result', () => {
+  it('keeps structured Code Mode output under the same model-facing budget as text content', () => {
     const bytes = 200_000;
     const output = execOutput(asciiOutput(bytes), 30_000);
     const structured = execCommandStructuredOutput(output);
@@ -142,6 +142,8 @@ describe('exec output budget', () => {
     expect(typeof structured.output).toBe('string');
     expect(String(structured.output).length).toBeGreaterThan(100_000);
     expect(String(structured.output)).toContain('Warning: truncated output');
+    expect(execCommandResponseText(output).length).toBeGreaterThan(100_000);
+    expect(execCommandResponseText(output)).toContain('Warning: truncated output');
   });
 
   it('leaves the 1 MiB collection cap in place beneath the model-facing budget', () => {

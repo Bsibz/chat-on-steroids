@@ -812,13 +812,13 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
   let tone: UpdateTone = 'work';
   if (update.latest) {
     // `latest` set with a stage of `idle` is the deliberate case: a new version exists and this
-    // installation - a Linux .deb, macOS, a development tree, an architecture with no artifact -
+    // installation - a Linux .deb, a public macOS release, a development tree, an architecture with no artifact -
     // is not one the app can update by itself. That is when the button matters.
     lines.push(
       update.stage === 'checking'
         ? t("Checking for the latest update…")
         : update.stage === 'ready'
-        ? t("Chat On Steroids {0} is downloaded and ready. Install it now, or it installs the next time you quit.", [update.latest])
+        ? t("Chat On Steroids {0} is downloaded and verified. Install it when you’re ready.", [update.latest])
         : update.stage === 'downloading'
           ? t("Chat On Steroids {0} is downloading. Keep working; you can install it when it lands.", [update.latest])
           : update.stage === 'failed'
@@ -1016,7 +1016,7 @@ function apply(next: AppState): void {
 
   // ---- out of date, app or extension
   paintUpdate(next);
-  paintPluginRefreshReminder(next.update.current);
+  paintPluginRefreshReminder(next.update.current, config.ui.autoRefreshPlugins === true);
 
   // ---- health numbers and facts
   paintClock();

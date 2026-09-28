@@ -14,7 +14,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -49,6 +49,7 @@ const {
   markInstallOnQuit,
   releaseVersion,
   resetUpdateForTests,
+  runningMacBundle,
   stagedArtifact,
   updateStatus
 } = await import('../src/main/update.js');
@@ -56,6 +57,14 @@ const {
 const NEXT = '99.0.0';
 const WINDOWS_ASSET = `Chat-On-Steroids-Setup-${process.arch}.exe`;
 const APPIMAGE_ASSET = `Chat-On-Steroids-Linux-${process.arch}.AppImage`;
+const MAC_EXEC = '/Applications/Chat On Steroids.app/Contents/MacOS/Chat On Steroids';
+const LOCAL_TEAM = 'ABCDEFGHIJ';
+const LOCAL_SIGNING_ID = 'com.chatonsteroids.app';
+const LOCAL_REQUIREMENT =
+  'identifier "com.chatonsteroids.app" and anchor apple generic and ' +
+  'certificate 1[field.1.2.840.113635.100.6.2.1] /* exists */ and ' +
+  'certificate leaf[field.1.2.840.113635.100.6.1.12] /* exists */ and ' +
+  'certificate leaf[subject.OU] = ' + LOCAL_TEAM;
 
 const sha256 = (body: string): string => createHash('sha256').update(body).digest('hex');
 
@@ -95,19 +104,64 @@ function github(options: {
 }
 
 /** Runs the pass as an installation of the given shape, and puts the real one back. */
-async function asPlatform(platform: string, appImage: string | undefined, run: () => Promise<void>): Promise<void> {
+async function asPlatform(
+  platform: string,
+  appImage: string | undefined,
+  run: () => Promise<void>,
+  execPath?: string
+): Promise<void> {
   const realPlatform = process.platform;
+  const realExecPath = process.execPath;
   const realAppImage = process.env.APPIMAGE;
   Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  if (execPath) Object.defineProperty(process, 'execPath', { value: execPath, configurable: true });
   if (appImage) process.env.APPIMAGE = appImage;
   else delete process.env.APPIMAGE;
   try {
     await run();
   } finally {
     Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+    Object.defineProperty(process, 'execPath', { value: realExecPath, configurable: true });
     if (realAppImage === undefined) delete process.env.APPIMAGE;
     else process.env.APPIMAGE = realAppImage;
   }
+}
+
+function localMac(options: {
+  body?: string;
+  digest?: string;
+  version?: string;
+  bundleIdentifier?: string;
+  omitSigning?: boolean;
+  teamIdentifier?: string;
+  signingIdentifier?: string;
+  designatedRequirement?: string;
+} = {}) {
+  const body = options.body ?? 'local mac zip bytes';
+  const version = options.version ?? NEXT;
+  const artifact = `Chat-On-Steroids-macOS-${process.arch}-${version}.zip`;
+  const channel = path.join(userData, 'LocalUpdateChannel');
+  mkdirSync(channel, { recursive: true });
+  writeFileSync(path.join(channel, artifact), body);
+  const manifest: Record<string, unknown> = {
+    schemaVersion: 1,
+    channel: 'local-development',
+    version,
+    arch: process.arch,
+    artifact,
+    sha256: options.digest ?? sha256(body),
+    bundleIdentifier: options.bundleIdentifier ?? LOCAL_SIGNING_ID
+  };
+  if (!options.omitSigning) {
+    manifest.teamIdentifier = options.teamIdentifier ?? LOCAL_TEAM;
+    manifest.signingIdentifier = options.signingIdentifier ?? LOCAL_SIGNING_ID;
+    manifest.designatedRequirement = options.designatedRequirement ?? LOCAL_REQUIREMENT;
+  }
+  writeFileSync(
+    path.join(channel, 'manifest.json'),
+    JSON.stringify(manifest)
+  );
+  return { body, version, channel, artifact, staged: path.join(userData, 'updates', version, artifact) };
 }
 
 beforeEach(() => {
@@ -132,13 +186,20 @@ describe('which installations update themselves', () => {
     });
   });
 
+  it('derives the exact running macOS app bundle and rejects lookalike paths', () => {
+    expect(runningMacBundle(MAC_EXEC)).toBe('/Applications/Chat On Steroids.app');
+    expect(runningMacBundle('/Applications/Other.app/Contents/MacOS/Chat On Steroids')).toBeNull();
+    expect(runningMacBundle('/tmp/Chat On Steroids')).toBeNull();
+  });
+
   /**
    * A `.deb` is the system package manager's file and replacing it needs root. Asking for a
    * password during quit is not something this app does, so that installation is told a new
    * version exists and given the release page - it is not quietly left waiting for a download
-   * that was never going to happen. Same for macOS, where the artifacts ship unsigned.
+   * that was never going to happen. Same for public macOS releases, which are not the separate
+   * owner-local development channel tested below.
    */
-  it('leaves a Linux package install and macOS to be updated by hand', async () => {
+  it('leaves a Linux package install and public macOS release to be updated by hand', async () => {
     expect(stagedArtifact('linux', 'x64', undefined)).toBeNull();
     expect(stagedArtifact('darwin', 'arm64')).toBeNull();
     expect(stagedArtifact('win32', 'ia32')).toBeNull();
@@ -169,6 +230,98 @@ describe('which installations update themselves', () => {
     expect(asked).toEqual(['latest']);
     await applyStagedUpdate();
     expect(spawned).toEqual([]);
+  });
+});
+
+describe('local macOS development updates', () => {
+  it('stages only the fixed local-channel artifact after SHA-256 verification and never calls GitHub', async () => {
+    const local = localMac();
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      expect(updateStatus()).toMatchObject({ latest: NEXT, stage: 'ready', error: null });
+      expect(readFileSync(local.staged, 'utf8')).toBe(local.body);
+    }, MAC_EXEC);
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('never installs a local macOS candidate merely because the app quit', async () => {
+    localMac();
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      await applyStagedUpdate();
+    }, MAC_EXEC);
+    expect(spawned).toEqual([]);
+  });
+
+  it('hands an explicitly accepted local macOS candidate to the detached verified-swap helper', async () => {
+    const local = localMac();
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      expect(markInstallOnQuit()).toBe(true);
+      await applyStagedUpdate();
+    }, MAC_EXEC);
+
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]!.file).toBe('/bin/zsh');
+    expect(spawned[0]!.args[0]).toBe('-c');
+    expect(spawned[0]!.args[1]).toContain('candidate bundle is incomplete');
+    expect(spawned[0]!.args.slice(2)).toEqual([
+      'cos-local-update',
+      expect.any(String),
+      local.staged,
+      '/Applications/Chat On Steroids.app',
+      NEXT,
+      sha256(local.body),
+      process.arch,
+      LOCAL_TEAM,
+      LOCAL_SIGNING_ID
+    ]);
+  });
+
+  it('fails closed on a local archive whose bytes do not match its manifest', async () => {
+    localMac({ digest: sha256('some other build') });
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      expect(updateStatus().stage).toBe('failed');
+      expect(updateStatus().error).toContain('does not match its manifest SHA-256');
+      expect(markInstallOnQuit()).toBe(false);
+      await applyStagedUpdate();
+    }, MAC_EXEC);
+    expect(spawned).toEqual([]);
+  });
+
+  it('fails closed when the local manifest names a different product identity', async () => {
+    localMac({ bundleIdentifier: 'com.example.other' });
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      expect(updateStatus().stage).toBe('failed');
+      expect(updateStatus().error).toContain('malformed or unsupported');
+    }, MAC_EXEC);
+    expect(spawned).toEqual([]);
+  });
+
+  it('fails closed when local dogfood omits stable Apple Development signing proof', async () => {
+    localMac({ omitSigning: true });
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      expect(updateStatus().stage).toBe('failed');
+      expect(updateStatus().error).toContain('malformed or unsupported');
+      expect(markInstallOnQuit()).toBe(false);
+    }, MAC_EXEC);
+    expect(spawned).toEqual([]);
+  });
+
+  it('fails closed when the designated requirement is not bound to the published Team ID', async () => {
+    localMac({ designatedRequirement: 'identifier "com.chatonsteroids.app" and anchor apple generic' });
+    await asPlatform('darwin', undefined, async () => {
+      await checkForUpdates();
+      expect(updateStatus().stage).toBe('failed');
+      expect(updateStatus().error).toContain('malformed or unsupported');
+    }, MAC_EXEC);
   });
 });
 

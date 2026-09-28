@@ -92,6 +92,142 @@ function fixture(versionCaption = '', closeDelay: number | null = 0) {
   win.eval(fiberSource); win.eval(domSource);
   return { api: (win as any).CLF_DOM, state, props, selections, actions, freeze: () => { frozen = true; } };
 }
+
+function shellPickerFixture() {
+  page = new JSDOM(
+    '<main data-app-shell-main-surface><form data-chatgpt-composer>' +
+      '<div contenteditable="true" role="textbox" data-composer-markdown></div>' +
+      '<button type="button" aria-haspopup="menu" data-codex-intelligence-trigger="true" ' +
+        'data-composer-navigation-target="reasoning" data-selected-reasoning-effort="medium">Medium</button>' +
+      '<button type="submit">Send</button>' +
+    '</form></main>',
+    { url: 'https://chatgpt.com/', runScripts: 'outside-only' }
+  );
+  const win = page.window, doc = win.document;
+  Object.defineProperty(win.HTMLElement.prototype, 'getClientRects', {
+    value() { return this.hidden ? [] : [{}]; }
+  });
+  win.postMessage = (data: unknown) => queueMicrotask(() =>
+    win.dispatchEvent(new win.MessageEvent('message', {
+      data, source: win as unknown as Window, origin: win.location.origin
+    }))
+  );
+  const versions = [
+    { id: '5.6', label: 'GPT-5.6 Sol', selected: true },
+    { id: 'future', label: 'Future', selected: false }
+  ];
+  const selections: any[][] = [
+    [
+      { model: 'gpt-5-6-thinking', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'medium', powerSettingIndex: 1, labels: { effort: 'Medium' } },
+      { model: 'gpt-5-6-thinking', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high', powerSettingIndex: 2, labels: { effort: 'High' } }
+    ],
+    [
+      { model: 'future-thinking', modelLabel: 'Future', reasoningEffort: 'high', powerSettingIndex: 1, labels: { effort: 'High' } }
+    ]
+  ];
+  const props: any = {
+    powerSelections: selections[0],
+    selectedLabelCandidate: selections[0]![0],
+    selectedPowerSelection: null,
+    modelListConfig: { options: versions },
+    modelSelectionDisabled: false,
+    currentModelId: 'gpt-5-6-thinking'
+  };
+  const trigger = doc.querySelector('[data-codex-intelligence-trigger]') as HTMLButtonElement;
+  (trigger as any).__reactFiber$shell = { memoizedProps: props, return: null };
+  const actions = vi.fn();
+  const syncTrigger = () => {
+    const selected = props.selectedPowerSelection ?? props.selectedLabelCandidate;
+    trigger.setAttribute('data-selected-reasoning-effort', selected?.reasoningEffort || '');
+    trigger.textContent = selected?.labels?.effort || selected?.sliderLabel || selected?.reasoningEffort || '';
+    props.currentModelId = selected?.model || null;
+  };
+  const render = () => {
+    let panel = doc.querySelector('[data-model-picker-view]') as HTMLElement | null;
+    if (!panel) {
+      panel = doc.createElement('div');
+      panel.setAttribute('data-model-picker-view', 'simple');
+      panel.setAttribute('role', 'menu');
+      doc.body.append(panel);
+    }
+    panel.innerHTML =
+      '<div role="menuitem" data-model-picker-view-toggle>Version</div>' +
+      '<div role="menuitem" aria-keyshortcuts="ArrowLeft ArrowRight"></div>';
+    panel.querySelector('[data-model-picker-view-toggle]')!.addEventListener('click', () => {
+      panel!.replaceChildren();
+      for (const [index, version] of versions.entries()) {
+        const option = doc.createElement('div');
+        option.setAttribute('role', 'menuitemradio');
+        option.textContent = version.label;
+        option.addEventListener('keydown', (event: Event) => {
+          const keyEvent = event as KeyboardEvent;
+          if (keyEvent.key !== 'Enter') return;
+          actions('version');
+          versions.forEach(value => { value.selected = value === version; });
+          props.powerSelections = selections[index];
+          props.selectedPowerSelection = selections[index]![0];
+          props.selectedLabelCandidate = selections[index]![0];
+          syncTrigger();
+          render();
+        });
+        panel!.append(option);
+      }
+    });
+    panel.querySelector('[aria-keyshortcuts]')!.addEventListener('keydown', (event: Event) => {
+      const keyEvent = event as KeyboardEvent;
+      const selected = props.selectedPowerSelection ?? props.selectedLabelCandidate;
+      const at = props.powerSelections.indexOf(selected) + (keyEvent.key === 'ArrowRight' ? 1 : -1);
+      if (!props.powerSelections[at]) return;
+      actions('effort');
+      props.selectedPowerSelection = props.powerSelections[at];
+      syncTrigger();
+      render();
+    });
+  };
+  trigger.addEventListener('keydown', event => { if (event.key === 'Enter') render(); });
+  doc.addEventListener('keydown', event => {
+    if (event.key === 'Escape') doc.querySelector('[data-model-picker-view]')?.remove();
+  });
+  syncTrigger();
+  win.eval(fiberSource);
+  win.eval(domSource);
+  return { api: (win as any).CLF_DOM, doc, win, versions, selections, props, trigger, actions, render };
+}
+
+it('selects saved 5.6 High through the live shell version and proves the closed execution lane', async () => {
+  const f = shellPickerFixture();
+  expect(await f.api.selectModelSettings('5.6', 'high')).toBe(true);
+  expect(f.props.selectedPowerSelection).toMatchObject({ model: 'gpt-5-6-thinking', reasoningEffort: 'high' });
+  expect(f.doc.querySelector('[data-model-picker-view]')).toBeNull();
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-5-6-thinking', reasoningEffort: 'high' });
+});
+
+it('fails closed when one live shell version has two distinct High execution lanes', async () => {
+  const f = shellPickerFixture();
+  f.selections[0]!.push({
+    model: 'gpt-5-6-other',
+    modelLabel: 'GPT-5.6 Alternate',
+    reasoningEffort: 'high',
+    powerSettingIndex: 3,
+    labels: { effort: 'High' }
+  });
+  expect(await f.api.selectModelSettings('5.6', 'high')).toBe(false);
+  expect(f.props.selectedPowerSelection ?? f.props.selectedLabelCandidate).toMatchObject({
+    model: 'gpt-5-6-thinking', reasoningEffort: 'medium'
+  });
+});
+
+it('waits for cold shell picker ownership to hydrate instead of guessing from its visible High control', async () => {
+  const f = shellPickerFixture();
+  const options = f.props.modelListConfig;
+  f.props.modelListConfig = null;
+  f.win.setTimeout(() => {
+    f.props.modelListConfig = options;
+    f.trigger.setAttribute('data-shell-picker-hydrated', 'true');
+  }, 30);
+  expect(await f.api.selectModelSettings('5.6', 'high')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-5-6-thinking', reasoningEffort: 'high' });
+});
 it('waits for the model picker to close before allowing composer insertion', async () => {
   const f = fixture('', 30);
   expect(await f.api.selectModelSettings('future-model', 'ultra')).toBe(true);
@@ -359,6 +495,40 @@ it('observes direct Chrome selection with the picker closed and invalidates anot
 it('keeps an explicit model denial unavailable even when the preset is visible', async () => {
   const f = fixture(); (f.props.modelSwitcherDenialsBySlug as any)['future-model'] = { reason: 'workspace_policy' };
   expect(await f.api.inspectModelSettings()).toEqual([{ id: 'gpt-5-6-thinking', label: 'GPT-5.6 Sol', efforts: ['medium', 'high'], aliases: ['gpt-5-6-thinking'] }]);
+});
+it('resolves a closed picker through form[data-chatgpt-composer] without #prompt-textarea', async () => {
+  const f = fixture();
+  const doc = page.window.document;
+  const form = doc.querySelector('form')!;
+  form.setAttribute('data-chatgpt-composer', '');
+  doc.querySelector('#prompt-textarea')!.remove();
+  const editor = doc.createElement('div');
+  editor.setAttribute('data-composer-markdown', '');
+  editor.setAttribute('contenteditable', 'true');
+  editor.setAttribute('role', 'textbox');
+  form.prepend(editor);
+  const stray = doc.createElement('div');
+  stray.setAttribute('contenteditable', 'true');
+  stray.setAttribute('role', 'textbox');
+  stray.setAttribute('data-composer-markdown', '');
+  doc.body.append(stray);
+  const reply = await new Promise<any>((resolve) => {
+    const receive = (event: MessageEvent) => {
+      if (event.data?.source !== 'clf-picker-reply') return;
+      page.window.removeEventListener('message', receive as any);
+      resolve(event.data.picker);
+    };
+    page.window.addEventListener('message', receive as any);
+    page.window.postMessage({ source: 'clf-picker-ask', nonce: 'prosemirror-composer' }, page.window.location.origin);
+  });
+  expect(doc.querySelector('#prompt-textarea')).toBeNull();
+  expect(reply).toMatchObject({
+    currentBucket: 2,
+    choices: expect.arrayContaining([expect.objectContaining({ id: 'gpt-5-6-thinking', effort: 'high' })])
+  });
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-5-6-thinking', reasoningEffort: 'high' });
+  expect(f.actions).not.toHaveBeenCalled();
+  expect(stray.textContent).toBe('');
 });
 it('observes the September closed 6 Pro selection without opening or changing a working composer', async () => {
   const f = fixture(), doc = page.window.document, trigger = doc.querySelector('button')!;

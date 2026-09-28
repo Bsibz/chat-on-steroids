@@ -2608,7 +2608,7 @@ function paintDetail(followBottom = historyBefore === null): void {
     if (agentFilter !== null) {
       facts.push(t("filtered to {0} — {1} matched", [agentFilter === UNATTRIBUTED ? 'unattributed' : agentFilter, filtered.length]));
     }
-    facts.push(t("~{0} rough current-chat context tokens", [compactNumber(summary.contextTokens)]));
+    facts.push(t("~{0} locally recorded text tokens", [compactNumber(summary.contextTokens)]));
     const level = pressureOf(summary.id);
     if (level && level.level !== 'ok') {
       facts.push(
@@ -2861,7 +2861,7 @@ function paintSwarm(state: SwarmState): void {
  * a chat whose automatic trigger was set far higher, or fill only halfway on the turn that
  * compaction actually fired. The threshold is now the amber line by definition, and the red
  * line sits a third further on, which is the relation the app's own defaults have always
- * carried (300k → 400k when the threshold was 300k; 400k → 533k now).
+ * carried (300k → 400k then; 400k → 533k, and now 750k → 1M).
  */
 function urgentFrom(threshold: number): number {
   return Math.min(4_000_000, Math.max(10_000, Math.round((threshold * 4) / 3)));

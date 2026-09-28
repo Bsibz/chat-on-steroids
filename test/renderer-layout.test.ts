@@ -219,7 +219,7 @@ describe('a session row', () => {
 describe('the session-row chat actions', () => {
   it('keeps current-chat pressure in the conversation detail', () => {
     expect(chatSource).toContain('compactNumber(summary.contextTokens)');
-    expect(chatSource).toContain('rough current-chat context tokens');
+    expect(chatSource).toContain('locally recorded text tokens');
   });
 
   it('reserves all three top-right hit targets instead of laying the timestamp underneath them', () => {

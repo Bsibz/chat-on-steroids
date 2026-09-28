@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.49] - Native attachment Send readiness
+
+- Native Chat attachment delivery now treats ChatGPT's exact enabled native Send control as the final upload-readiness authority once every requested attachment tile has been matched and owned.
+- Stale or hidden composer-wide progress semantics can no longer strand an otherwise ready attachment draft before Send authorization while the same native Send control is already usable by the owner.
+- Attachment identity, exact tile matching, draft ownership, send authorization and native acceptance receipts remain fail-closed.
+
 ## [2.1.48] - Compaction restore identity and browser scan efficiency
 
 - Restart recovery no longer lets a stale, dropped Compact & Resume command remember a finished ticket ahead of the live continuation for the same session; owner controls and Cancel keep pointing at the transaction the durable ledger still owes.

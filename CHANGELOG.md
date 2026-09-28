@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.52] - Native image tile ownership
+
+- Restores the exact ChatGPT composer image-tile detector that recognizes a native attachment under `data-composer-attachments` only when the tile's accessible filename matches its image alt text and it has one unique remove action.
+- Fixes Native Chat screenshot sends that reached the real Chrome composer with an enabled Send button but remained stuck before authorization because CoS reported `tiles=0` and could not prove attachment ownership.
+- Keeps all existing fail-closed checks: exact filename ownership, no extra attachment tiles, one unambiguous enabled native Send control, exact draft/conversation ownership, authorization immediately before click, and native message acceptance afterward.
+
 ## [2.1.51] - Resumed Native Chat continuity
 
 - Native Chat transcript projection now accepts the exact presentation artifact seen after a real Compact & Resume: ChatGPT may render matched Markdown code delimiters away from the recorded resume user bubble while preserving every other byte. Changed words, unmatched/literal backticks, and ambiguous boundaries still fail closed.

@@ -941,6 +941,10 @@ export function nativeChatMutationPendingForSession(sessionId: string): Promise<
     return reconciled.some((row) => {
       if (!row.nativeChat || row.nativeChat.sessionId !== sessionId) return false;
       if (row.nativeChat.stop) return true;
+      // The exact browser ACK is terminal proof that this authorized Send
+      // completed. Acceptance metadata is a later recorder projection used by
+      // Native Chat controls; it must not keep Compact & Resume fenced forever.
+      if (row.state === 'sent') return false;
       if (row.nativeChat.acceptance) return false;
       if (row.state === 'failed') return false;
       if (row.state === 'cancelled' && row.sendAuthorizedAt === undefined) return false;

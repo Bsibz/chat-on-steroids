@@ -12,6 +12,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { InputEntry } from '../src/main/session/input.js';
 
 vi.mock('electron', () => ({
   safeStorage: {
@@ -24,7 +25,7 @@ vi.mock('electron', () => ({
   shell: { openExternal: async () => undefined }
 }));
 
-const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const {
   beginPrimeTransfer,
   bindConversation,
@@ -94,6 +95,16 @@ const {
   setGoalObjective
 } = await import('../src/main/goal.js');
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF } = await import('./helpers.js');
+const { initDurableStore, readDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
+const {
+  acknowledgeBrowserInput,
+  authorizeBrowserInput,
+  claimBrowserInput,
+  enqueueNativeChatInput,
+  listInputs,
+  nativeChatMutationPendingForSession,
+  resetInputForTests
+} = await import('../src/main/session/input.js');
 
 let dir: string;
 
@@ -150,6 +161,47 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
 }
 
 describe('capturing the brief', () => {
+  it('reproduces terminal Native Chat ACK being fenced from automatic compaction before acceptance projection', async () => {
+    const config = getConfig();
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 750_000 } });
+    try {
+      resetInputForTests();
+      initDurableStore(dir);
+      await writeDurableNow('session-input', []);
+      const nativeConversation = 'conversation-native-a';
+      const summary = await createSession({ title: 'terminal native send', conversationId: nativeConversation });
+      const id = crypto.randomUUID();
+      await enqueueNativeChatInput({ id, sessionId: summary.id, conversationId: nativeConversation, text: 'A completed native send' });
+      expect(await nativeChatMutationPendingForSession(summary.id)).toBe(true);
+      expect(await claimBrowserInput(id, 'native-page', nativeConversation, true)).not.toBeNull();
+      expect(await authorizeBrowserInput(id, 'native-page', nativeConversation)).toBe(true);
+      expect(await nativeChatMutationPendingForSession(summary.id)).toBe(true);
+      expect(await acknowledgeBrowserInput(id, 'native-page', nativeConversation, 'native-user-message')).toBe(true);
+
+      const acknowledgedRows = await listInputs();
+      await writeDurableNow('session-input', acknowledgedRows.map(entry => entry.id === id
+        ? { ...entry, historyRecorded: true, historyAnchored: true }
+        : entry));
+      const row = (await readDurable<InputEntry[]>('session-input'))!.find(entry => entry.id === id)!;
+      expect(row).toMatchObject({ state: 'sent', messageId: 'native-user-message', historyRecorded: true, historyAnchored: true });
+      expect(row.deliveredAt).toEqual(expect.any(Number));
+      expect(row.nativeChat?.acceptance).toBeUndefined();
+      expect(await nativeChatMutationPendingForSession(summary.id)).toBe(false);
+      expect(store.autoCompactionReady({ ...(await getSession(summary.id))!, contextTokens: 1_000_000 })).toBe(true);
+
+      const tickets = await Promise.all([
+        openContinuationNow(summary.id, nativeConversation, true),
+        openContinuationNow(summary.id, nativeConversation, true)
+      ]);
+      expect(tickets[0]?.token).toBe(tickets[1]?.token);
+      expect(snapshotContinuations().entries.filter(entry => entry.sessionId === summary.id)).toHaveLength(1);
+    } finally {
+      resetInputForTests();
+      resetDurableForTests();
+      await saveConfig(config);
+    }
+  });
+
   it('freezes exact source model intent across selection changes and durable restore', async () => {
     const summary = await createSession({ title: 'model transfer', conversationId: CHAT_A });
     await store.observeSessionModel(summary.id, CHAT_A, 'gpt-5.6-sol', 10, 'high');

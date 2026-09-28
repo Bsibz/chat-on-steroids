@@ -229,7 +229,7 @@ describe('durable user input ownership', () => {
     expect(await claimBrowserInput(id, 'native-document', binding.conversationId, true)).not.toBeNull();
     expect(await authorizeBrowserInput(id, 'native-document', binding.conversationId)).toBe(true);
     expect(await acknowledgeBrowserInput(id, 'native-document', binding.conversationId, 'native-message-id')).toBe(true);
-    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(true);
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(false);
 
     expect(await recordNativeChatAcceptance(id, sessionId, binding.conversationId, {
       messageId: 'native-message-id',
@@ -253,6 +253,24 @@ describe('durable user input ownership', () => {
     now = 2_501;
     expect(await nativeChatMutationPendingForSession(sessionId)).toBe(false);
     expect((await listInputs()).find((entry) => entry.id === id)?.nativeChat?.stop).toBeUndefined();
+  });
+
+  it('releases pre-Send failures but retains an authorized cancelled Send as uncertain', async () => {
+    binding.activeTurnId = null;
+    binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 900 };
+    const failedId = randomUUID();
+    await enqueueNativeChatInput({ id: failedId, sessionId, conversationId: binding.conversationId, text: 'Failed before Send' });
+    expect(await claimBrowserInput(failedId, 'failed-page', binding.conversationId, true)).not.toBeNull();
+    expect(await failBrowserInput(failedId, 'failed-page', 'composer unavailable')).toBe(true);
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(false);
+
+    const uncertainId = randomUUID();
+    await enqueueNativeChatInput({ id: uncertainId, sessionId, conversationId: binding.conversationId, text: 'Authorized but uncertain' });
+    expect(await claimBrowserInput(uncertainId, 'uncertain-page', binding.conversationId, true)).not.toBeNull();
+    expect(await authorizeBrowserInput(uncertainId, 'uncertain-page', binding.conversationId)).toBe(true);
+    expect(await cancelInput(uncertainId)).toBe(true);
+    expect((await listInputs()).find(entry => entry.id === uncertainId)).toMatchObject({ state: 'cancelled', sendAuthorizedAt: expect.any(Number) });
+    expect(await nativeChatMutationPendingForSession(sessionId)).toBe(true);
   });
 
   it('preserves messages beyond the former composer limit through admission, restart and browser claim', async () => {

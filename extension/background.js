@@ -4123,6 +4123,20 @@ function conversationForTab(tab) {
   if (pending) return pending;
   const urls = [tab.url, tab.pendingUrl].filter((value) => typeof value === 'string' && value);
   if (urls.some((value) => !isChatGptUrl(value))) return null;
+  // Registry fallback exists only for the transient root/no-URL shape Chrome can expose
+  // while reloading an already-known conversation. A stable ChatGPT surface such as
+  // /settings/plugins-settings, a Project home, or another non-conversation route is not
+  // that conversation merely because this numeric tab used to show it. Treating those pages
+  // as remembered copies makes one real Native Chat tab look ambiguous and strands its
+  // pinned input before browser claim.
+  if (urls.some((value) => {
+    try {
+      const url = new URL(value);
+      return url.pathname !== '/' && url.pathname !== '';
+    } catch {
+      return true;
+    }
+  })) return null;
   return cleanConversationId(tabConversations[String(tab.id)]);
 }
 

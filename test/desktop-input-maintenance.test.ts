@@ -391,6 +391,58 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect((exact.localSaved.inputOpenings as any)[firstId]).toEqual({ tab: 7, stage: 'ready', conversationId: secondId });
   });
 
+  it('offers a new native Chat intent after the exact same tab reloads into a new document', async () => {
+    const before = { id: firstId, conversationId: secondId, nativePinned: true as const };
+    const inputs = [before];
+    const h = await worker(inputs);
+    h.tabs.push({ id: 7, url: `https://chatgpt.com/c/${secondId}` });
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'native-before-reload', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.sendMessage).toHaveBeenCalledWith(7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId });
+
+    h.sendMessage.mockClear();
+    const after = { id: secondId, conversationId: secondId, nativePinned: true as const };
+    inputs.splice(0, inputs.length, after);
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'native-after-reload', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 2 });
+    await h.maintain();
+    expect(h.sendMessage).toHaveBeenCalledWith(7, { type: 'clf-desktop-input', id: secondId, conversationId: secondId });
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it('does not let remembered Settings tabs make one exact native Chat conversation ambiguous', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const };
+    const h = await worker([input], undefined, {}, {
+      tabConversations: { '6': secondId, '7': secondId, '8': secondId }
+    });
+    h.tabs.push(
+      { id: 6, url: 'https://chatgpt.com/settings/plugins-settings?cos-plugin-refresh=one' },
+      { id: 7, url: `https://chatgpt.com/g/g-p-11111111222233334444555555555555-night-build/c/${secondId}` },
+      { id: 8, url: 'https://chatgpt.com/settings/plugins-settings?cos-plugin-refresh=two' }
+    );
+    await h.authorizeDocument({ tab: { id: 6 }, documentId: 'settings-a', frameId: 0, url: h.tabs[0]!.url }, { navigationEpoch: 1 });
+    await h.authorizeDocument({ tab: { id: 7 }, documentId: 'native-project-chat', frameId: 0, url: h.tabs[1]!.url }, { navigationEpoch: 1 });
+    await h.authorizeDocument({ tab: { id: 8 }, documentId: 'settings-b', frameId: 0, url: h.tabs[2]!.url }, { navigationEpoch: 1 });
+    await h.maintain();
+    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
+      [7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId }]
+    ]);
+    expect(h.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps remembered conversation fallback for a transient ChatGPT root during reload', async () => {
+    const input = { id: firstId, conversationId: secondId, nativePinned: true as const };
+    const h = await worker([input], undefined, {}, {
+      tabConversations: { '7': secondId },
+      tabDocuments: { '7': 'root-reload' },
+      tabEpochs: { '7': 2 }
+    });
+    h.tabs.push({ id: 7, url: 'https://chatgpt.com/' });
+    await h.maintain();
+    expect(h.sendMessage.mock.calls.filter(([, message]) => message.type === 'clf-desktop-input')).toEqual([
+      [7, { type: 'clf-desktop-input', id: firstId, conversationId: secondId }]
+    ]);
+  });
+
   it('refuses duplicate or replacement documents for one native Chat intent', async () => {
     const input = { id: firstId, conversationId: secondId, nativePinned: true as const };
     const duplicate = await worker([input]);

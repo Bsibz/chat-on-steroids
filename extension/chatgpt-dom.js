@@ -1198,7 +1198,24 @@ var CLF_DOM = (() => {
     return safe(() => {
       const namespace = key || (turn && turn.id) || 'turn';
       const boxes = [];
-      for (const section of turnNodes(turn)) boxes.push(...progressRoots(section));
+      for (const section of turnNodes(turn)) {
+        const interrupted = progressRoots(section);
+        if (interrupted.length) {
+          boxes.push(...interrupted);
+          continue;
+        }
+        // September search-unit renderer can mount live public commentary directly as
+        // assistant-authored markdown without a data-interrupted wrapper and without a
+        // reachable Fiber message. progressItems() is consumed only by the already-gated
+        // live model-less generation path in content.js, so this remains progress evidence,
+        // never final-answer authority. Keep only the innermost authored node to avoid a
+        // wrapper + styled child producing duplicate progress identities.
+        const authored = assistantAuthoredNodes(section).filter(node =>
+          !node.closest?.('[data-interrupted]') &&
+          !node.closest?.(TOOL) &&
+          !node.closest?.(OWN_SURFACES));
+        boxes.push(...collapseNested(authored, true));
+      }
       const ids = stampIdentities(boxes, 'data-clf-progress-id', namespace, 'p');
 
       const out = [];

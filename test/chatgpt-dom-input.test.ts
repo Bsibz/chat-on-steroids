@@ -20,6 +20,8 @@ interface DomApi {
   selectModelSettings(model: string | null, effort: string | null, current?: () => boolean): Promise<boolean>;
   uploadImages(images: Array<{ name: string; dataUrl: string }>, current?: () => boolean, draft?: ReturnType<DomApi['captureComposerDraft']>, files?: File[], onWait?: (diagnostic: Record<string, unknown>) => void): Promise<boolean>;
   messages(): Array<{ id: string; role: 'user' | 'assistant'; text: string; turnId: string | null }>;
+  turns(): Array<{ role: string; id: string | null; node: HTMLElement; nodes?: HTMLElement[] }>;
+  progressItems(turn: { role: string; id: string | null; node: HTMLElement; nodes?: HTMLElement[] }, key?: string): Array<{ id: string; text: string }>;
 }
 let dom: JSDOM;
 let document: Document;
@@ -828,6 +830,32 @@ describe('locale-independent provider composer evidence', () => {
     document.querySelector('[data-turn-key]')!.removeAttribute('data-clf-shell-running');
     expect(api.generating()).toBe(false);
     expect(api.sendButton()?.getAttribute('type')).toBe('submit');
+  });
+
+  it('reads live shell commentary from visible assistant markdown when data-interrupted is absent', () => {
+    document.body.innerHTML = `
+      <main data-app-shell-main-surface>
+        <div data-thread-find-target="conversation">
+          <div data-turn-key="shell-live" data-clf-shell-running="/">
+            <div data-content-search-turn-key="shell-live-turn">
+              <div data-content-search-unit-key="shell-live-turn:0:user"><div>Question</div></div>
+              <div data-content-search-unit-key="shell-live-turn:1:assistant">
+                <div class="markdown"><div data-markdown-text-style="assistant-message">Checking the exact live renderer now.</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <form data-chatgpt-composer>
+          <div contenteditable="true" role="textbox" data-composer-markdown></div>
+          <button type="submit">Send</button>
+        </form>
+      </main>`;
+    const turn = api.turns().find(row => row.role === 'assistant');
+    expect(turn).toBeTruthy();
+    expect(document.querySelector('[data-interrupted]')).toBeNull();
+    expect(api.progressItems(turn!, 'live-generation')).toEqual([
+      expect.objectContaining({ id: 'live-generation#p0', text: 'Checking the exact live renderer now.' })
+    ]);
   });
 
   it.each([['ja', '送信', '回答を停止'], ['ar', 'إرسال', 'إيقاف الإجابة']])('uses provider Send and Stop identities in %s', (language, sendLabel, stopLabel) => {

@@ -9377,7 +9377,7 @@ interface CommandRestorePlan {
     id: string;
     spec: Extract<CommandSpec, { type: 'revive' }>;
   }>;
-  /** Resume tokens discovered in the durable command file, published only with the plan. */
+  /** Tokens of the resume transports this plan keeps, published only with the plan. */
   resumeTokens: Array<{ sessionId: string; token: string }>;
   /** Number of durable commands newly reconstructed rather than retained from this process. */
   restored: number;
@@ -9584,7 +9584,6 @@ function planCommandRestore(
   }
 
   for (const { raw, spec, createdAt } of durableCandidates.values()) {
-    if (spec.type === 'resume') resumeTokens.push({ sessionId: spec.sessionId, token: spec.token });
     const persistedLeased = version !== 1 && raw.phase === 'leased';
     // The broker cannot yet say whether a restored wake was delivered, so disk rows get the
     // longer budget here; the deadline re-armed below applies the exact one.
@@ -9595,6 +9594,13 @@ function planCommandRestore(
       if (spec.type === 'revive') expiredRevivals.push({ id: raw.id!, spec });
       continue;
     }
+    // Only a transport this plan actually keeps may become the session's remembered
+    // continuation. A row dropped above is not a resumed transaction, and seeding its token
+    // anyway let a dead ticket shadow the live one after a restart: `resumeJobFor` reported
+    // the finished ticket's stage to the app and the page, and `cancelResumeNow` refused the
+    // open ticket because the remembered token already said `committed`. The WAL is the
+    // authority for what a session currently owes; a dropped row must not vote.
+    if (spec.type === 'resume') resumeTokens.push({ sessionId: spec.sessionId, token: spec.token });
 
     const continuation = spec.type === 'resume' ? continuationByToken(spec.token) : null;
     const legacyAlreadyClaimed =

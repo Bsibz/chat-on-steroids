@@ -60,6 +60,7 @@ const {
   companionDiagnostics,
   sessionControlsFor,
   onBridgeChange,
+  cancelSessionCompactionNow,
   compactSession,
   setSessionObjective,
   unattributedRepairEta,
@@ -118,11 +119,13 @@ const {
   attachSummary,
   claimContinuationNow,
   commitContinuation,
+  commitContinuationResult,
   continuationByToken,
   continuationForSession,
   openContinuationNow,
   setContinuationRecoveryHooks,
-  restoreContinuations
+  restoreContinuations,
+  snapshotContinuations
 } = await import('../src/main/session/continuation.js');
 const {
   acknowledgeOffers,
@@ -2977,6 +2980,92 @@ describe('automatic compaction', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /**
+   * A committed ticket's resume-command row can outlive the crash that lost its retirement
+   * write. On the next start, a live ticket for the same session must not be shadowed by it:
+   * the projection has to name the live ticket, and Cancel has to reach it.
+   */
+  it('does not let a dead ticket’s stale resume row shadow the live automatic ticket after restart', async () => {
+    await pair();
+    const sourceChat = 'a1a1a1a1-0000-4000-8000-00000000ac0b';
+    const successorChat = 'a1a1a1a1-0000-4000-8000-00000000ac0c';
+    const session = await createSession({ conversationId: sourceChat });
+
+    // The ticket that ran to completion before the crash.
+    const finished = await openContinuationNow(session.id, sourceChat, true);
+    expect(await attachSummary(finished.token, `first brief\n\n${SAMPLE_BRIEF}`)).not.toBeNull();
+    expect((await commitContinuationResult(finished.token, successorChat)).status).toBe('committed');
+
+    // The live ticket for the same session, still waiting for its prompt.
+    const live = await openContinuationNow(session.id, successorChat, true);
+    expect(continuationForSession(session.id)?.token).toBe(live.token);
+
+    // The crash lost the retirement write, so the finished ticket's resume row is still on
+    // disk — already past its transport TTL.
+    await writeDurableNow('bridge-commands', {
+      version: 4,
+      commands: [{
+        id: 'cmd-dead-resume',
+        spec: { type: 'resume', sessionId: session.id, token: finished.token },
+        createdAt: Date.now() - 60 * 60_000,
+        claimedAt: null,
+        owner: null,
+        lastError: null,
+        phase: 'queued'
+      }],
+      receipts: []
+    });
+    await flushDurable();
+    const snapshot = snapshotContinuations();
+
+    // Startup order: the continuation WAL first, then the durable command ledger.
+    resetBridgeForTests();
+    await restoreContinuations(snapshot);
+    await restoreCommands();
+
+    expect(resumeJobFor(session.id)).toMatchObject({ token: live.token, automatic: true, stage: 'handoff-pending' });
+    expect(await cancelSessionCompactionNow(session.id)).toBe(true);
+    expect(continuationForSession(session.id)).toBeNull();
+  });
+
+  /**
+   * The neighboring case: a resume transport this restore actually keeps is still the
+   * session's remembered continuation, so a page polling after the move is told “that
+   * finished” rather than “there is nothing”.
+   */
+  it('still reports a kept resume transport’s finished ticket after restart', async () => {
+    await pair();
+    const sourceChat = 'a1a1a1a1-0000-4000-8000-00000000ac0d';
+    const successorChat = 'a1a1a1a1-0000-4000-8000-00000000ac0e';
+    const session = await createSession({ conversationId: sourceChat });
+    const finished = await openContinuationNow(session.id, sourceChat, true);
+    expect(await attachSummary(finished.token, `first brief\n\n${SAMPLE_BRIEF}`)).not.toBeNull();
+    expect((await commitContinuationResult(finished.token, successorChat)).status).toBe('committed');
+
+    await writeDurableNow('bridge-commands', {
+      version: 4,
+      commands: [{
+        id: 'cmd-young-resume',
+        spec: { type: 'resume', sessionId: session.id, token: finished.token },
+        createdAt: Date.now() - 60_000,
+        claimedAt: null,
+        owner: null,
+        lastError: null,
+        phase: 'queued'
+      }],
+      receipts: []
+    });
+    await flushDurable();
+    const snapshot = snapshotContinuations();
+
+    resetBridgeForTests();
+    await restoreContinuations(snapshot);
+    await restoreCommands();
+
+    expect(pendingCommands().map((command) => command.what)).toEqual([`resume:${session.id}`]);
+    expect(resumeJobFor(session.id)).toMatchObject({ token: finished.token, stage: 'done' });
   });
 });
 

@@ -1823,6 +1823,9 @@ The four command kinds are **worker, resume, revive and stop**. A command progre
 durable intent to an exact tab/document lease, page execution, durable receipt and retirement.
 `DurableCommandRecord` restores valid owner + `claimedAt`; it is not merely an unowned queue.
 Command token, document id, navigation epoch, lease and underlying operation must all agree.
+A durable resume row the restore drops as stale contributes no identity: only a transport the
+restore actually keeps may become the session's remembered continuation, so a dead ticket's row
+can never shadow a newer open ticket in the command ledger, the session view or the Cancel path.
 
 Opening authority is spent at handout, before asynchronous tab creation/hydration. An elected
 tab that is loading, temporarily unreachable or user-closed does not authorize another opening.

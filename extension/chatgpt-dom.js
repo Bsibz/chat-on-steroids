@@ -2247,6 +2247,22 @@ var CLF_DOM = (() => {
     const host = composerBox() || composerActions()?.host;
     return host ? [...host.querySelectorAll('button[aria-label]')].map(composerFileName).filter(Boolean).slice(0, 20).sort() : [];
   }
+  /**
+   * Current ChatGPT gives composer upload inputs generated ids. Select only by the
+   * exact capability exposed inside the current composer, and fail closed on
+   * ambiguity. Images have one exact `image/*` input beside a broader image/video
+   * picker; arbitrary files use the one input with no accept restriction.
+   */
+  function composerFileInput(arbitraryFiles) {
+    const host = composerBox();
+    if (!host) return null;
+    const candidates = [...host.querySelectorAll('input[type="file"]')].filter(input => {
+      if (!input.isConnected) return false;
+      const accept = (input.getAttribute('accept') || '').trim();
+      return arbitraryFiles ? accept === '' : accept === 'image/*';
+    });
+    return candidates.length === 1 ? candidates[0] : null;
+  }
   /** Observed ChatGPT Plugins settings surface. Missing/ambiguous structure is not proof. */
   async function pluginRefreshView(connectorName, expectedTools = [], expectedAppId = null) {
     const externalPlugins = connectorName === 'Chat On Steroids Plugins';
@@ -2289,7 +2305,7 @@ var CLF_DOM = (() => {
     if (files.length) images = [...(images || []), ...files];
     if (!images?.length) return true;
     if (!Array.isArray(images) || images.length > 20 || !stillCurrent() || hasComposerAttachments()) return false;
-    const input = document.querySelector(files.length ? 'input#upload-files[type="file"]' : 'input#upload-photos[type="file"][accept="image/*"]');
+    const input = composerFileInput(files.length > 0);
     if (!input) return false;
     const priorTiles = new Set((composerBox() || composerActions()?.host)?.querySelectorAll('button[aria-label]') || []);
     const transfer = new DataTransfer();

@@ -482,6 +482,79 @@ function upload() {
   return input;
 }
 describe('native image readiness', () => {
+  it('selects current generated-id composer inputs by exact upload capability', async () => {
+    const form = document.querySelector('form')!;
+    const broad = document.createElement('input'); broad.type = 'file'; broad.id = '_r_js_'; broad.accept = 'image/*,video/*';
+    const image = document.createElement('input'); image.type = 'file'; image.id = '_r_jr_'; image.accept = 'image/*';
+    const general = document.createElement('input'); general.type = 'file'; general.id = '_r_jq_';
+    for (const input of [broad, image, general]) {
+      Object.defineProperty(input, 'files', { writable: true, value: [] });
+      form.append(input);
+    }
+    class Transfer {
+      files: File[] = [];
+      items = { add: (file: File) => { this.files.push(file); } };
+    }
+    Object.defineProperty(dom.window, 'DataTransfer', { value: Transfer });
+    const broadChanged = vi.fn(); const imageChanged = vi.fn(); const generalChanged = vi.fn();
+    broad.addEventListener('change', broadChanged); image.addEventListener('change', () => {
+      imageChanged();
+      const tile = document.createElement('button'); tile.setAttribute('aria-label', 'Remove file: app.webp'); form.append(tile);
+    });
+    general.addEventListener('change', generalChanged);
+
+    expect(await api.uploadImages([{ name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' }])).toBe(true);
+    expect(imageChanged).toHaveBeenCalledTimes(1);
+    expect(broadChanged).not.toHaveBeenCalled();
+    expect(generalChanged).not.toHaveBeenCalled();
+  });
+
+  it('selects the current unrestricted composer input for arbitrary files', async () => {
+    const form = document.querySelector('form')!;
+    const image = document.createElement('input'); image.type = 'file'; image.id = '_r_img_'; image.accept = 'image/*';
+    const general = document.createElement('input'); general.type = 'file'; general.id = '_r_file_';
+    for (const input of [image, general]) {
+      Object.defineProperty(input, 'files', { writable: true, value: [] });
+      form.append(input);
+    }
+    class Transfer {
+      files: File[] = [];
+      items = { add: (file: File) => { this.files.push(file); } };
+    }
+    Object.defineProperty(dom.window, 'DataTransfer', { value: Transfer });
+    const imageChanged = vi.fn(); const generalChanged = vi.fn();
+    image.addEventListener('change', imageChanged); general.addEventListener('change', () => {
+      generalChanged();
+      const tile = document.createElement('div'); tile.setAttribute('role', 'group'); tile.setAttribute('aria-label', 'Notes.md');
+      tile.innerHTML = '<div data-default-action="true"><button aria-label="Notes.md"></button></div><button aria-label="Remove"></button>';
+      form.append(tile);
+    });
+    const file = new dom.window.File(['# exact markdown'], 'Notes.md', { type: 'text/markdown' });
+
+    expect(await api.uploadImages([], () => true, undefined, [file])).toBe(true);
+    expect(generalChanged).toHaveBeenCalledTimes(1);
+    expect(imageChanged).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the current composer exposes ambiguous exact image inputs', async () => {
+    const form = document.querySelector('form')!;
+    const first = document.createElement('input'); first.type = 'file'; first.accept = 'image/*';
+    const second = document.createElement('input'); second.type = 'file'; second.accept = 'image/*';
+    for (const input of [first, second]) {
+      Object.defineProperty(input, 'files', { writable: true, value: [] });
+      form.append(input);
+    }
+    class Transfer {
+      files: File[] = [];
+      items = { add: (file: File) => { this.files.push(file); } };
+    }
+    Object.defineProperty(dom.window, 'DataTransfer', { value: Transfer });
+    const changed = vi.fn(); first.addEventListener('change', changed); second.addEventListener('change', changed);
+
+    expect(await api.uploadImages([{ name: 'app.webp', dataUrl: 'data:image/webp;base64,YQ==' }])).toBe(false);
+    expect(changed).not.toHaveBeenCalled();
+  });
+
   it.each(['rename', 'replacement', 'extra file', 'cancel'])('retains exact image upload nodes across %s while processing', async change => {
     const input = upload();
     const tile = document.createElement('button');

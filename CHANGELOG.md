@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.46] - Current ChatGPT attachment input compatibility
+
+- Native Chat attachment upload no longer depends on ChatGPT's retired `#upload-photos` / `#upload-files` ids.
+- CoS now resolves the exact file input inside the current composer by its advertised capability: exact `image/*` for screenshots/images, or the one unrestricted input for arbitrary files.
+- Ambiguous matching inputs fail closed instead of guessing; the existing exact-tile ownership and upload-complete proof remain unchanged.
+
 ## [2.1.45] - Compaction waits instead of dying when ChatGPT ignores Stop
 
 - Compact & Resume no longer abandons a durable ticket just because the current ChatGPT UI ignores its first Stop request.

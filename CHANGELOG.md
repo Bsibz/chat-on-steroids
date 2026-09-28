@@ -9,6 +9,12 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.55] - Ready attachment draft continuity
+
+- Keeps an exact Native Chat attachment draft owned after ChatGPT has fully enabled native Send even if stale upload progress semantics remain mounted in the composer.
+- Fixes the live failure where the screenshot reached Chrome, upload readiness succeeded, and the next exact draft check still failed with `The composer changed; your draft was preserved` solely because `aria-busy`/progress markers had not been removed.
+- Text identity, exact attachment-node ownership, route/currentness, trusted edits, native Send readiness, immediate authorization, and exact provider acceptance checks remain unchanged.
+
 ## [2.1.54] - Native Chat concrete document custody
 
 - Pinned Night Build Native Chat sends now elect only one current ChatGPT document whose concrete URL contains the exact target conversation, with no pending navigation. Remembered conversation identity remains recovery context but can no longer grant authored-send custody.
